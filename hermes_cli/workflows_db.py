@@ -108,8 +108,6 @@ CREATE TABLE IF NOT EXISTS workflow_schedules (
     updated_at  INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_workflow_definitions_workflow
-    ON workflow_definitions(workflow_id, version);
 CREATE INDEX IF NOT EXISTS idx_workflow_executions_status
     ON workflow_executions(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_workflow_executions_definition
@@ -135,7 +133,9 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path), isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    from hermes_state import apply_wal_with_fallback
+
+    apply_wal_with_fallback(conn, db_label="workflows.db")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -147,6 +147,9 @@ def init_db(db_path: Path | None = None) -> None:
 
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection):
+    if conn.in_transaction:
+        yield conn
+        return
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
@@ -328,6 +331,15 @@ def append_event(
     node_run_id: int | None = None,
 ) -> None:
     with write_txn(conn):
+        if node_run_id is not None:
+            row = conn.execute(
+                "SELECT execution_id FROM workflow_node_runs WHERE id = ?",
+                (node_run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"workflow node run not found: {node_run_id}")
+            if row["execution_id"] != execution_id:
+                raise ValueError("node_run_id does not belong to execution")
         conn.execute(
             """
             INSERT INTO workflow_events (
