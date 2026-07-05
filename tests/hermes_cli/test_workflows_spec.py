@@ -102,6 +102,19 @@ def test_switch_default_target_must_exist():
         validate_graph(spec)
 
 
+@pytest.mark.parametrize("default", ["", "   "])
+def test_blank_switch_default_rejected_even_with_outgoing_edge(default):
+    raw = _minimal_spec()
+    raw["nodes"] = {
+        "route": {"type": "switch", "default": default},
+        "done": {"type": "pass"},
+    }
+    raw["edges"] = [{"from": "route.any", "to": "done"}]
+    spec = WorkflowSpec.model_validate(raw)
+    with pytest.raises(ValueError, match="unknown switch default target"):
+        validate_graph(spec)
+
+
 def test_switch_default_target_satisfies_required_exit():
     raw = _minimal_spec()
     raw["nodes"] = {

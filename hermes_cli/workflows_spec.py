@@ -110,7 +110,7 @@ def validate_graph(spec: WorkflowSpec) -> None:
 
     for node_id, node in spec.nodes.items():
         if node.type == "switch":
-            if node.default:
+            if node.default is not None:
                 if node.default not in node_ids:
                     raise ValueError(f"unknown switch default target: {node.default}")
             elif node_id not in outgoing_sources:
