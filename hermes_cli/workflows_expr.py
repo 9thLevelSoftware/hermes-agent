@@ -77,39 +77,63 @@ def _value(spec: Any, data: Any) -> Any:
 
 
 def _unary_value(cond: Mapping[str, Any], data: Any) -> Any:
-    if "path" in cond:
+    sources = [source for source in ("path", "arg", "left") if source in cond]
+    if len(sources) != 1:
+        raise ValueError("unary condition requires one operand")
+    if sources[0] == "path":
         return resolve_path(data, cond["path"], default=_UNRESOLVED)
-    if "arg" in cond:
+    if sources[0] == "arg":
         return _value(cond["arg"], data)
-    if "left" in cond:
-        return _value(cond["left"], data)
-    return _MISSING
+    return _value(cond["left"], data)
+
+
+def _is_absent(value: Any) -> bool:
+    return value is _MISSING or value is _UNRESOLVED
+
+
+def _condition_args(cond: Mapping[str, Any], op: str) -> Sequence[Any]:
+    args = cond.get("args")
+    if not isinstance(args, Sequence) or isinstance(args, (str, bytes, bytearray)) or not args:
+        raise ValueError(f"{op} requires non-empty args")
+    return args
+
+
+def _binary_values(cond: Mapping[str, Any], data: Any, op: str) -> tuple[Any, Any]:
+    if "left" not in cond or "right" not in cond:
+        raise ValueError(f"{op} requires left and right")
+    return _value(cond["left"], data), _value(cond["right"], data)
 
 
 def eval_condition(cond: Mapping[str, Any], data: Any) -> bool:
+    if not isinstance(cond, Mapping):
+        raise ValueError("condition must be a mapping")
+
     op = cond.get("op")
 
     if op == "and":
-        return all(eval_condition(arg, data) for arg in cond.get("args", ()))
+        return all(eval_condition(arg, data) for arg in _condition_args(cond, op))
     if op == "or":
-        return any(eval_condition(arg, data) for arg in cond.get("args", ()))
+        return any(eval_condition(arg, data) for arg in _condition_args(cond, op))
     if op == "not":
-        args = cond.get("args")
-        if args:
+        if "args" in cond:
+            if "arg" in cond:
+                raise ValueError("not requires exactly one arg")
+            args = _condition_args(cond, op)
+            if len(args) != 1:
+                raise ValueError("not requires exactly one arg")
             return not eval_condition(args[0], data)
         if "arg" not in cond:
             raise ValueError("not requires arg")
         return not eval_condition(cond["arg"], data)
 
     if op == "exists":
-        return _unary_value(cond, data) not in (_MISSING, _UNRESOLVED)
+        return not _is_absent(_unary_value(cond, data))
     if op == "missing":
-        return _unary_value(cond, data) in (_MISSING, _UNRESOLVED)
+        return _is_absent(_unary_value(cond, data))
 
     if op in _COMPARISONS:
-        left = _value(cond.get("left", _MISSING), data)
-        right = _value(cond.get("right", _MISSING), data)
-        if left in (_MISSING, _UNRESOLVED) or right in (_MISSING, _UNRESOLVED):
+        left, right = _binary_values(cond, data, op)
+        if _is_absent(left) or _is_absent(right):
             return False
         try:
             return bool(_COMPARISONS[op](left, right))
@@ -119,9 +143,8 @@ def eval_condition(cond: Mapping[str, Any], data: Any) -> bool:
     if op not in {"contains", "starts_with", "ends_with", "regex"}:
         raise ValueError(f"unsupported condition op: {op}")
 
-    left = _value(cond.get("left", _MISSING), data)
-    right = _value(cond.get("right", _MISSING), data)
-    if left in (_MISSING, _UNRESOLVED) or right in (_MISSING, _UNRESOLVED):
+    left, right = _binary_values(cond, data, op)
+    if _is_absent(left) or _is_absent(right):
         return False
 
     if op == "contains":
