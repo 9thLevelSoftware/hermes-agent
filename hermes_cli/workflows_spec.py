@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+_NODE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
 TriggerType = Literal["manual", "schedule", "webhook", "kanban_event"]
 NodeType = Literal[
@@ -72,6 +75,15 @@ class WorkflowSpec(BaseModel):
     nodes: dict[str, NodeSpec] = Field(default_factory=dict)
     edges: list[EdgeSpec] = Field(default_factory=list)
 
+    @field_validator("nodes", mode="before")
+    @classmethod
+    def _validate_node_ids(cls, nodes: Any) -> Any:
+        if isinstance(nodes, dict):
+            for node_id in nodes:
+                if not isinstance(node_id, str) or not _NODE_ID_RE.fullmatch(node_id):
+                    raise ValueError(f"invalid node id: {node_id!r}")
+        return nodes
+
 
 def validate_graph(spec: WorkflowSpec) -> None:
     if not spec.nodes:
@@ -81,15 +93,27 @@ def validate_graph(spec: WorkflowSpec) -> None:
     outgoing_sources: set[str] = set()
 
     for edge in spec.edges:
-        source_base = edge.from_.split(".", 1)[0]
+        source_base = edge.from_
+        branch = None
+        if "." in edge.from_:
+            source_base, branch = edge.from_.split(".", 1)
         if source_base not in node_ids:
             raise ValueError(f"unknown edge source: {edge.from_}")
+        if branch is not None:
+            if not branch:
+                raise ValueError(f"edge source {edge.from_} requires branch suffix")
+            if spec.nodes[source_base].type != "switch":
+                raise ValueError(f"dotted edge source {edge.from_} requires switch source")
         if edge.to not in node_ids:
             raise ValueError(f"unknown edge target: {edge.to}")
         outgoing_sources.add(source_base)
 
     for node_id, node in spec.nodes.items():
-        if node.type == "switch" and node_id not in outgoing_sources and not node.default:
-            raise ValueError(f"switch node {node_id} must define outgoing edges or default")
-        if node.type == "agent_task" and (not node.profile or not node.prompt):
+        if node.type == "switch":
+            if node.default:
+                if node.default not in node_ids:
+                    raise ValueError(f"unknown switch default target: {node.default}")
+            elif node_id not in outgoing_sources:
+                raise ValueError(f"switch node {node_id} must define outgoing edges or default")
+        if node.type == "agent_task" and (not (node.profile or "").strip() or not (node.prompt or "").strip()):
             raise ValueError(f"agent_task node {node_id} requires profile and prompt")
