@@ -88,7 +88,19 @@ def test_manifest_points_to_plugin_api():
     assert manifest["label"] == "Workflows"
     assert manifest["tab"] == {"path": "/workflows", "position": "after:kanban"}
     assert manifest["entry"] == "dist/index.js"
+    assert (PLUGIN_DIR / manifest["entry"]).exists()
     assert manifest["api"] == "plugin_api.py"
+
+
+def test_dashboard_bundle_registers_plugin_without_build_scaffolding():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    assert "window.__HERMES_PLUGIN_SDK__" in bundle
+    assert "window.__HERMES_PLUGINS__" in bundle
+    assert 'REG.register("workflows"' in bundle
+    assert not any(
+        line.lstrip().startswith(("import ", "export ")) for line in bundle.splitlines()
+    )
+    assert "__webpack_require__" not in bundle
 
 
 def test_validate_deploy_list_show_roundtrip(client):
