@@ -265,8 +265,8 @@ def test_direct_switch_branch_to_join_preserves_parallel_branch_label():
             }},
         },
         "edges": [
-            {"from": "fork.work", "to": "route"},
             {"from": "fork.review", "to": "review"},
+            {"from": "fork.work", "to": "route"},
             {"from": "route.go", "to": "merge"},
             {"from": "route.default", "to": "skip"},
             {"from": "review", "to": "merge"},

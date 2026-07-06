@@ -213,6 +213,13 @@ def run_in_memory_until_waiting(
                 else:
                     expected_labels.add(label)
                     branches[label] = branch_outputs.setdefault(label, None)
+            for pending_node_id, pending_branch_key in runnable:
+                if pending_node_id != node_id or pending_branch_key is None:
+                    continue
+                pending_parallel_id, pending_label = pending_branch_key
+                pending_outputs = context.setdefault("branches", {}).setdefault(pending_parallel_id, {})
+                expected_labels.add(pending_label)
+                branches[pending_label] = pending_outputs.setdefault(pending_label, None)
             for edge in incoming:
                 source_base, _, port = edge.from_.partition(".")
                 source_node = spec.nodes.get(source_base)
