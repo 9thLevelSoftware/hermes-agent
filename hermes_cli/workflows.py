@@ -6,7 +6,6 @@ import argparse
 import contextlib
 import json
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +15,6 @@ from pydantic import ValidationError
 from hermes_cli import workflows_db as wfdb
 from hermes_cli import workflows_dispatcher
 from hermes_cli.workflows_spec import WorkflowSpec, validate_graph
-
-_TERMINAL_STATUSES = {"cancelled", "failed", "succeeded"}
 
 
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
@@ -325,28 +322,10 @@ def _cmd_executions_show(args: argparse.Namespace) -> int:
 
 def _cmd_executions_cancel(args: argparse.Namespace) -> int:
     with _connect_initialized() as conn:
-        execution = wfdb.get_execution(conn, args.execution_id)
-        if execution.status in _TERMINAL_STATUSES:
+        execution, cancelled = wfdb.cancel_execution(conn, args.execution_id, source="cli")
+        if not cancelled:
             print(f"Execution {execution.execution_id} already {execution.status}.")
             return 0
-        now = int(time.time())
-        terminal_statuses = tuple(sorted(_TERMINAL_STATUSES))
-        placeholders = ", ".join("?" for _ in terminal_statuses)
-        with wfdb.write_txn(conn):
-            updated = conn.execute(
-                f"""
-                UPDATE workflow_executions
-                   SET status = 'cancelled', claim_lock = NULL,
-                       claim_expires = NULL, updated_at = ?
-                 WHERE execution_id = ?
-                   AND status NOT IN ({placeholders})
-                """,
-                (now, execution.execution_id, *terminal_statuses),
-            )
-            if updated.rowcount == 0:
-                current = wfdb.get_execution(conn, execution.execution_id)
-                print(f"Execution {current.execution_id} already {current.status}.")
-                return 0
     print(f"Cancelled execution {args.execution_id}")
     return 0
 

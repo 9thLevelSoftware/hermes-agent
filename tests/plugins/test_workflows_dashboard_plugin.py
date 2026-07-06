@@ -178,6 +178,18 @@ def test_cancel_endpoint_is_idempotent(client):
     assert second.json()["cancelled"] is False
     assert second.json()["execution"]["status"] == "cancelled"
 
+    with wfdb.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT kind, payload_json FROM workflow_events
+             WHERE execution_id = ? AND kind = 'execution_cancelled'
+             ORDER BY id
+            """,
+            (execution_id,),
+        ).fetchall()
+    assert [row["kind"] for row in rows] == ["execution_cancelled"]
+    assert [json.loads(row["payload_json"]) for row in rows] == [{"source": "dashboard"}]
+
 
 def test_bad_spec_returns_400_with_validation_message(client):
     r = client.post(

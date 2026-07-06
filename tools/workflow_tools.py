@@ -5,7 +5,6 @@ import contextlib
 import json
 import logging
 import os
-import time
 from typing import Any
 
 from hermes_cli import workflows_db as wfdb
@@ -13,8 +12,6 @@ from hermes_cli.config import load_config
 from tools.registry import registry, tool_error, tool_result
 
 logger = logging.getLogger(__name__)
-
-_TERMINAL_STATUSES = {"cancelled", "failed", "succeeded"}
 
 
 def _check_workflow_mode() -> bool:
@@ -177,36 +174,11 @@ def _handle_cancel(args: dict, **_kw) -> str:
         return tool_error("execution_id is required")
     try:
         with _connect_initialized() as conn:
-            execution = wfdb.get_execution(conn, execution_id)
-            if execution.status in _TERMINAL_STATUSES:
-                payload = _execution_to_dict(execution)
-                payload["cancelled"] = False
-                return tool_result(payload)
-
-            now = int(time.time())
-            terminal_statuses = tuple(sorted(_TERMINAL_STATUSES))
-            placeholders = ", ".join("?" for _ in terminal_statuses)
-            with wfdb.write_txn(conn):
-                updated = conn.execute(
-                    f"""
-                    UPDATE workflow_executions
-                       SET status = 'cancelled', claim_lock = NULL,
-                           claim_expires = NULL, updated_at = ?
-                     WHERE execution_id = ?
-                       AND status NOT IN ({placeholders})
-                    """,
-                    (now, execution_id, *terminal_statuses),
-                )
-                if updated.rowcount:
-                    wfdb.append_event(
-                        conn,
-                        execution_id,
-                        "execution_cancelled",
-                        {"source": "workflow_cancel"},
-                    )
-            current = wfdb.get_execution(conn, execution_id)
-            payload = _execution_to_dict(current)
-            payload["cancelled"] = current.status == "cancelled" and execution.status != "cancelled"
+            execution, cancelled = wfdb.cancel_execution(
+                conn, execution_id, source="workflow_cancel"
+            )
+            payload = _execution_to_dict(execution)
+            payload["cancelled"] = cancelled
             return tool_result(payload)
     except Exception as exc:
         logger.exception("workflow_cancel failed")

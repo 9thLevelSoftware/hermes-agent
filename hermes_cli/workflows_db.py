@@ -44,6 +44,9 @@ class WorkflowExecution:
     updated_at: int
 
 
+_TERMINAL_EXECUTION_STATUSES = {"cancelled", "failed", "succeeded"}
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS workflow_definitions (
     workflow_id TEXT NOT NULL,
@@ -374,6 +377,36 @@ def get_execution(conn: sqlite3.Connection, execution_id: str) -> WorkflowExecut
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def cancel_execution(
+    conn: sqlite3.Connection,
+    execution_id: str,
+    *,
+    source: str = "workflow",
+) -> tuple[WorkflowExecution, bool]:
+    execution = get_execution(conn, execution_id)
+    if execution.status in _TERMINAL_EXECUTION_STATUSES:
+        return execution, False
+
+    now = int(time.time())
+    terminal_statuses = tuple(sorted(_TERMINAL_EXECUTION_STATUSES))
+    placeholders = ", ".join("?" for _ in terminal_statuses)
+    with write_txn(conn):
+        cancelled = conn.execute(
+            f"""
+            UPDATE workflow_executions
+               SET status = 'cancelled', claim_lock = NULL,
+                   claim_expires = NULL, updated_at = ?
+             WHERE execution_id = ?
+               AND status NOT IN ({placeholders})
+            """,
+            (now, execution_id, *terminal_statuses),
+        ).rowcount > 0
+        if cancelled:
+            append_event(conn, execution_id, "execution_cancelled", {"source": source})
+
+    return get_execution(conn, execution_id), cancelled
 
 
 def append_event(

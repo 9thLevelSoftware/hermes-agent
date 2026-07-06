@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import time
 from typing import Any
 
 import yaml
@@ -18,7 +17,6 @@ from hermes_cli.workflows_spec import WorkflowSpec, validate_graph
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-_TERMINAL_STATUSES = {"cancelled", "failed", "succeeded"}
 
 
 @contextlib.contextmanager
@@ -278,32 +276,9 @@ async def get_execution(execution_id: str) -> dict[str, Any]:
 async def cancel_execution(execution_id: str) -> dict[str, Any]:
     try:
         with _connect_initialized() as conn:
-            execution = wfdb.get_execution(conn, execution_id)
-            cancelled = False
-            if execution.status not in _TERMINAL_STATUSES:
-                now = int(time.time())
-                terminal_statuses = tuple(sorted(_TERMINAL_STATUSES))
-                placeholders = ", ".join("?" for _ in terminal_statuses)
-                with wfdb.write_txn(conn):
-                    updated = conn.execute(
-                        f"""
-                        UPDATE workflow_executions
-                           SET status = 'cancelled', claim_lock = NULL,
-                               claim_expires = NULL, updated_at = ?
-                         WHERE execution_id = ?
-                           AND status NOT IN ({placeholders})
-                        """,
-                        (now, execution_id, *terminal_statuses),
-                    ).rowcount
-                    cancelled = updated > 0
-                    if cancelled:
-                        wfdb.append_event(
-                            conn,
-                            execution_id,
-                            "execution_cancelled",
-                            {"source": "dashboard"},
-                        )
-            execution = wfdb.get_execution(conn, execution_id)
+            execution, cancelled = wfdb.cancel_execution(
+                conn, execution_id, source="dashboard"
+            )
     except KeyError as exc:
         raise _http_404(exc) from exc
     return {"cancelled": cancelled, "execution": _execution_to_dict(execution)}

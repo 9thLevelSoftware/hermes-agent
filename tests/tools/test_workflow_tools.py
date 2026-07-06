@@ -180,5 +180,52 @@ def test_workflow_cancel_is_idempotent(_isolated_workflow_home):
 
     assert "error" not in first
     assert first["status"] == "cancelled"
+    assert first["cancelled"] is True
     assert "error" not in second
     assert second["status"] == "cancelled"
+    assert second["cancelled"] is False
+
+    with wfdb.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT kind, payload_json FROM workflow_events
+             WHERE execution_id = ? AND kind = 'execution_cancelled'
+             ORDER BY id
+            """,
+            (execution_id,),
+        ).fetchall()
+    assert [row["kind"] for row in rows] == ["execution_cancelled"]
+    assert [json.loads(row["payload_json"]) for row in rows] == [
+        {"source": "workflow_cancel"}
+    ]
+
+
+def test_shared_cancel_execution_records_source(_isolated_workflow_home):
+    spec = _deploy_demo_workflow()
+
+    from hermes_cli import workflows_db as wfdb
+
+    with wfdb.connect() as conn:
+        execution_id = wfdb.start_execution(
+            conn,
+            spec.id,
+            input_data={},
+            trigger_type="manual",
+        )
+
+        execution, cancelled = wfdb.cancel_execution(conn, execution_id, source="unit")
+        again, cancelled_again = wfdb.cancel_execution(conn, execution_id, source="unit")
+        rows = conn.execute(
+            """
+            SELECT kind, payload_json FROM workflow_events
+             WHERE execution_id = ? AND kind = 'execution_cancelled'
+             ORDER BY id
+            """,
+            (execution_id,),
+        ).fetchall()
+
+    assert execution.status == "cancelled"
+    assert cancelled is True
+    assert again.status == "cancelled"
+    assert cancelled_again is False
+    assert [json.loads(row["payload_json"]) for row in rows] == [{"source": "unit"}]
