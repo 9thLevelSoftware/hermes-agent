@@ -181,8 +181,8 @@ Common fields on node specs:
 | Field | Meaning |
 |---|---|
 | `type` | One of `pass`, `switch`, `agent_task`, `wait`, `parallel`, `join`, `send_message`, `fail`, `subworkflow`. |
-| `catch` | Node id to run after this node fails and retries are exhausted. |
-| `retry` | `{max_attempts, delay_seconds, backoff_seconds, multiplier}` for retrying failed node attempts. |
+| `catch` | Node id to run after supported node execution failures once retries are exhausted. Some validation, render, or setup errors can fail the execution directly. |
+| `retry` | `{max_attempts, delay_seconds, backoff_seconds, multiplier}` for retrying supported node execution failures. Some validation, render, or setup errors are not retryable node attempts. |
 
 The schema also accepts `workspace: {cwd, env}` for forward compatibility, but the bundled dispatcher does not use it today. For Kanban workers, use `agent_task.workspace_kind` and `agent_task.workspace_path`.
 
@@ -298,7 +298,7 @@ edges:
 
 ### `fail`
 
-Fails the execution, or routes to `catch` after retries are exhausted.
+Emits a node execution failure; if retries are exhausted, a configured `catch` may run.
 
 ```yaml
 reject:
@@ -381,7 +381,7 @@ output:
   text: "Verdict: ${ node.review.output.verdict }"  # literal string, not interpolated
 ```
 
-Inside `${ ... }`, the leading `$.` is optional. Lists and objects are rendered recursively. A missing path raises an error, which can fail the execution or route through `catch` when configured.
+Inside `${ ... }`, the leading `$.` is optional. Lists and objects are rendered recursively. A missing path raises an error; depending where rendering happens, it may fail the execution directly rather than route through `catch`.
 
 This is intentional safety: templates can only copy values out of the workflow context. They cannot call functions, read files, run shell commands, or evaluate code.
 
