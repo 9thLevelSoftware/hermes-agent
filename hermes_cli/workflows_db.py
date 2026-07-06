@@ -268,32 +268,33 @@ def deploy_definition(
             ),
         )
         conn.execute(
-            "DELETE FROM workflow_schedules WHERE workflow_id = ? AND version = ?",
-            (spec.id, spec.version),
+            "DELETE FROM workflow_schedules WHERE workflow_id = ?",
+            (spec.id,),
         )
-        for trigger in spec.triggers:
-            if trigger.type != "schedule":
-                continue
-            expr = _schedule_expr(trigger)
-            if not expr:
-                continue
-            conn.execute(
-                """
-                INSERT INTO workflow_schedules (
-                    workflow_id, version, trigger_id, schedule, enabled,
-                    next_run_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
-                """,
-                (
-                    spec.id,
-                    spec.version,
-                    trigger.id,
-                    expr,
-                    _next_cron_run(expr, now),
-                    now,
-                    now,
-                ),
-            )
+        if spec.enabled:
+            for trigger in spec.triggers:
+                if trigger.type != "schedule":
+                    continue
+                expr = _schedule_expr(trigger)
+                if not expr:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO workflow_schedules (
+                        workflow_id, version, trigger_id, schedule, enabled,
+                        next_run_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (
+                        spec.id,
+                        spec.version,
+                        trigger.id,
+                        expr,
+                        _next_cron_run(expr, now),
+                        now,
+                        now,
+                    ),
+                )
 
 
 def get_definition(

@@ -217,6 +217,22 @@ def _finish(
         if row is None or row["claim_lock"] != token:
             return False
 
+        existing_events = conn.execute(
+            "SELECT kind, payload_json FROM workflow_events WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchall()
+        emitted_nodes: set[str] = set()
+        for event in existing_events:
+            if event["kind"] != "node_succeeded":
+                continue
+            try:
+                payload = json.loads(event["payload_json"])
+            except (TypeError, ValueError):
+                continue
+            node_id = payload.get("node_id")
+            if isinstance(node_id, str):
+                emitted_nodes.add(node_id)
+
         _persist_waiting_nodes(
             conn,
             execution_id=execution_id,
@@ -224,8 +240,11 @@ def _finish(
             spec=spec,
             now=now,
         )
-        _append_event(conn, execution_id, "execution_started", {}, now)
+        if not existing_events:
+            _append_event(conn, execution_id, "execution_started", {}, now)
         for node_id, node_context in result.context.get("node", {}).items():
+            if node_id in emitted_nodes:
+                continue
             if isinstance(node_context, dict):
                 output = node_context.get("output")
             else:
@@ -237,6 +256,7 @@ def _finish(
                 {"node_id": node_id, "output": output},
                 now,
             )
+            emitted_nodes.add(node_id)
         _append_event(conn, execution_id, final_event, final_payload, now)
         conn.execute(
             """

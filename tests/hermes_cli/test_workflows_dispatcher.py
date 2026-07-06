@@ -42,9 +42,10 @@ def _wait_spec() -> WorkflowSpec:
     })
 
 
-def _schedule_spec() -> WorkflowSpec:
+def _schedule_spec(*, version: int = 1, enabled: bool = True) -> WorkflowSpec:
     return WorkflowSpec.model_validate({
-        "id": "scheduled_demo", "name": "Scheduled Demo", "version": 1,
+        "id": "scheduled_demo", "name": "Scheduled Demo", "version": version,
+        "enabled": enabled,
         "triggers": [{"type": "schedule", "id": "every_minute", "cron": "* * * * *"}],
         "nodes": {"start": {"type": "pass", "output": {"ok": True}}},
     })
@@ -173,6 +174,23 @@ def test_wait_node_persists_wait_until_then_resumes_when_due(tmp_path, monkeypat
     assert pause["status"] == "succeeded"
     assert pause["completed_at"] == 161
 
+    execution, claim, events = _execution_state(exec_id)
+    assert execution.status == "succeeded"
+    assert claim == {"claim_lock": None, "claim_expires": None}
+    assert [event["kind"] for event in events] == [
+        "execution_started",
+        "node_succeeded",
+        "execution_waiting",
+        "node_succeeded",
+        "node_succeeded",
+        "execution_succeeded",
+    ]
+    assert [
+        json.loads(event["payload_json"])["node_id"]
+        for event in events
+        if event["kind"] == "node_succeeded"
+    ] == ["start", "pause", "done"]
+
     assert workflows_dispatcher.tick(limit=1, now=162) == 0
     with wfdb.connect() as conn:
         assert conn.execute(
@@ -224,6 +242,54 @@ def test_due_schedule_starts_once_and_advances_next_run(tmp_path, monkeypatch):
         assert conn.execute(
             "SELECT count(*) FROM workflow_executions WHERE workflow_id = 'scheduled_demo'"
         ).fetchone()[0] == 1
+
+
+def test_redeploying_schedule_replaces_older_version_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    wfdb.init_db()
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, _schedule_spec(version=1), created_by="test")
+        wfdb.deploy_definition(conn, _schedule_spec(version=2), created_by="test")
+        schedules = [dict(row) for row in conn.execute(
+            "SELECT version, next_run_at FROM workflow_schedules ORDER BY version"
+        )]
+
+    assert [schedule["version"] for schedule in schedules] == [2]
+
+    assert workflows_dispatcher.tick(limit=10, now=schedules[0]["next_run_at"]) == 1
+
+    with wfdb.connect() as conn:
+        executions = [dict(row) for row in conn.execute(
+            """
+            SELECT version, trigger_type, trigger_id
+              FROM workflow_executions
+             WHERE workflow_id = 'scheduled_demo'
+             ORDER BY version
+            """
+        )]
+    assert executions == [{
+        "version": 2,
+        "trigger_type": "schedule",
+        "trigger_id": "every_minute",
+    }]
+
+
+def test_disabling_scheduled_workflow_removes_schedule_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    wfdb.init_db()
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, _schedule_spec(enabled=True), created_by="test")
+        due_at = conn.execute("SELECT next_run_at FROM workflow_schedules").fetchone()[0]
+        wfdb.deploy_definition(conn, _schedule_spec(enabled=False), created_by="test")
+        schedule_count = conn.execute("SELECT count(*) FROM workflow_schedules").fetchone()[0]
+
+    assert schedule_count == 0
+    assert workflows_dispatcher.tick(limit=10, now=due_at) == 0
+
+    with wfdb.connect() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM workflow_executions WHERE workflow_id = 'scheduled_demo'"
+        ).fetchone()[0] == 0
 
 
 def test_waiting_result_persists_and_is_not_retried(tmp_path, monkeypatch):
