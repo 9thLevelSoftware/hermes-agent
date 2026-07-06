@@ -148,15 +148,30 @@ def test_switch_default_target_satisfies_required_exit():
 
 
 @pytest.mark.parametrize(
-    ("profile", "prompt"),
-    [("", "do it"), ("worker", ""), ("   ", "do it"), ("worker", "   ")],
+    ("profile", "prompt", "expected_error"),
+    [
+        ("", "do it", "agent_task node task requires a non-blank profile"),
+        ("worker", "", "agent_task node task requires a non-empty prompt"),
+        ("   ", "do it", "agent_task node task requires a non-blank profile"),
+        ("worker", "   ", "agent_task node task requires a non-empty prompt"),
+    ],
 )
-def test_agent_task_requires_non_blank_profile_and_prompt(profile, prompt):
+def test_agent_task_requires_non_blank_profile_and_prompt(profile, prompt, expected_error):
     raw = _minimal_spec()
     raw["nodes"] = {"task": {"type": "agent_task", "profile": profile, "prompt": prompt}}
     raw["edges"] = []
     spec = WorkflowSpec.model_validate(raw)
-    with pytest.raises(ValueError, match="requires profile and prompt"):
+    with pytest.raises(ValueError, match=expected_error):
+        validate_graph(spec)
+
+
+@pytest.mark.parametrize("prompt", [{}, []])
+def test_agent_task_prompt_may_be_text_or_structured_but_not_empty_container(prompt):
+    raw = _minimal_spec()
+    raw["nodes"] = {"task": {"type": "agent_task", "profile": "worker", "prompt": prompt}}
+    raw["edges"] = []
+    spec = WorkflowSpec.model_validate(raw)
+    with pytest.raises(ValueError, match="agent_task node task requires a non-empty prompt"):
         validate_graph(spec)
 
 

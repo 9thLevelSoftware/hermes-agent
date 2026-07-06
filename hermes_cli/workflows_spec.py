@@ -101,6 +101,16 @@ class WorkflowSpec(BaseModel):
         return nodes
 
 
+def _blank_prompt(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (dict, list, tuple, set)):
+        return len(value) == 0
+    return False
+
+
 def validate_graph(spec: WorkflowSpec) -> None:
     for trigger in spec.triggers:
         expr = trigger.cron or trigger.schedule or getattr(trigger, "expr", None)
@@ -143,8 +153,8 @@ def validate_graph(spec: WorkflowSpec) -> None:
                     raise ValueError(f"unknown switch default target: {node.default}")
             elif node_id not in outgoing_sources:
                 raise ValueError(f"switch node {node_id} must define outgoing edges or default")
-        missing_prompt = node.prompt is None or (
-            isinstance(node.prompt, str) and not node.prompt.strip()
-        )
-        if node.type == "agent_task" and (not (node.profile or "").strip() or missing_prompt):
-            raise ValueError(f"agent_task node {node_id} requires profile and prompt")
+        if node.type == "agent_task":
+            if not str(node.profile or "").strip():
+                raise ValueError(f"agent_task node {node_id} requires a non-blank profile")
+            if _blank_prompt(node.prompt):
+                raise ValueError(f"agent_task node {node_id} requires a non-empty prompt")
