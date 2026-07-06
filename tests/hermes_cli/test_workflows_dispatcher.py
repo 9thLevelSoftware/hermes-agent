@@ -44,7 +44,7 @@ def _wait_spec() -> WorkflowSpec:
     })
 
 
-def _agent_spec() -> WorkflowSpec:
+def _agent_spec(done_output=None) -> WorkflowSpec:
     return WorkflowSpec.model_validate({
         "id": "agent_demo", "name": "Agent Demo", "version": 1,
         "triggers": [{"type": "manual", "id": "manual"}],
@@ -55,11 +55,14 @@ def _agent_spec() -> WorkflowSpec:
                 "title": "Do agent work",
                 "prompt": {"task": "${ input.task }"},
                 "workspace_kind": "scratch",
+                "workspace_path": "workflow-workspace",
                 "skills": ["test-driven-development"],
                 "max_retries": 2,
+                "model_override": "test-model",
                 "goal_mode": True,
+                "goal_max_turns": 3,
             },
-            "done": {"type": "pass", "output": {"agent": "${ node.ask.output.answer }"}},
+            "done": {"type": "pass", "output": done_output or {"agent": "${ node.ask.output.answer }"}},
         },
         "edges": [{"from": "ask", "to": "done"}],
     })
@@ -235,7 +238,10 @@ def test_agent_task_creates_kanban_card_and_resumes_after_completion(tmp_path, m
     with wfdb.connect() as conn:
         wfdb.deploy_definition(conn, _agent_spec(), created_by="test")
         exec_id = wfdb.start_execution(
-            conn, "agent_demo", input_data={"task": "hello"}, trigger_type="manual"
+            conn,
+            "agent_demo",
+            input_data={"task": "hello", "secret": "leaked"},
+            trigger_type="manual",
         )
 
     assert workflows_dispatcher.tick(limit=1, now=100) == 1
@@ -256,6 +262,12 @@ def test_agent_task_creates_kanban_card_and_resumes_after_completion(tmp_path, m
     assert task.workflow_template_id == "agent_demo"
     assert task.current_step_key == "ask"
     assert task.assignee == "worker-profile"
+    assert task.workspace_path == "workflow-workspace"
+    assert task.skills == ["test-driven-development"]
+    assert task.max_retries == 2
+    assert task.model_override == "test-model"
+    assert task.goal_mode is True
+    assert task.goal_max_turns == 3
     assert task.status in {"ready", "todo"}
     assert task.body is not None and "hello" in task.body
     assert len(ask) == 1
@@ -266,7 +278,7 @@ def test_agent_task_creates_kanban_card_and_resumes_after_completion(tmp_path, m
     assert workflows_dispatcher.tick(limit=1, now=100) == 0
     with kb.connect() as kconn:
         assert len(kb.list_tasks(kconn)) == 1
-        assert kb.complete_task(kconn, task.id, result=json.dumps({"answer": "ok"}))
+        assert kb.complete_task(kconn, task.id, result=json.dumps({"answer": "${ input.secret }"}))
 
     assert workflows_dispatcher.tick(limit=1, now=101) == 1
 
@@ -280,9 +292,81 @@ def test_agent_task_creates_kanban_card_and_resumes_after_completion(tmp_path, m
             (exec_id,),
         ).fetchone()
     assert execution.status == "succeeded"
-    assert execution.context["node"]["done"]["output"] == {"agent": "ok"}
+    assert execution.context["node"]["done"]["output"] == {"agent": "${ input.secret }"}
     assert ask["status"] == "succeeded"
-    assert json.loads(ask["output_json"]) == {"answer": "ok"}
+    assert json.loads(ask["output_json"]) == {"answer": "${ input.secret }"}
+
+
+def test_agent_task_resumes_from_summary_only_json_completion(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    wfdb.init_db()
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, _agent_spec(), created_by="test")
+        exec_id = wfdb.start_execution(
+            conn, "agent_demo", input_data={"task": "hello"}, trigger_type="manual"
+        )
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+    with kb.connect() as kconn:
+        task = kb.list_tasks(kconn)[0]
+        assert kb.complete_task(kconn, task.id, summary=json.dumps({"answer": "from summary"}))
+
+    assert workflows_dispatcher.tick(limit=1, now=101) == 1
+
+    with wfdb.connect() as conn:
+        execution = wfdb.get_execution(conn, exec_id)
+        ask = conn.execute(
+            """
+            SELECT * FROM workflow_node_runs
+             WHERE execution_id = ? AND node_id = 'ask'
+            """,
+            (exec_id,),
+        ).fetchone()
+    assert execution.status == "succeeded"
+    assert execution.context["node"]["done"]["output"] == {"agent": "from summary"}
+    assert json.loads(ask["output_json"]) == {"answer": "from summary"}
+
+
+def test_agent_task_resumes_from_summary_only_plain_text_completion(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    wfdb.init_db()
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(
+            conn,
+            _agent_spec(done_output={"agent": "${ node.ask.output.result }"}),
+            created_by="test",
+        )
+        exec_id = wfdb.start_execution(
+            conn, "agent_demo", input_data={"task": "hello"}, trigger_type="manual"
+        )
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+    with kb.connect() as kconn:
+        task = kb.list_tasks(kconn)[0]
+        assert kb.complete_task(kconn, task.id, summary="plain handoff")
+
+    assert workflows_dispatcher.tick(limit=1, now=101) == 1
+
+    with wfdb.connect() as conn:
+        execution = wfdb.get_execution(conn, exec_id)
+        ask = conn.execute(
+            """
+            SELECT * FROM workflow_node_runs
+             WHERE execution_id = ? AND node_id = 'ask'
+            """,
+            (exec_id,),
+        ).fetchone()
+    assert execution.status == "succeeded"
+    assert execution.context["node"]["done"]["output"] == {"agent": "plain handoff"}
+    assert json.loads(ask["output_json"]) == {"result": "plain handoff"}
 
 
 def test_blocked_kanban_agent_task_blocks_workflow(tmp_path, monkeypatch):
@@ -322,6 +406,35 @@ def test_blocked_kanban_agent_task_blocks_workflow(tmp_path, monkeypatch):
     }
     assert ask["status"] == "blocked"
     assert json.loads(ask["error"]) == execution.context["error"]
+
+
+def test_auto_blocked_agent_task_uses_last_failure_error_reason(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    wfdb.init_db()
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, _agent_spec(), created_by="test")
+        exec_id = wfdb.start_execution(
+            conn, "agent_demo", input_data={"task": "hello"}, trigger_type="manual"
+        )
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+    with kb.connect() as kconn:
+        task = kb.list_tasks(kconn)[0]
+        kconn.execute(
+            "UPDATE tasks SET status = 'blocked', last_failure_error = ? WHERE id = ?",
+            ("spawn failed: missing profile", task.id),
+        )
+
+    assert workflows_dispatcher.tick(limit=1, now=101) == 0
+
+    with wfdb.connect() as conn:
+        execution = wfdb.get_execution(conn, exec_id)
+    assert execution.status == "blocked"
+    assert "spawn failed: missing profile" in execution.context["error"]["reason"]
 
 
 def test_due_schedule_starts_once_and_advances_next_run(tmp_path, monkeypatch):

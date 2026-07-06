@@ -183,15 +183,10 @@ def _create_or_get_agent_task(
             max_retries=node.max_retries,
             goal_mode=bool(node.goal_mode),
             goal_max_turns=node.goal_max_turns,
+            workflow_template_id=spec.id,
+            current_step_key=node_id,
+            model_override=node.model_override,
             idempotency_key=f"workflow:{execution_id}:{node_id}",
-        )
-        kconn.execute(
-            """
-            UPDATE tasks
-               SET workflow_template_id = ?, current_step_key = ?, model_override = ?
-             WHERE id = ?
-            """,
-            (spec.id, node_id, node.model_override, task_id),
         )
         return task_id
 
@@ -209,7 +204,7 @@ def _kanban_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
     row = conn.execute(
         """
         SELECT payload FROM task_events
-         WHERE task_id = ? AND kind IN ('blocked', 'dependency_wait', 'block_loop_detected')
+         WHERE task_id = ? AND kind IN ('blocked', 'dependency_wait', 'block_loop_detected', 'gave_up')
          ORDER BY id DESC LIMIT 1
         """,
         (task_id,),
@@ -219,9 +214,27 @@ def _kanban_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
             payload = json.loads(row["payload"] or "{}")
         except (TypeError, ValueError):
             payload = {}
-        reason = payload.get("reason")
-        if isinstance(reason, str) and reason:
-            return reason
+        for key in ("reason", "error", "message"):
+            reason = payload.get(key)
+            if isinstance(reason, str) and reason:
+                return reason
+    row = conn.execute(
+        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is not None and row["last_failure_error"]:
+        return row["last_failure_error"]
+    row = conn.execute(
+        """
+        SELECT error, summary FROM task_runs
+         WHERE task_id = ?
+           AND ((error IS NOT NULL AND error != '') OR (summary IS NOT NULL AND summary != ''))
+         ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if row is not None:
+        return row["error"] or row["summary"]
     return "kanban task blocked"
 
 
@@ -246,7 +259,7 @@ def _resume_completed_agent_tasks(conn: sqlite3.Connection, *, now: int) -> None
             if task is None:
                 continue
             if task.status == "done":
-                output = _parse_agent_result(task.result)
+                output = _parse_agent_result(task.result or kb.latest_summary(kconn, task.id))
                 with wfdb.write_txn(conn):
                     updated = conn.execute(
                         """
@@ -331,17 +344,6 @@ def _completed_node_outputs(conn: sqlite3.Connection, execution_id: str) -> dict
         except (TypeError, ValueError):
             continue
     return outputs
-
-
-def _spec_with_completed_outputs(spec: WorkflowSpec, outputs: dict[str, Any]) -> WorkflowSpec:
-    if not outputs:
-        return spec
-    nodes = dict(spec.nodes)
-    for node_id, output in outputs.items():
-        node = nodes.get(node_id)
-        if node is not None:
-            nodes[node_id] = node.model_copy(update={"type": "pass", "output": output})
-    return spec.model_copy(update={"nodes": nodes})
 
 
 def _persist_waiting_nodes(
@@ -502,15 +504,12 @@ def tick(
                 spec = wfdb.get_definition(conn, execution.workflow_id, execution.version)
                 completed_wait_nodes = _completed_wait_nodes(conn, execution_id)
                 completed_outputs = _completed_node_outputs(conn, execution_id)
-                run_spec = _spec_with_completed_outputs(spec, completed_outputs)
+                kwargs: dict[str, Any] = {}
                 if completed_wait_nodes:
-                    result = run_in_memory_until_waiting(
-                        run_spec,
-                        execution.input,
-                        completed_wait_nodes=completed_wait_nodes,
-                    )
-                else:
-                    result = run_in_memory_until_waiting(run_spec, execution.input)
+                    kwargs["completed_wait_nodes"] = completed_wait_nodes
+                if completed_outputs:
+                    kwargs["completed_node_outputs"] = completed_outputs
+                result = run_in_memory_until_waiting(spec, execution.input, **kwargs)
             except Exception as exc:
                 context = execution.context if execution is not None else {"node": {}}
                 result = EngineResult(

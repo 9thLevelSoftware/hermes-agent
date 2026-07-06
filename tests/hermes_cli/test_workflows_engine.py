@@ -113,6 +113,27 @@ def test_pass_output_renders_whole_string_templates_recursively():
     }
 
 
+def test_completed_node_outputs_are_literal_not_template_rendered():
+    spec = WorkflowSpec.model_validate({
+        "id": "demo", "name": "Demo", "version": 1,
+        "nodes": {
+            "ask": {"type": "agent_task", "profile": "worker", "prompt": "do it"},
+            "done": {"type": "pass", "output": {"answer": "${ node.ask.output.answer }"}},
+        },
+        "edges": [{"from": "ask", "to": "done"}],
+    })
+
+    result = run_in_memory_until_waiting(
+        spec,
+        input_data={"secret": "do-not-leak"},
+        completed_node_outputs={"ask": {"answer": "${ input.secret }"}},
+    )
+
+    assert result.status == "succeeded"
+    assert result.context["node"]["ask"]["output"] == {"answer": "${ input.secret }"}
+    assert result.context["node"]["done"]["output"] == {"answer": "${ input.secret }"}
+
+
 def test_next_edges_matches_node_and_node_port_exactly():
     spec = WorkflowSpec.model_validate({
         "id": "demo", "name": "Demo", "version": 1,

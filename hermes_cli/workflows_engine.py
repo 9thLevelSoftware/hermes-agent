@@ -81,9 +81,11 @@ def run_in_memory_until_waiting(
     spec: WorkflowSpec,
     input_data: dict[str, Any],
     completed_wait_nodes: set[str] | None = None,
+    completed_node_outputs: dict[str, Any] | None = None,
 ) -> EngineResult:
     validate_graph(spec)
     completed_wait_nodes = completed_wait_nodes or set()
+    completed_node_outputs = completed_node_outputs or {}
     context = initial_context(input_data, spec)
     runnable = deque(_initial_nodes(spec))
     # ponytail: cheap cycle guard; real scheduler can track runs.
@@ -102,6 +104,11 @@ def run_in_memory_until_waiting(
 
         node_id = runnable.popleft()
         node = spec.nodes[node_id]
+
+        if node_id in completed_node_outputs:
+            context["node"][node_id] = {"output": completed_node_outputs[node_id]}
+            runnable.extend(edge.to for edge in next_edges(spec, node_id))
+            continue
 
         if node.type == "pass":
             context["node"][node_id] = {"output": render_template(node.output, context)}

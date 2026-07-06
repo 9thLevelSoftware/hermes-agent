@@ -139,6 +139,22 @@ def test_agent_task_requires_non_blank_profile_and_prompt(profile, prompt):
         validate_graph(spec)
 
 
+def test_agent_task_max_retries_must_be_positive():
+    raw = _minimal_spec()
+    raw["nodes"] = {
+        "task": {
+            "type": "agent_task",
+            "profile": "worker",
+            "prompt": "do it",
+            "max_retries": 0,
+        }
+    }
+    raw["edges"] = []
+
+    with pytest.raises(ValidationError):
+        WorkflowSpec.model_validate(raw)
+
+
 def test_edge_from_alias_and_field_name_both_populate_from_():
     by_alias = EdgeSpec.model_validate({"from": "start", "to": "done"})
     by_name = EdgeSpec.model_validate({"from_": "start", "to": "done"})

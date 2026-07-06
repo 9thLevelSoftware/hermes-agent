@@ -61,7 +61,7 @@ class NodeSpec(BaseModel):
     workspace_path: str | None = None
     skills: list[str] = Field(default_factory=list)
     model_override: str | None = None
-    max_retries: int | None = Field(default=None, ge=0)
+    max_retries: int | None = Field(default=None, ge=1)
     goal_mode: bool = False
     goal_max_turns: int | None = Field(default=None, ge=1)
     retry: RetrySpec | None = None

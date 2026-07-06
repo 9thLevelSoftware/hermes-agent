@@ -222,6 +222,23 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+def test_create_task_persists_workflow_metadata_and_model_override(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="workflow step",
+            workflow_template_id="wf_demo",
+            current_step_key="ask",
+            model_override="test-model",
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.workflow_template_id == "wf_demo"
+    assert task.current_step_key == "ask"
+    assert task.model_override == "test-model"
+
+
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")
