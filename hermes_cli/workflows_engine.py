@@ -77,8 +77,13 @@ def _switch_port(node_id: str, cases: list[Any], context: dict[str, Any]) -> str
     return "default"
 
 
-def run_in_memory_until_waiting(spec: WorkflowSpec, input_data: dict[str, Any]) -> EngineResult:
+def run_in_memory_until_waiting(
+    spec: WorkflowSpec,
+    input_data: dict[str, Any],
+    completed_wait_nodes: set[str] | None = None,
+) -> EngineResult:
     validate_graph(spec)
+    completed_wait_nodes = completed_wait_nodes or set()
     context = initial_context(input_data, spec)
     runnable = deque(_initial_nodes(spec))
     # ponytail: cheap cycle guard; real scheduler can track runs.
@@ -119,6 +124,11 @@ def run_in_memory_until_waiting(spec: WorkflowSpec, input_data: dict[str, Any]) 
                 waiting_nodes=[],
                 error={"node": node_id, "type": "fail", "output": render_template(node.output, context)},
             )
+
+        if node.type == "wait" and node_id in completed_wait_nodes:
+            context["node"][node_id] = {"output": {"waited": True}}
+            runnable.extend(edge.to for edge in next_edges(spec, node_id))
+            continue
 
         if node.type in _WAITING_NODE_TYPES:
             return EngineResult(status="waiting", context=context, waiting_nodes=[node_id])

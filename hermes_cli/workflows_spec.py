@@ -28,6 +28,9 @@ class TriggerSpec(BaseModel):
 
     type: TriggerType
     id: str | None = None
+    cron: str | None = None
+    schedule: str | None = None
+    input: dict[str, Any] = Field(default_factory=dict)
 
 
 class RetrySpec(BaseModel):
@@ -55,6 +58,7 @@ class NodeSpec(BaseModel):
     prompt: str | None = None
     retry: RetrySpec | None = None
     workspace: WorkspaceSpec | None = None
+    seconds: int = Field(default=0, ge=0)
 
 
 class EdgeSpec(BaseModel):
@@ -86,6 +90,11 @@ class WorkflowSpec(BaseModel):
 
 
 def validate_graph(spec: WorkflowSpec) -> None:
+    for trigger in spec.triggers:
+        expr = trigger.cron or trigger.schedule or getattr(trigger, "expr", None)
+        if trigger.type == "schedule" and not expr:
+            raise ValueError("schedule trigger requires cron or schedule")
+
     if not spec.nodes:
         raise ValueError("workflow must define at least one node")
 

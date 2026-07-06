@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from croniter import croniter
+
 from hermes_constants import get_hermes_home
 from hermes_cli.workflows_spec import WorkflowSpec
 
@@ -82,6 +84,7 @@ CREATE TABLE IF NOT EXISTS workflow_node_runs (
     error         TEXT,
     started_at    INTEGER,
     completed_at  INTEGER,
+    wait_until    INTEGER,
     FOREIGN KEY (execution_id) REFERENCES workflow_executions(execution_id)
 );
 
@@ -143,6 +146,11 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
 def init_db(db_path: Path | None = None) -> None:
     with contextlib.closing(connect(db_path)) as conn:
         conn.executescript(SCHEMA_SQL)
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(workflow_node_runs)")
+        }
+        if "wait_until" not in columns:
+            conn.execute("ALTER TABLE workflow_node_runs ADD COLUMN wait_until INTEGER")
 
 
 @contextlib.contextmanager
@@ -173,6 +181,14 @@ def _spec_json(spec: WorkflowSpec) -> str:
 
 def _checksum(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _schedule_expr(trigger: Any) -> str | None:
+    return trigger.cron or trigger.schedule or getattr(trigger, "expr", None)
+
+
+def _next_cron_run(expr: str, base_ts: int) -> int:
+    return int(croniter(expr, base_ts).get_next(float))
 
 
 def _record_from_row(row: sqlite3.Row) -> WorkflowDefinitionRecord:
@@ -251,6 +267,33 @@ def deploy_definition(
                 now,
             ),
         )
+        conn.execute(
+            "DELETE FROM workflow_schedules WHERE workflow_id = ? AND version = ?",
+            (spec.id, spec.version),
+        )
+        for trigger in spec.triggers:
+            if trigger.type != "schedule":
+                continue
+            expr = _schedule_expr(trigger)
+            if not expr:
+                continue
+            conn.execute(
+                """
+                INSERT INTO workflow_schedules (
+                    workflow_id, version, trigger_id, schedule, enabled,
+                    next_run_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (
+                    spec.id,
+                    spec.version,
+                    trigger.id,
+                    expr,
+                    _next_cron_run(expr, now),
+                    now,
+                    now,
+                ),
+            )
 
 
 def get_definition(
@@ -275,10 +318,12 @@ def start_execution(
     input_data: dict,
     trigger_type: str,
     trigger_id: str | None = None,
+    version: int | None = None,
+    now: int | None = None,
 ) -> str:
-    definition = _definition_record(conn, workflow_id)
+    definition = _definition_record(conn, workflow_id, version)
     execution_id = f"wfexec_{secrets.token_hex(8)}"
-    now = int(time.time())
+    created_at = int(time.time()) if now is None else now
     with write_txn(conn):
         conn.execute(
             """
@@ -295,8 +340,8 @@ def start_execution(
                 _json_dumps({"input": input_data, "node": {}}),
                 trigger_type,
                 trigger_id,
-                now,
-                now,
+                created_at,
+                created_at,
             ),
         )
     return execution_id

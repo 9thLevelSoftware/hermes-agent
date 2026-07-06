@@ -11,6 +11,7 @@ from typing import Any
 
 from hermes_cli import workflows_db as wfdb
 from hermes_cli.workflows_engine import EngineResult, run_in_memory_until_waiting
+from hermes_cli.workflows_spec import WorkflowSpec
 
 
 def _json_dumps(value: Any) -> str:
@@ -71,12 +72,130 @@ def _append_event(
     )
 
 
+def _fire_due_schedules(conn: sqlite3.Connection, *, now: int) -> None:
+    with wfdb.write_txn(conn):
+        rows = conn.execute(
+            """
+            SELECT * FROM workflow_schedules
+             WHERE enabled = 1
+               AND next_run_at IS NOT NULL
+               AND next_run_at <= ?
+             ORDER BY next_run_at, id
+            """,
+            (now,),
+        ).fetchall()
+        for row in rows:
+            wfdb.start_execution(
+                conn,
+                row["workflow_id"],
+                input_data={},
+                trigger_type="schedule",
+                trigger_id=row["trigger_id"],
+                version=row["version"],
+                now=now,
+            )
+            conn.execute(
+                """
+                UPDATE workflow_schedules
+                   SET next_run_at = ?, updated_at = ?
+                 WHERE id = ?
+                """,
+                (wfdb._next_cron_run(row["schedule"], now), now, row["id"]),
+            )
+
+
+def _resume_due_waits(conn: sqlite3.Connection, *, now: int) -> None:
+    with wfdb.write_txn(conn):
+        rows = conn.execute(
+            """
+            SELECT nr.id, nr.execution_id
+              FROM workflow_node_runs nr
+              JOIN workflow_executions ex ON ex.execution_id = nr.execution_id
+             WHERE nr.status = 'waiting'
+               AND nr.wait_until IS NOT NULL
+               AND nr.wait_until <= ?
+               AND ex.status = 'waiting'
+             ORDER BY nr.wait_until, nr.id
+            """,
+            (now,),
+        ).fetchall()
+        for row in rows:
+            updated = conn.execute(
+                """
+                UPDATE workflow_node_runs
+                   SET status = 'succeeded', completed_at = ?
+                 WHERE id = ? AND status = 'waiting'
+                """,
+                (now, row["id"]),
+            ).rowcount
+            if updated:
+                conn.execute(
+                    """
+                    UPDATE workflow_executions
+                       SET status = 'queued', claim_lock = NULL,
+                           claim_expires = NULL, updated_at = ?
+                     WHERE execution_id = ? AND status = 'waiting'
+                    """,
+                    (now, row["execution_id"]),
+                )
+
+
+def _completed_wait_nodes(conn: sqlite3.Connection, execution_id: str) -> set[str]:
+    return {
+        row["node_id"]
+        for row in conn.execute(
+            """
+            SELECT node_id FROM workflow_node_runs
+             WHERE execution_id = ?
+               AND status = 'succeeded'
+               AND wait_until IS NOT NULL
+            """,
+            (execution_id,),
+        )
+    }
+
+
+def _persist_waiting_nodes(
+    conn: sqlite3.Connection,
+    *,
+    execution_id: str,
+    result: EngineResult,
+    spec: WorkflowSpec | None,
+    now: int,
+) -> None:
+    if result.status != "waiting":
+        return
+    for node_id in result.waiting_nodes:
+        node = spec.nodes.get(node_id) if spec is not None else None
+        if node is not None and node.type == "wait":
+            wait_until = now + node.seconds
+        else:
+            wait_until = None
+        exists = conn.execute(
+            """
+            SELECT 1 FROM workflow_node_runs
+             WHERE execution_id = ? AND node_id = ? AND status = 'waiting'
+            """,
+            (execution_id, node_id),
+        ).fetchone()
+        if exists is None:
+            conn.execute(
+                """
+                INSERT INTO workflow_node_runs (
+                    execution_id, node_id, status, started_at, wait_until
+                ) VALUES (?, ?, 'waiting', ?, ?)
+                """,
+                (execution_id, node_id, now, wait_until),
+            )
+
+
 def _finish(
     conn: sqlite3.Connection,
     *,
     execution_id: str,
     token: str,
     result: EngineResult,
+    spec: WorkflowSpec | None,
     now: int,
 ) -> bool:
     final_event = {
@@ -98,9 +217,19 @@ def _finish(
         if row is None or row["claim_lock"] != token:
             return False
 
+        _persist_waiting_nodes(
+            conn,
+            execution_id=execution_id,
+            result=result,
+            spec=spec,
+            now=now,
+        )
         _append_event(conn, execution_id, "execution_started", {}, now)
         for node_id, node_context in result.context.get("node", {}).items():
-            output = node_context.get("output") if isinstance(node_context, dict) else None
+            if isinstance(node_context, dict):
+                output = node_context.get("output")
+            else:
+                output = None
             _append_event(
                 conn,
                 execution_id,
@@ -135,16 +264,27 @@ def tick(
     tick_now = int(time.time()) if now is None else now
     processed = 0
     with wfdb.connect(db_path) as conn:
+        _fire_due_schedules(conn, now=tick_now)
+        _resume_due_waits(conn, now=tick_now)
         while processed < limit:
             claimed = _claim_next(conn, now=tick_now, lease_seconds=lease_seconds)
             if claimed is None:
                 break
             execution_id, token = claimed
             execution = None
+            spec = None
             try:
                 execution = wfdb.get_execution(conn, execution_id)
                 spec = wfdb.get_definition(conn, execution.workflow_id, execution.version)
-                result = run_in_memory_until_waiting(spec, execution.input)
+                completed_wait_nodes = _completed_wait_nodes(conn, execution_id)
+                if completed_wait_nodes:
+                    result = run_in_memory_until_waiting(
+                        spec,
+                        execution.input,
+                        completed_wait_nodes=completed_wait_nodes,
+                    )
+                else:
+                    result = run_in_memory_until_waiting(spec, execution.input)
             except Exception as exc:
                 context = execution.context if execution is not None else {"node": {}}
                 result = EngineResult(
@@ -153,6 +293,13 @@ def tick(
                     waiting_nodes=[],
                     error={"message": str(exc)},
                 )
-            if _finish(conn, execution_id=execution_id, token=token, result=result, now=tick_now):
+            if _finish(
+                conn,
+                execution_id=execution_id,
+                token=token,
+                result=result,
+                spec=spec,
+                now=tick_now,
+            ):
                 processed += 1
     return processed
