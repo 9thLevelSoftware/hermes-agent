@@ -244,6 +244,42 @@ def test_due_schedule_starts_once_and_advances_next_run(tmp_path, monkeypatch):
         ).fetchone()[0] == 1
 
 
+def test_due_schedule_uses_trigger_input(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    wfdb.init_db()
+    spec = WorkflowSpec.model_validate({
+        "id": "scheduled_demo", "name": "Scheduled Demo", "version": 1,
+        "triggers": [{
+            "type": "schedule",
+            "id": "with_input",
+            "cron": "* * * * *",
+            "input": {"x": 42},
+        }],
+        "nodes": {"start": {"type": "pass", "output": {"x": "${ input.x }"}}},
+    })
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, spec, created_by="test")
+        next_run_at = conn.execute("SELECT next_run_at FROM workflow_schedules").fetchone()[0]
+
+    assert workflows_dispatcher.tick(limit=1, now=next_run_at) == 1
+
+    with wfdb.connect() as conn:
+        executions = [
+            wfdb.get_execution(conn, row["execution_id"])
+            for row in conn.execute(
+                """
+                SELECT execution_id FROM workflow_executions
+                 WHERE workflow_id = 'scheduled_demo'
+                """
+            )
+        ]
+    assert len(executions) == 1
+    execution = executions[0]
+    assert execution.input == {"x": 42}
+    assert execution.status == "succeeded"
+    assert execution.context["node"]["start"]["output"] == {"x": 42}
+
+
 def test_redeploying_schedule_replaces_older_version_rows(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     wfdb.init_db()

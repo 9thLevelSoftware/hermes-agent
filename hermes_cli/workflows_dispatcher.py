@@ -72,6 +72,20 @@ def _append_event(
     )
 
 
+def _schedule_input(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    spec = wfdb.get_definition(conn, row["workflow_id"], row["version"])
+    for trigger in spec.triggers:
+        if trigger.type != "schedule":
+            continue
+        expr = trigger.cron or trigger.schedule or getattr(trigger, "expr", None)
+        if row["trigger_id"] is not None:
+            if trigger.id == row["trigger_id"]:
+                return dict(trigger.input)
+        elif expr == row["schedule"]:
+            return dict(trigger.input)
+    return {}
+
+
 def _fire_due_schedules(conn: sqlite3.Connection, *, now: int) -> None:
     with wfdb.write_txn(conn):
         rows = conn.execute(
@@ -88,7 +102,7 @@ def _fire_due_schedules(conn: sqlite3.Connection, *, now: int) -> None:
             wfdb.start_execution(
                 conn,
                 row["workflow_id"],
-                input_data={},
+                input_data=_schedule_input(conn, row),
                 trigger_type="schedule",
                 trigger_id=row["trigger_id"],
                 version=row["version"],
