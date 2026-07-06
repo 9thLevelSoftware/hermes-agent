@@ -2648,6 +2648,14 @@ DEFAULT_CONFIG = {
         "dispatch_stale_timeout_seconds": 14400,
     },
 
+    # Workflow graph engine dispatcher. Off by default for the first merge;
+    # long-lived gateways can opt in to ticking queued workflow executions.
+    "workflow": {
+        "dispatch_in_gateway": False,
+        "tick_interval_seconds": 30,
+        "max_executions_per_tick": 50,
+    },
+
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {
         # Execution mode:
