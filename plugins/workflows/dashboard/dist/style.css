@@ -1,0 +1,242 @@
+/* Workflows dashboard plugin styles. All selectors stay scoped under the plugin root. */
+.hermes-workflows {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  color: var(--color-foreground);
+}
+
+.hermes-workflows * {
+  box-sizing: border-box;
+}
+
+.hermes-workflows .hermes-workflows-header,
+.hermes-workflows .hermes-workflows-panel {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius, 0.75rem);
+  background: color-mix(in srgb, var(--color-card) 88%, transparent);
+  padding: 1rem;
+}
+
+.hermes-workflows .hermes-workflows-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.hermes-workflows h1,
+.hermes-workflows h2,
+.hermes-workflows h3,
+.hermes-workflows p {
+  margin: 0;
+}
+
+.hermes-workflows h1 {
+  font-size: 1.55rem;
+  letter-spacing: -0.04em;
+}
+
+.hermes-workflows h2 {
+  font-size: 1rem;
+}
+
+.hermes-workflows h3 {
+  font-size: 0.86rem;
+}
+
+.hermes-workflows .hermes-workflows-muted {
+  color: var(--color-muted-foreground);
+  font-size: 0.84rem;
+}
+
+.hermes-workflows .hermes-workflows-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.9fr) minmax(340px, 1.3fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.hermes-workflows .hermes-workflows-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.hermes-workflows .hermes-workflows-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.hermes-workflows .hermes-workflows-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.hermes-workflows .hermes-workflows-list,
+.hermes-workflows .hermes-workflows-executions,
+.hermes-workflows .hermes-workflows-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.hermes-workflows .hermes-workflows-item {
+  width: 100%;
+  text-align: left;
+  border: 1px solid var(--color-border);
+  border-radius: calc(var(--radius, 0.75rem) * 0.75);
+  background: color-mix(in srgb, var(--color-card) 72%, transparent);
+  color: inherit;
+  padding: 0.65rem;
+  cursor: pointer;
+}
+
+.hermes-workflows .hermes-workflows-item:hover,
+.hermes-workflows .hermes-workflows-item.is-selected {
+  border-color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 12%, var(--color-card));
+}
+
+.hermes-workflows .hermes-workflows-item-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-weight: 650;
+}
+
+.hermes-workflows .hermes-workflows-meta {
+  margin-top: 0.25rem;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.72rem;
+}
+
+.hermes-workflows .hermes-workflows-badge {
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  padding: 0.1rem 0.45rem;
+  color: var(--color-muted-foreground);
+  font-size: 0.7rem;
+  white-space: nowrap;
+}
+
+.hermes-workflows .hermes-workflows-badge.is-on {
+  border-color: color-mix(in srgb, var(--color-primary) 55%, var(--color-border));
+  color: var(--color-primary);
+}
+
+.hermes-workflows .hermes-workflows-badge.is-off {
+  border-color: color-mix(in srgb, var(--color-destructive, var(--color-primary)) 55%, var(--color-border));
+  color: var(--color-destructive, var(--color-primary));
+}
+
+.hermes-workflows .hermes-workflows-editor,
+.hermes-workflows .hermes-workflows-run-input,
+.hermes-workflows input,
+.hermes-workflows select {
+  width: 100%;
+  border: 1px solid var(--color-border);
+  border-radius: calc(var(--radius, 0.75rem) * 0.75);
+  background: color-mix(in srgb, var(--color-background) 85%, transparent);
+  color: inherit;
+  padding: 0.65rem;
+}
+
+.hermes-workflows .hermes-workflows-editor,
+.hermes-workflows .hermes-workflows-run-input {
+  min-height: 12rem;
+  resize: vertical;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.hermes-workflows .hermes-workflows-run-input {
+  min-height: 7rem;
+}
+
+.hermes-workflows button {
+  border: 1px solid var(--color-border);
+  border-radius: calc(var(--radius, 0.75rem) * 0.75);
+  background: color-mix(in srgb, var(--color-card) 80%, transparent);
+  color: inherit;
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+}
+
+.hermes-workflows button:hover:not(:disabled) {
+  border-color: var(--color-primary);
+}
+
+.hermes-workflows button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.hermes-workflows .hermes-workflows-primary {
+  background: color-mix(in srgb, var(--color-primary) 20%, var(--color-card));
+}
+
+.hermes-workflows .hermes-workflows-banner {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius, 0.75rem);
+  padding: 0.65rem 0.8rem;
+  background: color-mix(in srgb, var(--color-card) 78%, transparent);
+  color: var(--color-muted-foreground);
+}
+
+.hermes-workflows .hermes-workflows-banner.is-error {
+  border-color: var(--color-destructive, var(--color-primary));
+  color: var(--color-destructive, var(--color-primary));
+}
+
+.hermes-workflows .hermes-workflows-graph {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.hermes-workflows .hermes-workflows-node-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.6rem;
+}
+
+.hermes-workflows .hermes-workflows-node-card,
+.hermes-workflows .hermes-workflows-edge-card,
+.hermes-workflows .hermes-workflows-event {
+  border: 1px solid var(--color-border);
+  border-radius: calc(var(--radius, 0.75rem) * 0.75);
+  background: color-mix(in srgb, var(--color-background) 72%, transparent);
+  padding: 0.6rem;
+}
+
+.hermes-workflows .hermes-workflows-node-type,
+.hermes-workflows .hermes-workflows-event-kind {
+  color: var(--color-muted-foreground);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.72rem;
+}
+
+.hermes-workflows .hermes-workflows-pre {
+  margin: 0.35rem 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: var(--color-muted-foreground);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.72rem;
+}
+
+@media (max-width: 980px) {
+  .hermes-workflows .hermes-workflows-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .hermes-workflows .hermes-workflows-header {
+    flex-direction: column;
+  }
+}

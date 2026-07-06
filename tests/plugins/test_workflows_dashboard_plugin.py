@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -89,7 +91,23 @@ def test_manifest_points_to_plugin_api():
     assert manifest["tab"] == {"path": "/workflows", "position": "after:kanban"}
     assert manifest["entry"] == "dist/index.js"
     assert (PLUGIN_DIR / manifest["entry"]).exists()
+    assert manifest["css"] == "dist/style.css"
+    assert (PLUGIN_DIR / manifest["css"]).exists()
     assert manifest["api"] == "plugin_api.py"
+
+
+def test_dashboard_bundle_is_syntax_valid_when_node_is_available():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    bundle = PLUGIN_DIR / "dist" / "index.js"
+    result = subprocess.run(
+        [node, "--check", str(bundle)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_dashboard_bundle_registers_plugin_without_build_scaffolding():
@@ -101,6 +119,42 @@ def test_dashboard_bundle_registers_plugin_without_build_scaffolding():
         line.lstrip().startswith(("import ", "export ")) for line in bundle.splitlines()
     )
     assert "__webpack_require__" not in bundle
+
+
+def test_dashboard_bundle_contains_workflow_mvp_api_and_ui_markers():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    for marker in [
+        'const API = "/api/plugins/workflows"',
+        "/api/plugins/workflows/definitions",
+        "/definitions/validate",
+        "/definitions/deploy",
+        "/executions",
+        "/events",
+        "/run",
+    ]:
+        assert marker in bundle
+
+    for marker in [
+        "Workflow list",
+        "Validate / deploy definition",
+        "Manual run form",
+        "Execution list",
+        "Execution detail timeline",
+        "Readonly graph",
+        "hermes-workflows-list",
+        "hermes-workflows-editor",
+        "hermes-workflows-run-form",
+        "hermes-workflows-executions",
+        "hermes-workflows-timeline",
+        "hermes-workflows-graph",
+    ]:
+        assert marker in bundle
+
+
+def test_dashboard_css_is_scoped_to_workflows_plugin():
+    css_file = PLUGIN_DIR / "dist" / "style.css"
+    css = css_file.read_text(encoding="utf-8")
+    assert ".hermes-workflows" in css
 
 
 def test_validate_deploy_list_show_roundtrip(client):
