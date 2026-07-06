@@ -164,3 +164,78 @@ def test_workflow_kanban_completion_routes_approved_path_e2e(tmp_path, monkeypat
         for event in events
         if event["kind"] == "node_succeeded"
     ] == ["implement", "approved"]
+
+
+def test_workflow_kanban_completion_routes_rejected_default_path_e2e(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    wfdb.init_db()
+
+    spec = _approval_workflow()
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, spec, created_by="test")
+        exec_id = wfdb.start_execution(
+            conn,
+            spec.id,
+            input_data={"subject": "deadlift form"},
+            trigger_type="manual",
+        )
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+
+    rejected_result = {"verdict": "rejected", "reason": "needs tests"}
+    with kb.connect() as kconn:
+        implement_task = kb.list_tasks(kconn)[0]
+        assert kb.complete_task(kconn, implement_task.id, result=json.dumps(rejected_result))
+
+    assert workflows_dispatcher.tick(limit=1, now=101) == 1
+
+    with wfdb.connect() as conn, kb.connect() as kconn:
+        execution = wfdb.get_execution(conn, exec_id)
+        tasks = kb.list_tasks(kconn, workflow_template_id=spec.id)
+        runs = [dict(row) for row in conn.execute(
+            """
+            SELECT node_id, status, output_json, kanban_task_id
+              FROM workflow_node_runs
+             WHERE execution_id = ?
+             ORDER BY id
+            """,
+            (exec_id,),
+        )]
+    revise_tasks = [task for task in tasks if task.current_step_key == "revise"]
+    assert execution.status == "waiting"
+    assert execution.context["node"]["implement"]["output"] == rejected_result
+    assert "approved" not in execution.context["node"]
+    assert [task.current_step_key for task in tasks] == ["implement", "revise"]
+    assert len(revise_tasks) == 1
+    revise_task = revise_tasks[0]
+    assert revise_task.id != implement_task.id
+    assert revise_task.status in {"ready", "todo"}
+    assert revise_task.body is not None and "needs tests" in revise_task.body
+    assert [
+        {key: run[key] for key in ("node_id", "status", "kanban_task_id")}
+        for run in runs
+    ] == [
+        {
+            "node_id": "implement",
+            "status": "succeeded",
+            "kanban_task_id": implement_task.id,
+        },
+        {
+            "node_id": "revise",
+            "status": "waiting",
+            "kanban_task_id": revise_task.id,
+        },
+    ]
+    assert json.loads(runs[0]["output_json"]) == rejected_result
+    assert runs[1]["output_json"] is None
+
+    events = _workflow_events(exec_id)
+    assert [
+        json.loads(event["payload_json"]).get("node_id")
+        for event in events
+        if event["kind"] == "node_succeeded"
+    ] == ["implement"]
