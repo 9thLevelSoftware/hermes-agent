@@ -103,13 +103,20 @@ def run_in_memory_until_waiting(
     completed_node_outputs = completed_node_outputs or {}
     catch_failed_nodes = catch_failed_nodes or set()
     context = initial_context(input_data, spec)
-    runnable: deque[tuple[str, tuple[str, str] | None]] = deque(
-        (node_id, None) for node_id in _initial_nodes(spec)
-    )
+    runnable: deque[tuple[str, tuple[str, str] | None]] = deque()
     max_steps = spec.max_node_runs
     steps = 0
     waiting_nodes: list[str] = []
+    scheduled_branch_by_node: dict[str, tuple[str, str] | None] = {}
     completed_branch_by_node: dict[str, tuple[str, str]] = {}
+
+    def enqueue(node_id: str, branch_key: tuple[str, str] | None) -> None:
+        queued_branch = None if spec.nodes[node_id].type == "join" else branch_key
+        scheduled_branch_by_node.setdefault(node_id, queued_branch)
+        runnable.append((node_id, queued_branch))
+
+    for node_id in _initial_nodes(spec):
+        enqueue(node_id, None)
 
     while runnable:
         steps += 1
@@ -130,22 +137,25 @@ def run_in_memory_until_waiting(
         if node_id in completed_node_outputs:
             context["node"][node_id] = {"output": completed_node_outputs[node_id]}
             _record_branch_output(context, completed_branch_by_node, node_id, branch_key)
-            runnable.extend((edge.to, branch_key) for edge in next_edges(spec, node_id))
+            for edge in next_edges(spec, node_id):
+                enqueue(edge.to, branch_key)
             continue
 
         if node.type == "pass":
             context["node"][node_id] = {"output": render_template(node.output, context)}
             _record_branch_output(context, completed_branch_by_node, node_id, branch_key)
-            runnable.extend((edge.to, branch_key) for edge in next_edges(spec, node_id))
+            for edge in next_edges(spec, node_id):
+                enqueue(edge.to, branch_key)
             continue
 
         if node.type == "switch":
             port = _switch_port(node_id, node.cases, context)
             edges = next_edges(spec, node_id, port)
             if edges:
-                runnable.extend((edge.to, branch_key) for edge in edges)
+                for edge in edges:
+                    enqueue(edge.to, branch_key)
             elif port == "default" and node.default:
-                runnable.append((node.default, branch_key))
+                enqueue(node.default, branch_key)
             continue
 
         if node.type == "parallel":
@@ -156,33 +166,43 @@ def run_in_memory_until_waiting(
             ]
             context.setdefault("branches", {}).setdefault(node_id, {})
             context["node"][node_id] = {"output": {"branches": [branch for branch, _ in branch_edges]}}
-            runnable.extend((edge.to, (node_id, branch)) for branch, edge in branch_edges)
+            for branch, edge in branch_edges:
+                enqueue(edge.to, (node_id, branch))
             continue
 
         if node.type == "join":
             incoming = [edge for edge in spec.edges if edge.to == node_id]
-            if any(edge.from_.split(".", 1)[0] not in context["node"] for edge in incoming):
+            branches = {}
+            expected_labels: set[str] = set()
+            for edge in incoming:
+                source_base, _, port = edge.from_.partition(".")
+                if source_base not in scheduled_branch_by_node and source_base not in context["node"]:
+                    continue
+                owner = completed_branch_by_node.get(source_base)
+                if owner is None:
+                    owner = scheduled_branch_by_node.get(source_base)
+                label = owner[1] if owner else (port or source_base)
+                expected_labels.add(label)
+                node_context = context["node"].get(source_base, {})
+                if source_base in context["node"]:
+                    output = node_context.get("output") if isinstance(node_context, dict) else None
+                    branches[label] = output
+            if expected_labels - branches.keys():
                 if runnable:
-                    runnable.append((node_id, branch_key))
+                    enqueue(node_id, branch_key)
                 elif not waiting_nodes:
                     return EngineResult(status="waiting", context=context, waiting_nodes=[node_id])
                 continue
-            branches = {}
-            for edge in incoming:
-                source_base, _, port = edge.from_.partition(".")
-                node_context = context["node"].get(source_base, {})
-                output = node_context.get("output") if isinstance(node_context, dict) else None
-                owner = completed_branch_by_node.get(source_base)
-                branches[owner[1] if owner else (port or source_base)] = output
             context["node"][node_id] = {"output": {"branches": branches}}
-            runnable.extend((edge.to, None) for edge in next_edges(spec, node_id))
+            for edge in next_edges(spec, node_id):
+                enqueue(edge.to, None)
             continue
 
         if node.type == "fail":
             error = {"node": node_id, "type": "fail", "output": render_template(node.output, context)}
             if node_id in catch_failed_nodes and node.catch:
                 context["error"] = error_context or error
-                runnable.append((node.catch, branch_key))
+                enqueue(node.catch, branch_key)
                 continue
             return EngineResult(
                 status="failed",
@@ -194,7 +214,8 @@ def run_in_memory_until_waiting(
         if node.type == "wait" and node_id in completed_wait_nodes:
             context["node"][node_id] = {"output": {"waited": True}}
             _record_branch_output(context, completed_branch_by_node, node_id, branch_key)
-            runnable.extend((edge.to, branch_key) for edge in next_edges(spec, node_id))
+            for edge in next_edges(spec, node_id):
+                enqueue(edge.to, branch_key)
             continue
 
         if node.type in _WAITING_NODE_TYPES:
