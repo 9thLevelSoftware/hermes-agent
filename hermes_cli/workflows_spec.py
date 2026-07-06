@@ -55,7 +55,15 @@ class NodeSpec(BaseModel):
     cases: list[Any] = Field(default_factory=list)
     default: str | None = None
     profile: str | None = None
-    prompt: str | None = None
+    prompt: Any = None
+    title: str | None = None
+    workspace_kind: str | None = None
+    workspace_path: str | None = None
+    skills: list[str] = Field(default_factory=list)
+    model_override: str | None = None
+    max_retries: int | None = Field(default=None, ge=0)
+    goal_mode: bool = False
+    goal_max_turns: int | None = Field(default=None, ge=1)
     retry: RetrySpec | None = None
     workspace: WorkspaceSpec | None = None
     seconds: int = Field(default=0, ge=0)
@@ -124,5 +132,8 @@ def validate_graph(spec: WorkflowSpec) -> None:
                     raise ValueError(f"unknown switch default target: {node.default}")
             elif node_id not in outgoing_sources:
                 raise ValueError(f"switch node {node_id} must define outgoing edges or default")
-        if node.type == "agent_task" and (not (node.profile or "").strip() or not (node.prompt or "").strip()):
+        missing_prompt = node.prompt is None or (
+            isinstance(node.prompt, str) and not node.prompt.strip()
+        )
+        if node.type == "agent_task" and (not (node.profile or "").strip() or missing_prompt):
             raise ValueError(f"agent_task node {node_id} requires profile and prompt")

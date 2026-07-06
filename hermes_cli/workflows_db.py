@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS workflow_node_runs (
     started_at    INTEGER,
     completed_at  INTEGER,
     wait_until    INTEGER,
+    kanban_task_id TEXT,
     FOREIGN KEY (execution_id) REFERENCES workflow_executions(execution_id)
 );
 
@@ -115,6 +116,8 @@ CREATE INDEX IF NOT EXISTS idx_workflow_executions_status
     ON workflow_executions(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_workflow_executions_definition
     ON workflow_executions(workflow_id, version);
+CREATE INDEX IF NOT EXISTS idx_workflow_node_runs_kanban_task
+    ON workflow_node_runs(kanban_task_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_events_execution
     ON workflow_events(execution_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_workflow_schedules_enabled
@@ -151,6 +154,8 @@ def init_db(db_path: Path | None = None) -> None:
         }
         if "wait_until" not in columns:
             conn.execute("ALTER TABLE workflow_node_runs ADD COLUMN wait_until INTEGER")
+        if "kanban_task_id" not in columns:
+            conn.execute("ALTER TABLE workflow_node_runs ADD COLUMN kanban_task_id TEXT")
 
 
 @contextlib.contextmanager

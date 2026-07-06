@@ -1,5 +1,7 @@
 import json
+from pathlib import Path
 
+from hermes_cli import kanban_db as kb
 from hermes_cli import workflows_db as wfdb
 from hermes_cli import workflows_dispatcher
 from hermes_cli.workflows_engine import EngineResult
@@ -39,6 +41,27 @@ def _wait_spec() -> WorkflowSpec:
             {"from": "start", "to": "pause"},
             {"from": "pause", "to": "done"},
         ],
+    })
+
+
+def _agent_spec() -> WorkflowSpec:
+    return WorkflowSpec.model_validate({
+        "id": "agent_demo", "name": "Agent Demo", "version": 1,
+        "triggers": [{"type": "manual", "id": "manual"}],
+        "nodes": {
+            "ask": {
+                "type": "agent_task",
+                "profile": "worker-profile",
+                "title": "Do agent work",
+                "prompt": {"task": "${ input.task }"},
+                "workspace_kind": "scratch",
+                "skills": ["test-driven-development"],
+                "max_retries": 2,
+                "goal_mode": True,
+            },
+            "done": {"type": "pass", "output": {"agent": "${ node.ask.output.answer }"}},
+        },
+        "edges": [{"from": "ask", "to": "done"}],
     })
 
 
@@ -200,6 +223,105 @@ def test_wait_node_persists_wait_until_then_resumes_when_due(tmp_path, monkeypat
             """,
             (exec_id,),
         ).fetchone()[0] == 1
+
+
+def test_agent_task_creates_kanban_card_and_resumes_after_completion(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    wfdb.init_db()
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, _agent_spec(), created_by="test")
+        exec_id = wfdb.start_execution(
+            conn, "agent_demo", input_data={"task": "hello"}, trigger_type="manual"
+        )
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+
+    with wfdb.connect() as conn, kb.connect() as kconn:
+        execution = wfdb.get_execution(conn, exec_id)
+        tasks = kb.list_tasks(kconn)
+        ask = conn.execute(
+            """
+            SELECT * FROM workflow_node_runs
+             WHERE execution_id = ? AND node_id = 'ask'
+            """,
+            (exec_id,),
+        ).fetchall()
+    assert execution.status == "waiting"
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.workflow_template_id == "agent_demo"
+    assert task.current_step_key == "ask"
+    assert task.assignee == "worker-profile"
+    assert task.status in {"ready", "todo"}
+    assert task.body is not None and "hello" in task.body
+    assert len(ask) == 1
+    assert ask[0]["status"] == "waiting"
+    assert ask[0]["kanban_task_id"] == task.id
+    assert ask[0]["wait_until"] is None
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 0
+    with kb.connect() as kconn:
+        assert len(kb.list_tasks(kconn)) == 1
+        assert kb.complete_task(kconn, task.id, result=json.dumps({"answer": "ok"}))
+
+    assert workflows_dispatcher.tick(limit=1, now=101) == 1
+
+    with wfdb.connect() as conn:
+        execution = wfdb.get_execution(conn, exec_id)
+        ask = conn.execute(
+            """
+            SELECT * FROM workflow_node_runs
+             WHERE execution_id = ? AND node_id = 'ask'
+            """,
+            (exec_id,),
+        ).fetchone()
+    assert execution.status == "succeeded"
+    assert execution.context["node"]["done"]["output"] == {"agent": "ok"}
+    assert ask["status"] == "succeeded"
+    assert json.loads(ask["output_json"]) == {"answer": "ok"}
+
+
+def test_blocked_kanban_agent_task_blocks_workflow(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    wfdb.init_db()
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, _agent_spec(), created_by="test")
+        exec_id = wfdb.start_execution(
+            conn, "agent_demo", input_data={"task": "hello"}, trigger_type="manual"
+        )
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+    with kb.connect() as kconn:
+        task = kb.list_tasks(kconn)[0]
+        assert kb.block_task(kconn, task.id, reason="needs input")
+
+    assert workflows_dispatcher.tick(limit=1, now=101) == 0
+
+    with wfdb.connect() as conn:
+        execution = wfdb.get_execution(conn, exec_id)
+        ask = conn.execute(
+            """
+            SELECT * FROM workflow_node_runs
+             WHERE execution_id = ? AND node_id = 'ask'
+            """,
+            (exec_id,),
+        ).fetchone()
+    assert execution.status == "blocked"
+    assert execution.context["error"] == {
+        "node_id": "ask",
+        "kanban_task_id": task.id,
+        "reason": "needs input",
+    }
+    assert ask["status"] == "blocked"
+    assert json.loads(ask["error"]) == execution.context["error"]
 
 
 def test_due_schedule_starts_once_and_advances_next_run(tmp_path, monkeypatch):
