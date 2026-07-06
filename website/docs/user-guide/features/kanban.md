@@ -59,7 +59,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
-- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | scheduled | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
@@ -467,7 +467,7 @@ hermes dashboard        # "Kanban" tab appears in the nav, after "Skills"
 
 ### What the plugin gives you
 
-- A **Kanban** tab showing one column per status: `triage`, `todo`, `ready`, `running`, `blocked`, `done` (plus `archived` when the toggle is on).
+- A **Kanban** tab showing one column per status: `triage`, `todo`, `scheduled`, `ready`, `running`, `blocked`, `review`, `done` (plus `archived` when the toggle is on).
   - `triage` is the parking column for rough ideas. By default (`kanban.auto_decompose: true`), the dispatcher auto-runs the **decomposer** on tasks that land here. The built-in decomposer uses the `auxiliary.kanban_decomposer` model path, reads your profile roster (with descriptions), and fans the task out into a small graph of child tasks routed to the best-fit specialists. The original task stays alive as the parent of every child so its assignee (`kanban.orchestrator_profile`, or the active default profile when unset) wakes back up to judge completion when everything finishes. Flip the **Orchestration: Auto/Manual** pill at the top of the page (emerald = Auto, muted gray = Manual), or by editing `config.yaml` directly. Both modes coexist with `hermes kanban specify` - that's still available as a single-task spec rewrite when you don't want fan-out.
 - Cards show the task id, title, priority badge, tenant tag, assigned profile, comment/link counts, a **progress pill** (`N/M` children done when the task has dependents), and "created N ago". A per-card checkbox enables multi-select.
 - **Per-profile lanes inside Running** — toolbar checkbox toggles sub-grouping of the Running column by assignee.
@@ -587,11 +587,11 @@ Each key is optional and falls back to the shown default.
 
 ### Security model
 
-The dashboard's HTTP auth middleware [explicitly skips `/api/plugins/`](./extending-the-dashboard#backend-api-routes) — plugin routes are unauthenticated by design because the dashboard binds to localhost by default. That means the kanban REST surface is reachable from any process on the host.
+Plugin routes are protected by the same dashboard auth/session middleware as core `/api` routes. On the default localhost bind, the SPA sends the dashboard's ephemeral session token; on remote/gated binds, the dashboard auth gate verifies the session before plugin handlers run.
 
-The WebSocket takes one additional step: it requires the dashboard's ephemeral session token as a `?token=…` query parameter (browsers can't set `Authorization` on an upgrade request), matching the pattern used by the in-browser PTY bridge.
+The live-events WebSocket uses the dashboard's shared WebSocket auth gate because browsers can't set custom auth headers on an upgrade request. Loopback sessions use a `?token=…` query parameter, while gated deployments use the dashboard's ticket/session flow.
 
-If you run `hermes dashboard --host 0.0.0.0`, every plugin route — kanban included — becomes reachable from the network. **Don't do that on a shared host.** The board contains task bodies, comments, and workspace paths; an attacker reaching these routes gets read access to your entire collaboration surface and can also create / reassign / archive tasks.
+The dashboard binds to localhost by default. If you run `hermes dashboard --host 0.0.0.0`, still treat it carefully: any authenticated dashboard user can read task bodies, comments, and workspace paths, and can also create / reassign / archive tasks.
 
 Tasks in `~/.hermes/kanban.db` are profile-agnostic on purpose (that's the coordination primitive). If you open the dashboard with `hermes -p <profile> dashboard`, the board still shows tasks created by any other profile on the host. Same user owns all profiles, but this is worth knowing if multiple personas coexist.
 
@@ -635,7 +635,7 @@ hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to
 hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
         [--priority N]
 hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
-hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
+hermes kanban schedule <id> [reason...] [--ids <id>...] # park task(s) in scheduled until unblocked
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
@@ -692,13 +692,13 @@ kanban:
   default_workdir: ~/work/active-project
 ```
 
-### Scheduled task starts (`scheduled_at`)
+### Scheduled task starts (`scheduled` status)
 
-Set `scheduled_at` on a task to delay dispatch until a specific time. The dispatcher skips ready tasks whose `scheduled_at` is in the future and picks them up on the first tick after that timestamp.
+`hermes kanban schedule` parks one or more tasks in `scheduled`, a non-dispatchable waiting status. It records the reason/timing note as a comment, but it does not attach a wake-up timestamp. A human, cron job, or other automation must call `hermes kanban unblock` when the task should become dispatchable again.
 
 ```bash
-hermes kanban create "nightly backup audit" \
-  --assignee ops --scheduled-at "2026-06-01T03:00:00Z"
+hermes kanban schedule t_abcd "run after the backup window"
+hermes kanban unblock t_abcd --reason "backup window reached"
 ```
 
 ### Respawn guard
@@ -728,7 +728,9 @@ All of these are gated by the same dashboard plugin auth as the rest of the kanb
 
 ```bash
 hermes kanban swarm "Design a multi-region failover plan" \
-  --workers researcher,architect,sre \
+  --worker researcher:"Research regional failure modes" \
+  --worker architect:"Design failover topology" \
+  --worker sre:"Validate operational runbook" \
   --verifier reviewer --synthesizer writer
 ```
 
@@ -788,7 +790,7 @@ In the interactive CLI, typing `/kanban ` and hitting Tab cycles through the bui
 
 ## Collaboration patterns
 
-The board supports these eight patterns without any new primitives:
+The board supports these nine patterns without any new primitives:
 
 | Pattern | Shape | Example |
 |---|---|---|

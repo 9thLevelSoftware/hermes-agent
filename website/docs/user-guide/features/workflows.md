@@ -29,11 +29,7 @@ Workflows can include schedule triggers, but scheduled workflows still run throu
 
 ## Quick start
 
-Use the included example definition:
-
-```bash
-examples/workflows/code-change-review.yaml
-```
+The examples live under `examples/workflows/`; this quick start uses `examples/workflows/code-change-review.yaml`.
 
 Validate and deploy it:
 

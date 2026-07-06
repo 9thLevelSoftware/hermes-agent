@@ -19,8 +19,6 @@ nodes:
     profile: implementer
     title: "Implement code change"
     workspace_kind: worktree
-    skills:
-      - test-driven-development
     prompt:
       task: "Implement the requested code change. Complete the Kanban task with JSON."
       repo: "${ input.repo }"
@@ -36,8 +34,6 @@ nodes:
     profile: reviewer
     title: "Review code change"
     workspace_kind: worktree
-    skills:
-      - github-code-review
     prompt:
       task: "Review the implementation. Complete the Kanban task with JSON."
       repo: "${ input.repo }"
@@ -75,8 +71,6 @@ nodes:
     profile: implementer
     title: "Revise code change after review"
     workspace_kind: worktree
-    skills:
-      - test-driven-development
     prompt:
       task: "Revise the implementation according to review feedback. Complete with JSON."
       repo: "${ input.repo }"
@@ -93,8 +87,6 @@ nodes:
     profile: reviewer
     title: "Review revised code change"
     workspace_kind: worktree
-    skills:
-      - github-code-review
     prompt:
       task: "Review the revised implementation. Complete with JSON."
       repo: "${ input.repo }"

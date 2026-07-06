@@ -28,8 +28,6 @@ nodes:
     type: agent_task
     profile: researcher
     title: "Gather research sources"
-    skills:
-      - research-intelligence
     prompt:
       task: "Gather current, citable sources for the topic. Complete the Kanban task with JSON."
       topic: "${ input.topic }"
@@ -45,8 +43,6 @@ nodes:
     type: agent_task
     profile: researcher
     title: "Scan research risks and duplicates"
-    skills:
-      - research-intelligence
     prompt:
       task: "Look for duplicate coverage, stale claims, and weak sources. Complete with JSON."
       topic: "${ input.topic }"
