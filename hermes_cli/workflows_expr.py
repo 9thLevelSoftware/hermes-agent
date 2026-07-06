@@ -167,4 +167,3 @@ def eval_condition(cond: Mapping[str, Any], data: Any) -> bool:
             raise ValueError(f"invalid regex: {exc}") from exc
 
     raise ValueError(f"unsupported condition op: {op}")
-
