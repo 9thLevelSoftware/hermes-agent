@@ -121,9 +121,45 @@ The bundled `workflows` dashboard plugin mounts at `/workflows`, after Kanban in
 - execution list
 - execution detail timeline from `workflow_events`
 - React Flow visual graph editor for nodes and edges, with an HTML fallback when React Flow is unavailable
-- node inspector that can edit JSON drafts; YAML drafts stay untouched until you convert to JSON
+- node inspector with a text-first agent cell editor, Prompt assistant for prompt drafts, and Advanced JSON for rare low-level node edits
 
 The dashboard run action starts an execution and nudges one dispatcher tick. Long-running `agent_task` nodes still wait for their Kanban task to complete, just like CLI-started executions.
+
+## Agent cell prompts
+
+Every `agent_task` cell has a `profile` and a `prompt`. The dashboard is text-first: write a plain text prompt for new agent cells, and Hermes renders inline `${ ... }` placeholders in that text before creating a Kanban task assigned to the profile. String/list/object prompt values remain supported in the reference below for existing definitions.
+
+```yaml
+review:
+  type: agent_task
+  profile: reviewer
+  title: Review implementation
+  prompt: |
+    You are the `reviewer` profile executing workflow cell `review`.
+
+    Review implementation output:
+    ${ node.implement.output }
+
+    Return JSON only:
+    {
+      "verdict": "approved or changes_requested",
+      "reason": "string"
+    }
+```
+
+The dashboard edits this prompt as text. Advanced JSON remains available for rare low-level node edits, but ordinary prompt writing should not require JSON.
+
+### Prompt assistant
+
+Select an `agent_task` cell and open **Prompt assistant**. Provide:
+
+- workflow goal
+- cell objective
+- available context placeholders
+- expected output contract
+- constraints
+
+The assistant is a deterministic dashboard draft helper, not an autonomous model or LLM run. It drafts a text prompt that you can review and apply to the cell.
 
 ## Workflow definition YAML reference
 
@@ -388,15 +424,17 @@ when:
 
 ## Template reference
 
-Templates are also path-only. A string is templated only when the whole string is a `${ ... }` expression:
+General workflow templates are path-only. Outside `agent_task` prompt text, a string is templated only when the whole string is a `${ ... }` expression:
 
 ```yaml
 output:
   ok: "${ node.review.output.verdict }"       # replaced
-  text: "Verdict: ${ node.review.output.verdict }"  # literal string, not interpolated
+  text: "Verdict: ${ node.review.output.verdict }"  # literal in general templates
 ```
 
 Inside `${ ... }`, the leading `$.` is optional. Lists and objects are rendered recursively. A missing path raises an error; depending where rendering happens, it may fail the execution directly rather than route through `catch`.
+
+`agent_task` prompts use `workflows_prompts.py` instead: text prompts render `${ ... }` placeholders inline, and list/object prompts keep backward-compatible recursive rendering before they become the Kanban task body.
 
 This is intentional safety: templates can only copy values out of the workflow context. They cannot call functions, read files, run shell commands, or evaluate code.
 
