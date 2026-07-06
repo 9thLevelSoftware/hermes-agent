@@ -1,0 +1,121 @@
+id: research-triage
+name: Research Triage
+version: 1
+enabled: true
+max_node_runs: 80
+triggers:
+  - type: manual
+    id: manual
+  - type: schedule
+    id: weekday_research
+    cron: "0 9 * * 1-5"
+    input:
+      topic: "AI agent research"
+      freshness: "last 24 hours"
+      min_score: 0.75
+nodes:
+  normalize:
+    type: pass
+    output:
+      topic: "${ input.topic }"
+      freshness: "${ input.freshness }"
+      min_score: "${ input.min_score }"
+
+  fork:
+    type: parallel
+
+  gather:
+    type: agent_task
+    profile: researcher
+    title: "Gather research sources"
+    skills:
+      - research-intelligence
+    prompt:
+      task: "Gather current, citable sources for the topic. Complete the Kanban task with JSON."
+      topic: "${ input.topic }"
+      freshness: "${ input.freshness }"
+      result_contract:
+        sources:
+          - title: "Source title"
+            url: "https://example.com"
+            why_it_matters: "One sentence"
+        summary: "Short source summary"
+
+  risk_scan:
+    type: agent_task
+    profile: researcher
+    title: "Scan research risks and duplicates"
+    skills:
+      - research-intelligence
+    prompt:
+      task: "Look for duplicate coverage, stale claims, and weak sources. Complete with JSON."
+      topic: "${ input.topic }"
+      freshness: "${ input.freshness }"
+      result_contract:
+        risks: ["risk or caveat"]
+        exclusions: ["source or angle to skip"]
+        confidence: 0.0
+
+  merge:
+    type: join
+
+  summarize:
+    type: agent_task
+    profile: analyst
+    title: "Summarize and score research"
+    prompt:
+      task: "Synthesize the gathered research and risk scan. Complete with JSON."
+      topic: "${ input.topic }"
+      gathered: "${ node.merge.output.branches.gather }"
+      risks: "${ node.merge.output.branches.risks }"
+      result_contract:
+        score: 0.0
+        summary: "Decision-ready summary"
+        recommendation: "publish, watch, or ignore"
+        next_actions: ["action"]
+
+  triage:
+    type: switch
+    cases:
+      - name: high_value
+        when:
+          op: gte
+          left: {path: "$.node.summarize.output.score"}
+          right: {path: "$.input.min_score"}
+
+  publish_ready:
+    type: pass
+    output:
+      status: ready_for_review
+      summary: "${ node.summarize.output }"
+
+  cooldown:
+    type: wait
+    seconds: 300
+
+  archive_low_value:
+    type: pass
+    output:
+      status: archived_low_value
+      summary: "${ node.summarize.output }"
+edges:
+  - from: normalize
+    to: fork
+  - from: fork.gather
+    to: gather
+  - from: fork.risks
+    to: risk_scan
+  - from: gather
+    to: merge
+  - from: risk_scan
+    to: merge
+  - from: merge
+    to: summarize
+  - from: summarize
+    to: triage
+  - from: triage.high_value
+    to: publish_ready
+  - from: triage.default
+    to: cooldown
+  - from: cooldown
+    to: archive_low_value

@@ -1,0 +1,147 @@
+id: code-change-review
+name: Code Change Review
+version: 1
+enabled: true
+max_node_runs: 50
+triggers:
+  - type: manual
+    id: manual
+nodes:
+  start:
+    type: pass
+    output:
+      repo: "${ input.repo }"
+      branch: "${ input.branch }"
+      change_request: "${ input.change_request }"
+
+  implement:
+    type: agent_task
+    profile: implementer
+    title: "Implement code change"
+    workspace_kind: worktree
+    skills:
+      - test-driven-development
+    prompt:
+      task: "Implement the requested code change. Complete the Kanban task with JSON."
+      repo: "${ input.repo }"
+      branch: "${ input.branch }"
+      change_request: "${ input.change_request }"
+      result_contract:
+        summary: "Short implementation summary"
+        changed_files: ["path/to/file"]
+        verification: ["command and result"]
+
+  review:
+    type: agent_task
+    profile: reviewer
+    title: "Review code change"
+    workspace_kind: worktree
+    skills:
+      - github-code-review
+    prompt:
+      task: "Review the implementation. Complete the Kanban task with JSON."
+      repo: "${ input.repo }"
+      branch: "${ input.branch }"
+      implementation: "${ node.implement.output }"
+      result_contract:
+        verdict: "approved or changes_requested"
+        confidence: 0.0
+        reason: "Why this verdict was reached"
+        required_changes: ["change to make, if any"]
+
+  decision:
+    type: switch
+    cases:
+      - name: approved
+        when:
+          op: and
+          args:
+            - op: eq
+              left: {path: "$.node.review.output.verdict"}
+              right: approved
+            - op: gte
+              left: {path: "$.node.review.output.confidence"}
+              right: 0.8
+
+  approved:
+    type: pass
+    output:
+      status: approved
+      implementation: "${ node.implement.output }"
+      review: "${ node.review.output }"
+
+  revise:
+    type: agent_task
+    profile: implementer
+    title: "Revise code change after review"
+    workspace_kind: worktree
+    skills:
+      - test-driven-development
+    prompt:
+      task: "Revise the implementation according to review feedback. Complete with JSON."
+      repo: "${ input.repo }"
+      branch: "${ input.branch }"
+      original_implementation: "${ node.implement.output }"
+      review_feedback: "${ node.review.output }"
+      result_contract:
+        summary: "Short revision summary"
+        changed_files: ["path/to/file"]
+        verification: ["command and result"]
+
+  second_review:
+    type: agent_task
+    profile: reviewer
+    title: "Review revised code change"
+    workspace_kind: worktree
+    skills:
+      - github-code-review
+    prompt:
+      task: "Review the revised implementation. Complete with JSON."
+      repo: "${ input.repo }"
+      branch: "${ input.branch }"
+      revision: "${ node.revise.output }"
+      result_contract:
+        verdict: "approved or changes_requested"
+        confidence: 0.0
+        reason: "Why this verdict was reached"
+
+  second_decision:
+    type: switch
+    cases:
+      - name: approved
+        when:
+          op: eq
+          left: {path: "$.node.second_review.output.verdict"}
+          right: approved
+
+  revised_success:
+    type: pass
+    output:
+      status: approved_after_revision
+      revision: "${ node.revise.output }"
+      review: "${ node.second_review.output }"
+
+  rejected:
+    type: fail
+    output:
+      reason: "Second review did not approve the change. Inspect the review output."
+      review: "${ node.second_review.output }"
+edges:
+  - from: start
+    to: implement
+  - from: implement
+    to: review
+  - from: review
+    to: decision
+  - from: decision.approved
+    to: approved
+  - from: decision.default
+    to: revise
+  - from: revise
+    to: second_review
+  - from: second_review
+    to: second_decision
+  - from: second_decision.approved
+    to: revised_success
+  - from: second_decision.default
+    to: rejected

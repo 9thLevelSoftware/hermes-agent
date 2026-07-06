@@ -883,9 +883,16 @@ Runs are exposed on the dashboard (Run History section in the drawer, one colour
 
 **Live drawer refresh.** When the dashboard's WebSocket event stream reports new events for the task the user is currently viewing, the drawer reloads itself (via a per-task event counter threaded into its `useEffect` dependency list). Closing and reopening is no longer required to see a run's new row or updated outcome.
 
-### Forward compatibility
+### Workflow-created cards
 
-Two nullable columns on `tasks` are reserved for v2 workflow routing: `workflow_template_id` (which template this task belongs to) and `current_step_key` (which step in that template is active). The v1 kernel ignores them for routing but lets clients write them, so a v2 release can add the routing machinery without another schema migration.
+The [workflow graph engine](./workflows) uses Kanban for `agent_task` nodes. When a workflow reaches an `agent_task`, the workflow dispatcher creates an idempotent Kanban task and waits for that task to finish. The task is tagged with `workflow_template_id` (the workflow id) and `current_step_key` (the node id), so you can find workflow work on the board:
+
+```bash
+hermes kanban list --workflow-template-id code-change-review
+hermes kanban list --workflow-template-id code-change-review --current-step-key review
+```
+
+Completing the Kanban task resumes the workflow on the next workflow tick. If the task's `result` or latest summary is JSON, that object becomes the `agent_task` node output; plain text is wrapped as `{"result": "..."}`. Blocking the Kanban task blocks the workflow execution with the same reason.
 
 ## Event reference
 
