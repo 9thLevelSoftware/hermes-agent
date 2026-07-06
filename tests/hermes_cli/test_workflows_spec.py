@@ -41,6 +41,15 @@ def test_unknown_edge_source_rejected():
         validate_graph(spec)
 
 
+def test_self_catch_rejected():
+    raw = _minimal_spec()
+    raw["nodes"] = {"start": {"type": "fail", "catch": "start"}}
+    raw["edges"] = []
+    spec = WorkflowSpec.model_validate(raw)
+    with pytest.raises(ValueError, match="cannot catch itself"):
+        validate_graph(spec)
+
+
 def test_empty_workflow_nodes_rejected():
     raw = _minimal_spec()
     raw["nodes"] = {}

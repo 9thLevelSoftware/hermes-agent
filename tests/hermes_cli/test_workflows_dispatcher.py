@@ -774,6 +774,31 @@ def test_failed_node_catch_routes_after_max_attempts(tmp_path, monkeypatch):
     ]
 
 
+def test_catch_route_exception_fails_execution_and_releases_claim(tmp_path, monkeypatch):
+    exec_id = _start_spec_execution(
+        tmp_path,
+        monkeypatch,
+        _fail_spec(catch="recover", recover_output={"missing": "${ node.nope.output }"}),
+    )
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+
+    execution, claim, events = _execution_state(exec_id)
+    runs = _node_runs(exec_id, "flaky")
+    failure_payload = json.loads(events[-1]["payload_json"])
+
+    assert execution.status == "failed"
+    assert claim == {"claim_lock": None, "claim_expires": None}
+    assert execution.context["error"]["node"] == "flaky"
+    assert len(runs) == 1
+    assert runs[0]["status"] == "failed"
+    assert json.loads(runs[0]["error"])["node"] == "flaky"
+    assert events[-1]["kind"] == "execution_failed"
+    assert "$.node.nope.output" in failure_payload["error"]["message"]
+    assert failure_payload["error"]["catch_node"] == "recover"
+    assert failure_payload["error"]["caught_node"] == "flaky"
+
+
 def test_failed_node_without_catch_fails_execution_and_records_attempt(tmp_path, monkeypatch):
     exec_id = _start_spec_execution(tmp_path, monkeypatch, _fail_spec())
 

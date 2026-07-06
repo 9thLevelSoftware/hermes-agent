@@ -129,8 +129,11 @@ def validate_graph(spec: WorkflowSpec) -> None:
         outgoing_sources.add(source_base)
 
     for node_id, node in spec.nodes.items():
-        if node.catch is not None and node.catch not in node_ids:
-            raise ValueError(f"unknown catch target for node {node_id}: {node.catch}")
+        if node.catch is not None:
+            if node.catch == node_id:
+                raise ValueError(f"node {node_id} cannot catch itself")
+            if node.catch not in node_ids:
+                raise ValueError(f"unknown catch target for node {node_id}: {node.catch}")
         if node.type == "switch":
             if node.default is not None:
                 if node.default not in node_ids:

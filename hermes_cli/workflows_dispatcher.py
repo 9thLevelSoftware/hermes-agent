@@ -661,12 +661,26 @@ def _finish(
                     kwargs["completed_wait_nodes"] = completed_wait_nodes
                 if completed_outputs:
                     kwargs["completed_node_outputs"] = completed_outputs
-                result = run_in_memory_until_waiting(
-                    spec,
-                    json.loads(row["input_json"]),
-                    **kwargs,
-                )
-                result.context = _context_with_error(result.context, error)
+                catch_context = _context_with_error(result.context, error)
+                try:
+                    result = run_in_memory_until_waiting(
+                        spec,
+                        json.loads(row["input_json"]),
+                        **kwargs,
+                    )
+                except Exception as exc:
+                    result = EngineResult(
+                        status="failed",
+                        context=catch_context,
+                        waiting_nodes=[],
+                        error={
+                            "message": str(exc),
+                            "catch_node": node.catch,
+                            "caught_node": node_id,
+                        },
+                    )
+                else:
+                    result.context = _context_with_error(result.context, error)
 
         final_event = {
             "succeeded": "execution_succeeded",
