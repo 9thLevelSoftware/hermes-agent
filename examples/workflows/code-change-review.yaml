@@ -18,9 +18,8 @@ nodes:
     type: agent_task
     profile: implementer
     title: "Implement code change"
-    workspace_kind: worktree
     prompt:
-      task: "Implement the requested code change. Complete the Kanban task with JSON."
+      task: "Implement the requested code change in the repo path from this prompt. Complete the Kanban task with JSON."
       repo: "${ input.repo }"
       branch: "${ input.branch }"
       change_request: "${ input.change_request }"
@@ -33,9 +32,8 @@ nodes:
     type: agent_task
     profile: reviewer
     title: "Review code change"
-    workspace_kind: worktree
     prompt:
-      task: "Review the implementation. Complete the Kanban task with JSON."
+      task: "Review the implementation in the repo path from this prompt. Complete the Kanban task with JSON."
       repo: "${ input.repo }"
       branch: "${ input.branch }"
       implementation: "${ node.implement.output }"
@@ -70,9 +68,8 @@ nodes:
     type: agent_task
     profile: implementer
     title: "Revise code change after review"
-    workspace_kind: worktree
     prompt:
-      task: "Revise the implementation according to review feedback. Complete with JSON."
+      task: "Revise the implementation according to review feedback in the repo path from this prompt. Complete with JSON."
       repo: "${ input.repo }"
       branch: "${ input.branch }"
       original_implementation: "${ node.implement.output }"
@@ -86,9 +83,8 @@ nodes:
     type: agent_task
     profile: reviewer
     title: "Review revised code change"
-    workspace_kind: worktree
     prompt:
-      task: "Review the revised implementation. Complete with JSON."
+      task: "Review the revised implementation in the repo path from this prompt. Complete with JSON."
       repo: "${ input.repo }"
       branch: "${ input.branch }"
       revision: "${ node.revise.output }"

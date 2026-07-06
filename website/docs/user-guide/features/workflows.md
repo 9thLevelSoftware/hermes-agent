@@ -31,6 +31,8 @@ Workflows can include schedule triggers, but scheduled workflows still run throu
 
 The examples live under `examples/workflows/`; this quick start uses `examples/workflows/code-change-review.yaml`.
 
+That example leaves `agent_task.workspace_kind` unset, so Kanban uses scratch workspaces; each prompt passes `repo` and tells the worker to use that path. Set `agent_task.workspace_kind`/`workspace_path` or board `kanban.default_workdir` if you want dispatcher working directories pinned.
+
 Validate and deploy it:
 
 ```bash
