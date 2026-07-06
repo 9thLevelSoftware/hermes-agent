@@ -249,6 +249,43 @@ def test_join_does_not_wait_for_untaken_branch_switch_path():
     assert result.context["node"]["done"]["output"] == {"review": "review"}
 
 
+def test_direct_switch_branch_to_join_preserves_parallel_branch_label():
+    spec = WorkflowSpec.model_validate({
+        "id": "demo", "name": "Demo", "version": 1, "max_node_runs": 20,
+        "nodes": {
+            "fork": {"type": "parallel"},
+            "route": {"type": "switch", "cases": [
+                {"name": "go", "when": {"op": "eq", "left": {"path": "$.input.route"}, "right": "go"}}
+            ]},
+            "skip": {"type": "pass", "output": {"skipped": True}},
+            "review": {"type": "pass", "output": {"summary": "review"}},
+            "merge": {"type": "join"},
+            "done": {"type": "pass", "output": {
+                "review": "${ node.merge.output.branches.review.summary }",
+            }},
+        },
+        "edges": [
+            {"from": "fork.work", "to": "route"},
+            {"from": "fork.review", "to": "review"},
+            {"from": "route.go", "to": "merge"},
+            {"from": "route.default", "to": "skip"},
+            {"from": "review", "to": "merge"},
+            {"from": "merge", "to": "done"},
+        ],
+    })
+
+    result = run_in_memory_until_waiting(spec, input_data={"route": "go"})
+
+    assert result.status == "succeeded"
+    assert result.waiting_nodes == []
+    assert result.context["node"]["merge"]["output"]["branches"] == {
+        "work": None,
+        "review": {"summary": "review"},
+    }
+    assert "skip" not in result.context["node"]
+    assert result.context["node"]["done"]["output"] == {"review": "review"}
+
+
 def test_join_waits_until_all_branch_upstreams_succeed():
     spec = WorkflowSpec.model_validate({
         "id": "demo", "name": "Demo", "version": 1,

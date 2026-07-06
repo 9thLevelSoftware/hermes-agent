@@ -120,6 +120,8 @@ def validate_graph(spec: WorkflowSpec) -> None:
             source_base, branch = edge.from_.split(".", 1)
         if source_base not in node_ids:
             raise ValueError(f"unknown edge source: {edge.from_}")
+        if branch is None and spec.nodes[source_base].type == "parallel":
+            raise ValueError(f"parallel edge source {edge.from_} requires branch suffix")
         if branch is not None:
             if not branch:
                 raise ValueError(f"edge source {edge.from_} requires branch suffix")

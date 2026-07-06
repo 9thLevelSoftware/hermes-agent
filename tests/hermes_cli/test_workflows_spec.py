@@ -84,12 +84,12 @@ def test_bad_node_id_rejected(node_id):
         WorkflowSpec.model_validate(raw)
 
 
-def test_dotted_edge_source_requires_switch_node():
+def test_dotted_edge_source_requires_switch_or_parallel_node():
     raw = _minimal_spec()
     raw["nodes"]["route"] = {"type": "pass"}
     raw["edges"] = [{"from": "route.any", "to": "done"}]
     spec = WorkflowSpec.model_validate(raw)
-    with pytest.raises(ValueError, match="dotted edge source.*switch"):
+    with pytest.raises(ValueError, match="dotted edge source.*switch or parallel"):
         validate_graph(spec)
 
 
@@ -99,6 +99,18 @@ def test_dotted_edge_source_requires_branch_suffix():
     raw["edges"] = [{"from": "route.", "to": "done"}]
     spec = WorkflowSpec.model_validate(raw)
     with pytest.raises(ValueError, match="branch suffix"):
+        validate_graph(spec)
+
+
+def test_parallel_edge_source_requires_branch_suffix():
+    raw = _minimal_spec()
+    raw["nodes"] = {
+        "fork": {"type": "parallel"},
+        "done": {"type": "pass"},
+    }
+    raw["edges"] = [{"from": "fork", "to": "done"}]
+    spec = WorkflowSpec.model_validate(raw)
+    with pytest.raises(ValueError, match="parallel.*branch suffix"):
         validate_graph(spec)
 
 

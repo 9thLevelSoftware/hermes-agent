@@ -128,16 +128,13 @@ def run_in_memory_until_waiting(
     max_steps = spec.max_node_runs
     steps = 0
     waiting_nodes: list[str] = []
-    scheduled_branch_by_node: dict[str, tuple[str, str] | None] = {}
     completed_branch_by_node: dict[str, tuple[str, str]] = {}
     active_branch_by_node: dict[str, tuple[str, str]] = {}
 
     def enqueue(node_id: str, branch_key: tuple[str, str] | None) -> None:
-        queued_branch = None if spec.nodes[node_id].type == "join" else branch_key
-        scheduled_branch_by_node.setdefault(node_id, queued_branch)
-        if queued_branch is not None:
-            active_branch_by_node[node_id] = queued_branch
-        runnable.append((node_id, queued_branch))
+        if branch_key is not None and spec.nodes[node_id].type != "join":
+            active_branch_by_node[node_id] = branch_key
+        runnable.append((node_id, branch_key))
 
     for node_id in _initial_nodes(spec):
         enqueue(node_id, None)
@@ -202,13 +199,17 @@ def run_in_memory_until_waiting(
             incoming = [edge for edge in spec.edges if edge.to == node_id]
             branches = {}
             expected_labels: set[str] = set()
+            if branch_key is not None:
+                parallel_id, label = branch_key
+                expected_labels.add(label)
+                branches[label] = context.get("branches", {}).get(parallel_id, {}).get(label)
             for edge in incoming:
                 source_base, _, port = edge.from_.partition(".")
-                if source_base not in scheduled_branch_by_node and source_base not in context["node"]:
+                if source_base not in active_branch_by_node and source_base not in context["node"]:
                     continue
                 owner = completed_branch_by_node.get(source_base)
                 if owner is None:
-                    owner = scheduled_branch_by_node.get(source_base)
+                    owner = active_branch_by_node.get(source_base)
                 label = owner[1] if owner else (port or source_base)
                 expected_labels.add(label)
                 node_context = context["node"].get(source_base, {})
