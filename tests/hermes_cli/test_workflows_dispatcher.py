@@ -778,7 +778,7 @@ def test_disabling_scheduled_workflow_removes_schedule_rows(tmp_path, monkeypatc
     with wfdb.connect() as conn:
         wfdb.deploy_definition(conn, _schedule_spec(enabled=True), created_by="test")
         due_at = conn.execute("SELECT next_run_at FROM workflow_schedules").fetchone()[0]
-        wfdb.deploy_definition(conn, _schedule_spec(enabled=False), created_by="test")
+        wfdb.deploy_definition(conn, _schedule_spec(version=2, enabled=False), created_by="test")
         schedule_count = conn.execute("SELECT count(*) FROM workflow_schedules").fetchone()[0]
 
     assert schedule_count == 0

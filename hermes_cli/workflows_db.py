@@ -251,20 +251,24 @@ def deploy_definition(
     created_by: str | None = None,
 ) -> None:
     raw = _spec_json(spec)
+    checksum = _checksum(raw)
     now = int(time.time())
     with write_txn(conn):
-        conn.execute(
+        existing = conn.execute(
+            "SELECT checksum FROM workflow_definitions WHERE workflow_id = ? AND version = ?",
+            (spec.id, spec.version),
+        ).fetchone()
+        if existing is not None and existing["checksum"] != checksum:
+            raise ValueError(
+                f"workflow definition {spec.id} v{spec.version} already exists with different checksum; bump version"
+            )
+
+        inserted = conn.execute(
             """
-            INSERT INTO workflow_definitions (
+            INSERT OR IGNORE INTO workflow_definitions (
                 workflow_id, version, name, enabled, spec_json, checksum,
                 created_by, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(workflow_id, version) DO UPDATE SET
-                name = excluded.name,
-                enabled = excluded.enabled,
-                spec_json = excluded.spec_json,
-                checksum = excluded.checksum,
-                created_by = excluded.created_by
             """,
             (
                 spec.id,
@@ -272,11 +276,14 @@ def deploy_definition(
                 spec.name,
                 1 if spec.enabled else 0,
                 raw,
-                _checksum(raw),
+                checksum,
                 created_by,
                 now,
             ),
-        )
+        ).rowcount > 0
+        if not inserted:
+            return
+
         conn.execute(
             "DELETE FROM workflow_schedules WHERE workflow_id = ?",
             (spec.id,),
