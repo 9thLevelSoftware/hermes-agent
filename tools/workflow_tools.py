@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from hermes_cli import workflows_db as wfdb
+from hermes_cli import workflows_assistant, workflows_db as wfdb
 from hermes_cli.config import load_config
 from hermes_cli.workflows_spec import WorkflowSpec, validate_graph
 from tools.registry import registry, tool_error, tool_result
@@ -55,6 +55,10 @@ def _error_text(exc: BaseException) -> str:
     return str(exc)
 
 
+def _assistant_runtime_error(tool_name: str) -> str:
+    return tool_error(f"{tool_name}: workflow assistant failed")
+
+
 def _parse_version(value: Any) -> int | None:
     if value in (None, ""):
         return None
@@ -74,6 +78,14 @@ def _spec_from_definition_text(text: Any) -> WorkflowSpec:
     if not isinstance(loaded, dict):
         raise ValueError("definition_text must decode to a YAML/JSON object")
     spec = WorkflowSpec.model_validate(loaded)
+    validate_graph(spec)
+    return spec
+
+
+def _spec_from_object(value: Any) -> WorkflowSpec:
+    if not isinstance(value, dict):
+        raise ValueError("spec must be an object")
+    spec = WorkflowSpec.model_validate(value)
     validate_graph(spec)
     return spec
 
@@ -151,6 +163,45 @@ def _handle_show(args: dict, **_kw) -> str:
     except Exception as exc:
         logger.exception("workflow_show failed")
         return tool_error(f"workflow_show: {_error_text(exc)}")
+
+
+def _handle_draft(args: dict, **_kw) -> str:
+    try:
+        goal = str(args.get("goal") or "").strip()
+        if not goal:
+            raise ValueError("goal is required")
+        result = workflows_assistant.draft_workflow_with_default_runner(goal)
+        return tool_result(result.to_dict())
+    except (workflows_assistant.AssistantValidationError, ValueError) as exc:
+        logger.exception("workflow_draft failed")
+        return tool_error(f"workflow_draft: {_error_text(exc)}")
+    except Exception:
+        logger.exception("workflow_draft failed")
+        return _assistant_runtime_error("workflow_draft")
+
+
+def _handle_refine(args: dict, **_kw) -> str:
+    try:
+        instruction = str(args.get("instruction") or "").strip()
+        if not instruction:
+            raise ValueError("instruction is required")
+        if args.get("spec") is not None:
+            spec = _spec_from_object(args.get("spec"))
+        else:
+            workflow_id = str(args.get("workflow_id") or "").strip()
+            if not workflow_id:
+                raise ValueError("spec or workflow_id is required")
+            version = _parse_version(args.get("version"))
+            with _connect_initialized() as conn:
+                spec = _definition_record(conn, workflow_id, version).spec
+        result = workflows_assistant.refine_workflow_with_default_runner(spec, instruction)
+        return tool_result(result.to_dict())
+    except (KeyError, ValueError, workflows_assistant.AssistantValidationError) as exc:
+        logger.exception("workflow_refine failed")
+        return tool_error(f"workflow_refine: {_error_text(exc)}")
+    except Exception:
+        logger.exception("workflow_refine failed")
+        return _assistant_runtime_error("workflow_refine")
 
 
 def _handle_validate(args: dict, **_kw) -> str:
@@ -256,6 +307,33 @@ _WORKFLOW_SHOW_SCHEMA = {
     },
 }
 
+_WORKFLOW_DRAFT_SCHEMA = {
+    "name": "workflow_draft",
+    "description": "Draft a validated workflow graph spec from a plain-language goal.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string", "description": "Plain-language workflow goal."},
+        },
+        "required": ["goal"],
+    },
+}
+
+_WORKFLOW_REFINE_SCHEMA = {
+    "name": "workflow_refine",
+    "description": "Refine a workflow using a plain-language instruction; callers must provide either spec or workflow_id.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "spec": {"type": "object", "description": "Inline workflow spec object."},
+            "workflow_id": {"type": "string", "description": "Deployed workflow id to refine."},
+            "version": {"type": "integer", "description": "Optional deployed workflow version; latest when omitted."},
+            "instruction": {"type": "string", "description": "Plain-language refinement instruction."},
+        },
+        "required": ["instruction"],
+    },
+}
+
 _WORKFLOW_VALIDATE_SCHEMA = {
     "name": "workflow_validate",
     "description": "Validate workflow YAML/JSON definition text without deploying it.",
@@ -341,6 +419,22 @@ registry.register(
     toolset="workflow",
     schema=_WORKFLOW_SHOW_SCHEMA,
     handler=_handle_show,
+    check_fn=_check_workflow_mode,
+    emoji="🔁",
+)
+registry.register(
+    name="workflow_draft",
+    toolset="workflow",
+    schema=_WORKFLOW_DRAFT_SCHEMA,
+    handler=_handle_draft,
+    check_fn=_check_workflow_mode,
+    emoji="🔁",
+)
+registry.register(
+    name="workflow_refine",
+    toolset="workflow",
+    schema=_WORKFLOW_REFINE_SCHEMA,
+    handler=_handle_refine,
     check_fn=_check_workflow_mode,
     emoji="🔁",
 )

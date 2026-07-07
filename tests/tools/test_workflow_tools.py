@@ -6,6 +6,8 @@ import pytest
 WORKFLOW_TOOL_NAMES = {
     "workflow_list",
     "workflow_show",
+    "workflow_draft",
+    "workflow_refine",
     "workflow_validate",
     "workflow_deploy",
     "workflow_run",
@@ -174,6 +176,149 @@ nodes:
     assert "error" not in payload
     assert payload["valid"] is True
     assert payload["workflow_id"] == "validate_tool_demo"
+
+
+def test_workflow_draft_tool_returns_validated_spec(_isolated_workflow_home, monkeypatch):
+    _enable_workflow_toolset(_isolated_workflow_home)
+    import tools.workflow_tools as workflow_tools
+    from hermes_cli.workflows_assistant import parse_assistant_payload
+    from tools.registry import registry
+
+    def fake_draft(goal):
+        assert "code change" in goal
+        return parse_assistant_payload({
+            "spec": {
+                "id": "draft_tool_demo",
+                "name": "Draft Tool Demo",
+                "version": 1,
+                "triggers": [{"type": "manual", "id": "manual"}],
+                "nodes": {"start": {"type": "pass", "output": {"ok": True}}},
+            },
+            "summary": "Drafted.",
+            "assumptions": [],
+            "questions": [],
+            "warnings": [],
+            "unsupported_requests": [],
+        })
+
+    monkeypatch.setattr(workflow_tools.workflows_assistant, "draft_workflow_with_default_runner", fake_draft)
+
+    payload = json.loads(registry.dispatch("workflow_draft", {"goal": "code change workflow"}))
+
+    assert "error" not in payload
+    assert payload["spec"]["id"] == "draft_tool_demo"
+    assert payload["summary"] == "Drafted."
+
+
+def test_workflow_draft_tool_redacts_unexpected_runtime_errors(
+    _isolated_workflow_home,
+    monkeypatch,
+):
+    _enable_workflow_toolset(_isolated_workflow_home)
+    import tools.workflow_tools as workflow_tools
+    from tools.registry import registry
+
+    def fake_draft(_goal):
+        raise RuntimeError("secret provider token abc123")
+
+    monkeypatch.setattr(workflow_tools.workflows_assistant, "draft_workflow_with_default_runner", fake_draft)
+
+    result = registry.dispatch("workflow_draft", {"goal": "code change workflow"})
+    payload = json.loads(result)
+
+    assert payload["error"].startswith("workflow_draft: workflow assistant failed")
+    assert "secret" not in result
+    assert "abc123" not in result
+
+
+def test_workflow_refine_tool_accepts_spec_object(_isolated_workflow_home, monkeypatch):
+    _enable_workflow_toolset(_isolated_workflow_home)
+    import tools.workflow_tools as workflow_tools
+    from hermes_cli.workflows_assistant import parse_assistant_payload
+    from tools.registry import registry
+
+    def fake_refine(spec, instruction):
+        assert spec.id == "demo"
+        assert instruction == "add reviewer"
+        return parse_assistant_payload({
+            "spec": spec.model_dump(mode="json", by_alias=True),
+            "summary": "Refined.",
+            "assumptions": [],
+            "questions": [],
+            "warnings": [],
+            "unsupported_requests": [],
+        })
+
+    monkeypatch.setattr(workflow_tools.workflows_assistant, "refine_workflow_with_default_runner", fake_refine)
+
+    spec = _deploy_demo_workflow().model_dump(mode="json", by_alias=True)
+    payload = json.loads(registry.dispatch("workflow_refine", {"spec": spec, "instruction": "add reviewer"}))
+
+    assert "error" not in payload
+    assert payload["summary"] == "Refined."
+
+
+def test_workflow_refine_tool_redacts_unexpected_runtime_errors(
+    _isolated_workflow_home,
+    monkeypatch,
+):
+    _enable_workflow_toolset(_isolated_workflow_home)
+    import tools.workflow_tools as workflow_tools
+    from tools.registry import registry
+
+    def fake_refine(_spec, _instruction):
+        raise RuntimeError("secret provider token abc123")
+
+    monkeypatch.setattr(workflow_tools.workflows_assistant, "refine_workflow_with_default_runner", fake_refine)
+
+    spec = _deploy_demo_workflow().model_dump(mode="json", by_alias=True)
+    result = registry.dispatch("workflow_refine", {"spec": spec, "instruction": "add reviewer"})
+    payload = json.loads(result)
+
+    assert payload["error"].startswith("workflow_refine: workflow assistant failed")
+    assert "secret" not in result
+    assert "abc123" not in result
+
+
+def test_workflow_refine_tool_falls_back_to_workflow_id_when_spec_is_none(
+    _isolated_workflow_home,
+    monkeypatch,
+):
+    _enable_workflow_toolset(_isolated_workflow_home)
+    import tools.workflow_tools as workflow_tools
+    from hermes_cli.workflows_assistant import parse_assistant_payload
+    from tools.registry import registry
+
+    seen = {}
+
+    def fake_refine(spec, instruction):
+        seen["spec_id"] = spec.id
+        assert instruction == "add reviewer"
+        return parse_assistant_payload({
+            "spec": spec.model_dump(mode="json", by_alias=True),
+            "summary": "Refined.",
+            "assumptions": [],
+            "questions": [],
+            "warnings": [],
+            "unsupported_requests": [],
+        })
+
+    monkeypatch.setattr(workflow_tools.workflows_assistant, "refine_workflow_with_default_runner", fake_refine)
+    _deploy_demo_workflow()
+
+    payload = json.loads(registry.dispatch(
+        "workflow_refine",
+        {"spec": None, "workflow_id": "demo", "instruction": "add reviewer"},
+    ))
+
+    assert "error" not in payload
+    assert seen["spec_id"] == "demo"
+
+
+def test_workflow_refine_schema_mentions_spec_or_workflow_id():
+    import tools.workflow_tools as workflow_tools
+
+    assert "spec or workflow_id" in workflow_tools._WORKFLOW_REFINE_SCHEMA["description"]
 
 
 def test_workflow_deploy_tool_accepts_yaml_text(_isolated_workflow_home):
