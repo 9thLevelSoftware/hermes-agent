@@ -15,3 +15,17 @@ def test_workflow_dashboard_contains_privacy_warning() -> None:
     text = BUNDLE.read_text(encoding="utf-8")
     assert "Workflow inputs and outputs are stored locally" in text
     assert "Do not paste secrets" in text
+
+
+def test_workflow_dashboard_has_accessible_cell_editor_path() -> None:
+    text = BUNDLE.read_text(encoding="utf-8")
+    assert "Workflow cell list" in text
+    assert "Edit cell" in text
+    assert "aria-label" in text
+
+
+def test_workflow_dashboard_has_responsive_editor_css() -> None:
+    css = (ROOT / "plugins" / "workflows" / "dashboard" / "dist" / "style.css").read_text(encoding="utf-8")
+    assert "hermes-workflows-editor-layout" in css
+    assert "@media" in css
+    assert "react-flow__minimap" in css or "hermes-workflows-minimap" in css

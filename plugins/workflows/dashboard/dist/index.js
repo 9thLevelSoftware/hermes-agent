@@ -541,9 +541,19 @@
       const node = data.node || {};
       return h("div", {
         className: "hermes-workflows-rf-node is-" + classSafe(kind) + " is-status-" + classSafe(status),
+        role: "button",
+        tabIndex: 0,
+        "aria-label": "Edit workflow cell " + safeString(data.id || node.id || "cell"),
         onClick: function (event) {
           event.stopPropagation();
           if (data.onSelect) data.onSelect(node);
+        },
+        onKeyDown: function (event) {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            event.stopPropagation();
+            if (data.onSelect) data.onSelect(node);
+          }
         },
       },
         Handle ? h(Handle, { type: "target", position: Position.Left }) : null,
@@ -1679,10 +1689,33 @@
       );
     }
 
+    function renderCellList(spec) {
+      const nodes = graphNodeList(spec);
+      return h("section", { className: "hermes-workflows-cell-list", "aria-label": "Workflow cell list" },
+        h("h3", null, "Workflow cell list"),
+        nodes.length ? nodes.map(function (node) {
+          const id = node.id || node.name || "node";
+          return h("button", {
+            key: id,
+            type: "button",
+            className: "hermes-workflows-cell-list-item",
+            "aria-label": "Edit cell " + safeString(id),
+            onClick: function () { selectNodeForInspector(node); },
+          },
+            h("span", null, safeString(id)),
+            h("span", null, safeString(node.type || "unknown")),
+            h("span", null, "Edit cell")
+          );
+        }) : h("p", { className: "hermes-workflows-muted" }, "No workflow cells available.")
+      );
+    }
+
+
     function renderSimpleGraph(spec) {
       const nodes = graphNodeList(spec);
       const edges = edgeList(spec);
       return h("div", { className: "hermes-workflows-graph-fallback" },
+        renderCellList(spec),
         nodes.length ? h("div", { className: "hermes-workflows-node-grid" }, nodes.map(function (node) {
           const id = node.id || node.name || "node";
           return h("div", {
@@ -1801,38 +1834,41 @@
 
     function renderReactFlowGraph(spec) {
       if (!ReactFlow || !ReactFlowProvider) return renderSimpleGraph(spec);
-      return h("div", { className: "hermes-workflows-builder" },
-        h("div", { className: "hermes-workflows-canvas" },
-          h(ReactFlowProvider, null,
-            h(ReactFlow, {
-              nodes: flowNodes,
-              edges: flowEdges,
-              nodeTypes: NODE_TYPES,
-              fitView: true,
-              nodesDraggable: true,
-              nodesConnectable: true,
-              onNodeClick: function (_, node) {
-                if (node && node.data && node.data.node) selectNodeForInspector(node.data.node);
+      return h("div", { className: "hermes-workflows-editor-layout hermes-workflows-builder" },
+        h("div", { className: "hermes-workflows-editor-main" },
+          renderCellList(spec),
+          h("div", { className: "hermes-workflows-canvas" },
+            h(ReactFlowProvider, null,
+              h(ReactFlow, {
+                nodes: flowNodes,
+                edges: flowEdges,
+                nodeTypes: NODE_TYPES,
+                fitView: true,
+                nodesDraggable: true,
+                nodesConnectable: true,
+                onNodeClick: function (_, node) {
+                  if (node && node.data && node.data.node) selectNodeForInspector(node.data.node);
+                },
+                onNodesChange: applyNodeChanges ? function (changes) { setFlowNodes(applyNodeChanges(changes, flowNodes)); } : undefined,
+                onEdgesChange: applyEdgeChanges ? function (changes) { setFlowEdges(applyEdgeChanges(changes, flowEdges)); } : undefined,
+                onConnect: addEdge ? function (connection) {
+                  setFlowEdges(addEdge(Object.assign({ label: "draft", markerEnd: { type: MarkerType.ArrowClosed } }, connection), flowEdges));
+                  const spec = activeSpec();
+                  if (spec && connection.source && connection.target) {
+                    const source = connection.sourceHandle ? connection.source + "." + connection.sourceHandle : connection.source;
+                    const nextSpec = upsertSpecEdge(spec, source, connection.target);
+                    updateEditorText(specToEditorText(nextSpec));
+                    setDraftSpec(nextSpec);
+                    setStatus("Connection added to workflow draft.");
+                  } else {
+                    setStatus("Draft connection added visually; validate/select a workflow to persist it.");
+                  }
+                } : undefined,
               },
-              onNodesChange: applyNodeChanges ? function (changes) { setFlowNodes(applyNodeChanges(changes, flowNodes)); } : undefined,
-              onEdgesChange: applyEdgeChanges ? function (changes) { setFlowEdges(applyEdgeChanges(changes, flowEdges)); } : undefined,
-              onConnect: addEdge ? function (connection) {
-                setFlowEdges(addEdge(Object.assign({ label: "draft", markerEnd: { type: MarkerType.ArrowClosed } }, connection), flowEdges));
-                const spec = activeSpec();
-                if (spec && connection.source && connection.target) {
-                  const source = connection.sourceHandle ? connection.source + "." + connection.sourceHandle : connection.source;
-                  const nextSpec = upsertSpecEdge(spec, source, connection.target);
-                  updateEditorText(specToEditorText(nextSpec));
-                  setDraftSpec(nextSpec);
-                  setStatus("Connection added to workflow draft.");
-                } else {
-                  setStatus("Draft connection added visually; validate/select a workflow to persist it.");
-                }
-              } : undefined,
-            },
-              Background ? h(Background, null) : null,
-              Controls ? h(Controls, null) : null,
-              MiniMap ? h(MiniMap, null) : null
+                Background ? h(Background, null) : null,
+                Controls ? h(Controls, null) : null,
+                MiniMap ? h(MiniMap, null) : null
+              )
             )
           )
         ),
