@@ -54,3 +54,26 @@ def workflow_capabilities() -> dict[str, Any]:
             "allowed_nodes": sorted(IMPLEMENTED_NODE_TYPES),
         },
     }
+
+
+def implemented_primitive_errors(spec: Any) -> list[str]:
+    """Return errors for workflow primitives not implemented by today's dispatcher."""
+    errors: list[str] = []
+    for trigger in getattr(spec, "triggers", []) or []:
+        trigger_type = getattr(trigger, "type", None)
+        if trigger_type not in IMPLEMENTED_TRIGGER_TYPES:
+            errors.append(f"unsupported trigger type: {trigger_type}")
+
+    nodes = getattr(spec, "nodes", {}) or {}
+    for node_id, node in nodes.items():
+        node_type = getattr(node, "type", None)
+        if node_type not in IMPLEMENTED_NODE_TYPES:
+            errors.append(f"unsupported node type: {node_type} on node {node_id}")
+    return errors
+
+
+def require_implemented_primitives(spec: Any) -> None:
+    """Raise ValueError when a spec uses primitives unavailable at runtime."""
+    errors = implemented_primitive_errors(spec)
+    if errors:
+        raise ValueError("; ".join(errors))
