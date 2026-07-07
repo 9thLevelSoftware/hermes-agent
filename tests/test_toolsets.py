@@ -74,6 +74,14 @@ class TestResolveToolset:
             del TOOLSETS["_cycle_a"]
             del TOOLSETS["_cycle_b"]
 
+    def test_workflow_toolset_includes_builder_tools(self):
+        tools = resolve_toolset("workflow")
+        assert "workflow_draft" in tools
+        assert "workflow_refine" in tools
+        assert "workflow_validate" in tools
+        assert "workflow_deploy" in tools
+        assert "workflow_run" in tools
+
     def test_unknown_toolset_returns_empty(self):
         assert resolve_toolset("nonexistent") == []
 

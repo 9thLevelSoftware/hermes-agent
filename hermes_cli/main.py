@@ -4264,6 +4264,13 @@ def cmd_kanban(args):
     return kanban_command(args)
 
 
+def cmd_workflow(args):
+    """Workflow graph definitions and executions."""
+    from hermes_cli.workflows import workflow_command
+
+    sys.exit(int(workflow_command(args) or 0))
+
+
 def cmd_project(args):
     """Manage projects (named, multi-folder workspaces)."""
     from hermes_cli.projects_cmd import projects_command
@@ -12223,7 +12230,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
+        "gui", "desktop", "kanban", "workflow", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
@@ -12990,6 +12997,14 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # =========================================================================
+    # workflow command — workflow graph definitions and executions
+    # =========================================================================
+    from hermes_cli.workflows import build_parser as _build_workflow_parser
+
+    workflow_parser = _build_workflow_parser(subparsers)
+    workflow_parser.set_defaults(func=cmd_workflow)
 
     # =========================================================================
     # project command — named, multi-folder workspaces
