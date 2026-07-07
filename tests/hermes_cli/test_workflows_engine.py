@@ -541,7 +541,7 @@ def test_fail_node_returns_failed():
     assert result.error == {"node": "stop", "type": "fail", "output": {"reason": "bad"}}
 
 
-def test_reachable_cycle_trips_max_step_guard():
+def test_reachable_cycle_is_rejected_before_engine_execution():
     spec = WorkflowSpec.model_validate({
         "id": "demo", "name": "Demo", "version": 1, "max_node_runs": 2,
         "nodes": {
@@ -554,8 +554,5 @@ def test_reachable_cycle_trips_max_step_guard():
         ],
     })
 
-    result = run_in_memory_until_waiting(spec, input_data={})
-
-    assert result.status == "failed"
-    assert result.error is not None
-    assert "max node runs" in result.error["message"]
+    with pytest.raises(ValueError, match="workflow graph contains cycle: loop -> loop"):
+        run_in_memory_until_waiting(spec, input_data={})
