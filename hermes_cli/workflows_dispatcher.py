@@ -16,6 +16,12 @@ from hermes_cli.workflows_prompts import render_agent_prompt
 from hermes_cli.workflows_spec import WorkflowSpec
 
 
+class _AgentTaskMaterializationError(RuntimeError):
+    def __init__(self, node_id: str, message: str):
+        super().__init__(message)
+        self.node_id = node_id
+
+
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
@@ -443,13 +449,16 @@ def _persist_waiting_nodes(
             wait_until = None
         kanban_task_id = None
         if spec is not None and node is not None and node.type == "agent_task":
-            kanban_task_id = _create_or_get_agent_task(
-                execution_id=execution_id,
-                spec=spec,
-                node_id=node_id,
-                node=node,
-                context=result.context,
-            )
+            try:
+                kanban_task_id = _create_or_get_agent_task(
+                    execution_id=execution_id,
+                    spec=spec,
+                    node_id=node_id,
+                    node=node,
+                    context=result.context,
+                )
+            except Exception as exc:
+                raise _AgentTaskMaterializationError(node_id, str(exc)) from exc
         exists = conn.execute(
             """
             SELECT id, kanban_task_id FROM workflow_node_runs
@@ -487,6 +496,69 @@ def _context_with_error(context: dict[str, Any], error: dict[str, Any]) -> dict[
     updated.setdefault("node", {})
     updated["error"] = error
     return updated
+
+
+def _linked_waiting_kanban_task_ids(conn: sqlite3.Connection, execution_id: str) -> list[str]:
+    return [
+        row["kanban_task_id"]
+        for row in conn.execute(
+            """
+            SELECT DISTINCT kanban_task_id
+              FROM workflow_node_runs
+             WHERE execution_id = ?
+               AND status = 'waiting'
+               AND kanban_task_id IS NOT NULL
+            """,
+            (execution_id,),
+        ).fetchall()
+    ]
+
+
+def _materialization_failure_result(
+    conn: sqlite3.Connection,
+    *,
+    execution_id: str,
+    result: EngineResult,
+    exc: _AgentTaskMaterializationError,
+    now: int,
+) -> EngineResult:
+    error = {
+        "message": str(exc),
+        "node": exc.node_id,
+        "phase": "agent_task_materialization",
+    }
+    _persist_failed_attempt(
+        conn,
+        execution_id=execution_id,
+        node_id=exc.node_id,
+        error=error,
+        now=now,
+    )
+    linked_task_ids = _linked_waiting_kanban_task_ids(conn, execution_id)
+    wfdb.block_linked_kanban_tasks(
+        linked_task_ids,
+        execution_id=execution_id,
+        source="agent_task_materialization",
+        reason=f"workflow execution {execution_id} failed to create agent task {exc.node_id}: {exc}",
+    )
+    if linked_task_ids:
+        placeholders = ", ".join("?" for _ in linked_task_ids)
+        conn.execute(
+            f"""
+            UPDATE workflow_node_runs
+               SET status = 'blocked', error = ?, completed_at = ?, wait_until = NULL
+             WHERE execution_id = ?
+               AND status = 'waiting'
+               AND kanban_task_id IN ({placeholders})
+            """,
+            (_json_dumps(error), now, execution_id, *linked_task_ids),
+        )
+    return EngineResult(
+        status="failed",
+        context=_context_with_error(result.context, error),
+        waiting_nodes=[],
+        error=error,
+    )
 
 
 def _persist_failed_attempt(
@@ -752,14 +824,25 @@ def _finish(
             result=result,
             now=now,
         )
-        _emit_progress_events(
-            conn,
-            execution_id=execution_id,
-            result=result,
-            spec=spec,
-            now=now,
-            existing_events=existing_events,
-        )
+        try:
+            _emit_progress_events(
+                conn,
+                execution_id=execution_id,
+                result=result,
+                spec=spec,
+                now=now,
+                existing_events=existing_events,
+            )
+        except _AgentTaskMaterializationError as exc:
+            result = _materialization_failure_result(
+                conn,
+                execution_id=execution_id,
+                result=result,
+                exc=exc,
+                now=now,
+            )
+            final_event = "execution_failed"
+            final_payload = {"error": result.error or {}}
         _append_event(conn, execution_id, final_event, final_payload, now)
         conn.execute(
             """

@@ -561,6 +561,111 @@ def test_agent_task_structured_prompt_remains_supported_and_pretty_printed(tmp_p
     assert "\n  " in body
 
 
+def test_cancel_execution_blocks_linked_agent_task(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    wfdb.init_db()
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, _agent_spec(), created_by="test")
+        exec_id = wfdb.start_execution(
+            conn, "agent_demo", input_data={"task": "hello"}, trigger_type="manual"
+        )
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+    task_id = _node_runs(exec_id, "ask")[0]["kanban_task_id"]
+    with kb.connect() as kconn:
+        task = kb.get_task(kconn, task_id)
+        assert task is not None
+        assert task.status in {"ready", "todo"}
+        kconn.execute(
+            """
+            UPDATE tasks
+               SET status = 'running', claim_lock = 'worker-lock',
+                   claim_expires = 999, worker_pid = NULL
+             WHERE id = ?
+            """,
+            (task_id,),
+        )
+
+    with wfdb.connect() as conn:
+        execution, cancelled = wfdb.cancel_execution(conn, exec_id, source="test")
+
+    assert cancelled is True
+    assert execution.status == "cancelled"
+    with kb.connect() as kconn:
+        task = kb.get_task(kconn, task_id)
+        assert task is not None
+        event = kconn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        reclaimed_event = kconn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'reclaimed' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    assert task.status == "blocked"
+    assert reclaimed_event is not None
+    assert event is not None
+    assert "cancelled" in json.loads(event["payload"])["reason"]
+
+
+def test_agent_task_materialization_error_fails_execution(tmp_path, monkeypatch):
+    exec_id = _start_agent_spec_execution(tmp_path, monkeypatch, _agent_spec())
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+
+    execution, claim, events = _execution_state(exec_id)
+    ask = _node_runs(exec_id, "ask")[0]
+    assert execution.status == "failed"
+    assert claim["claim_lock"] is None
+    assert ask["status"] == "failed"
+    assert "input.task" in ask["error"]
+    assert [event["kind"] for event in events][-1] == "execution_failed"
+    assert workflows_dispatcher.tick(limit=1, now=101) == 0
+
+
+def test_agent_task_materialization_error_blocks_sibling_tasks(tmp_path, monkeypatch):
+    spec = WorkflowSpec.model_validate({
+        "id": "agent_materialization_siblings",
+        "name": "Agent Materialization Siblings",
+        "version": 1,
+        "triggers": [{"type": "manual", "id": "manual"}],
+        "nodes": {
+            "first": {
+                "type": "agent_task",
+                "profile": "worker",
+                "title": "First task",
+                "prompt": "No missing input here",
+            },
+            "second": {
+                "type": "agent_task",
+                "profile": "worker",
+                "title": "Second task",
+                "prompt": "Needs ${ input.missing }",
+            },
+        },
+    })
+    exec_id = _start_agent_spec_execution(tmp_path, monkeypatch, spec)
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+
+    execution, _claim, _events = _execution_state(exec_id)
+    assert execution.status == "failed"
+    first = _node_runs(exec_id, "first")[0]
+    second = _node_runs(exec_id, "second")[0]
+    assert first["status"] == "blocked"
+    assert first["kanban_task_id"]
+    assert second["status"] == "failed"
+    with kb.connect() as kconn:
+        tasks = kb.list_tasks(kconn)
+    assert len(tasks) == 1
+    assert tasks[0].id == first["kanban_task_id"]
+    assert tasks[0].status == "blocked"
+
+
 def test_agent_task_resumes_from_summary_only_json_completion(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()

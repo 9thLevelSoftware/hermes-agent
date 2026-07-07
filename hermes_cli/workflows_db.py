@@ -7,6 +7,7 @@ import hashlib
 import json
 import secrets
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Any
 from croniter import croniter
 
 from hermes_constants import get_hermes_home
+from . import kanban_db as kb
 from hermes_cli.workflows_spec import WorkflowSpec
 
 
@@ -45,6 +47,8 @@ class WorkflowExecution:
 
 
 _TERMINAL_EXECUTION_STATUSES = {"cancelled", "failed", "succeeded"}
+_INIT_DB_LOCK = threading.Lock()
+_INITIALIZED_DB_PATHS: set[Path] = set()
 
 
 SCHEMA_SQL = """
@@ -147,20 +151,29 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def _init_cache_key(db_path: Path | None = None) -> Path:
+    return _resolve_db_path(db_path).expanduser().resolve(strict=False)
+
+
 def init_db(db_path: Path | None = None) -> None:
-    with contextlib.closing(connect(db_path)) as conn:
-        conn.executescript(SCHEMA_SQL)
-        columns = {
-            row["name"] for row in conn.execute("PRAGMA table_info(workflow_node_runs)")
-        }
-        if "wait_until" not in columns:
-            conn.execute("ALTER TABLE workflow_node_runs ADD COLUMN wait_until INTEGER")
-        if "kanban_task_id" not in columns:
-            conn.execute("ALTER TABLE workflow_node_runs ADD COLUMN kanban_task_id TEXT")
-        conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_workflow_node_runs_kanban_task
-                ON workflow_node_runs(kanban_task_id)
-        """)
+    cache_key = _init_cache_key(db_path)
+    with _INIT_DB_LOCK:
+        if cache_key in _INITIALIZED_DB_PATHS:
+            return
+        with contextlib.closing(connect(cache_key)) as conn:
+            conn.executescript(SCHEMA_SQL)
+            columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(workflow_node_runs)")
+            }
+            if "wait_until" not in columns:
+                conn.execute("ALTER TABLE workflow_node_runs ADD COLUMN wait_until INTEGER")
+            if "kanban_task_id" not in columns:
+                conn.execute("ALTER TABLE workflow_node_runs ADD COLUMN kanban_task_id TEXT")
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_workflow_node_runs_kanban_task
+                    ON workflow_node_runs(kanban_task_id)
+            """)
+        _INITIALIZED_DB_PATHS.add(cache_key)
 
 
 @contextlib.contextmanager
@@ -526,6 +539,27 @@ def list_node_runs(conn: sqlite3.Connection, execution_id: str) -> list[dict[str
     return result
 
 
+def block_linked_kanban_tasks(
+    task_ids: list[str],
+    *,
+    execution_id: str,
+    source: str,
+    reason: str | None = None,
+) -> None:
+    if not task_ids:
+        return
+
+    reason = reason or f"workflow execution {execution_id} cancelled by {source}"
+    with kb.connect_closing() as kconn:
+        for task_id in task_ids:
+            task = kb.get_task(kconn, task_id)
+            if task is None:
+                continue
+            if task.status == "running" or task.claim_lock is not None:
+                kb.reclaim_task(kconn, task_id, reason=reason)
+            kb.block_task(kconn, task_id, reason=reason, kind="capability")
+
+
 def cancel_execution(
     conn: sqlite3.Connection,
     execution_id: str,
@@ -539,7 +573,21 @@ def cancel_execution(
     now = int(time.time())
     terminal_statuses = tuple(sorted(_TERMINAL_EXECUTION_STATUSES))
     placeholders = ", ".join("?" for _ in terminal_statuses)
+    linked_task_ids: list[str] = []
     with write_txn(conn):
+        linked_task_ids = [
+            row["kanban_task_id"]
+            for row in conn.execute(
+                """
+                SELECT DISTINCT kanban_task_id
+                  FROM workflow_node_runs
+                 WHERE execution_id = ?
+                   AND kanban_task_id IS NOT NULL
+                   AND status = 'waiting'
+                """,
+                (execution_id,),
+            ).fetchall()
+        ]
         cancelled = conn.execute(
             f"""
             UPDATE workflow_executions
@@ -552,6 +600,9 @@ def cancel_execution(
         ).rowcount > 0
         if cancelled:
             append_event(conn, execution_id, "execution_cancelled", {"source": source})
+
+    if cancelled:
+        block_linked_kanban_tasks(linked_task_ids, execution_id=execution_id, source=source)
 
     return get_execution(conn, execution_id), cancelled
 

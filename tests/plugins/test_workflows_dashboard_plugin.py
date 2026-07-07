@@ -2024,6 +2024,27 @@ def test_dashboard_bundle_summarizes_structured_prompts_for_draft_review():
     assert "String(edge.from || edge.from_" in rows
 
 
+def test_dashboard_api_sync_db_routes_are_threadpool_safe(client):
+    import inspect
+
+    plugin = sys.modules["hermes_dashboard_plugin_workflows_test"]
+
+    for name in [
+        "list_definitions",
+        "get_definition",
+        "list_executions",
+        "get_execution",
+        "cancel_execution",
+        "list_events",
+    ]:
+        assert not inspect.iscoroutinefunction(getattr(plugin, name)), name
+
+    deploy_source = inspect.getsource(plugin.deploy_definition)
+    run_source = inspect.getsource(plugin.run_workflow)
+    assert "await asyncio.to_thread(_deploy)" in deploy_source
+    assert "await asyncio.to_thread(_run)" in run_source
+
+
 def test_bad_run_input_returns_400(client):
     _deploy(client)
     r = client.post(

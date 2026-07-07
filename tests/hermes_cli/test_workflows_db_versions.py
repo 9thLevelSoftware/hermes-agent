@@ -27,6 +27,41 @@ def _schedule_spec(*, version=1):
     })
 
 
+def test_init_db_runs_schema_once_per_resolved_path(tmp_path, monkeypatch):
+    calls = {"executescript": 0}
+
+    class FakeConn:
+        def executescript(self, _sql):
+            calls["executescript"] += 1
+
+        def execute(self, sql):
+            if "PRAGMA table_info(workflow_node_runs)" in sql:
+                return [{"name": "wait_until"}, {"name": "kanban_task_id"}]
+            return []
+
+        def close(self):
+            pass
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "workflows.db").touch()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(wfdb, "connect", lambda db_path=None: FakeConn())
+    wfdb._INITIALIZED_DB_PATHS.clear()
+    try:
+        wfdb.init_db()
+        wfdb.init_db()
+        assert calls["executescript"] == 1
+
+        custom_db = tmp_path / "custom-workflows.db"
+        custom_db.touch()
+        wfdb.init_db(custom_db)
+        wfdb.init_db(custom_db)
+        assert calls["executescript"] == 2
+    finally:
+        wfdb._INITIALIZED_DB_PATHS.clear()
+
+
 def test_redeploy_same_version_same_checksum_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     wfdb.init_db()

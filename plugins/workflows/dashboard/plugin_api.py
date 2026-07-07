@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -336,7 +337,7 @@ def refine_definition(req: WorkflowRefineRequest) -> dict[str, Any]:
 
 
 @router.get("/definitions")
-async def list_definitions() -> dict[str, Any]:
+def list_definitions() -> dict[str, Any]:
     with _connect_initialized() as conn:
         definitions = [_definition_to_dict(r) for r in wfdb.list_definitions(conn)]
     return {"definitions": definitions}
@@ -355,9 +356,13 @@ async def validate_definition(request: Request) -> dict[str, Any]:
 async def deploy_definition(request: Request) -> dict[str, Any]:
     try:
         spec = _load_spec_from_payload(await _read_body(request))
-        with _connect_initialized() as conn:
-            wfdb.deploy_definition(conn, spec, created_by="dashboard")
-            record = _definition_record(conn, spec.id, spec.version)
+
+        def _deploy():
+            with _connect_initialized() as conn:
+                wfdb.deploy_definition(conn, spec, created_by="dashboard")
+                return _definition_record(conn, spec.id, spec.version)
+
+        record = await asyncio.to_thread(_deploy)
     except (json.JSONDecodeError, yaml.YAMLError, ValidationError, ValueError) as exc:
         raise _http_400(exc) from exc
     except KeyError as exc:
@@ -366,7 +371,7 @@ async def deploy_definition(request: Request) -> dict[str, Any]:
 
 
 @router.get("/definitions/{workflow_id}")
-async def get_definition(
+def get_definition(
     workflow_id: str,
     version: int | None = Query(default=None),
 ) -> dict[str, Any]:
@@ -386,19 +391,24 @@ async def run_workflow(
 ) -> dict[str, Any]:
     try:
         input_data = _input_from_payload(await _read_body(request))
-        with _connect_initialized() as conn:
-            execution_id = wfdb.start_execution(
-                conn,
-                workflow_id,
-                input_data=input_data,
-                trigger_type="manual",
-                version=version,
-            )
+
+        def _run():
+            with _connect_initialized() as conn:
+                execution_id = wfdb.start_execution(
+                    conn,
+                    workflow_id,
+                    input_data=input_data,
+                    trigger_type="manual",
+                    version=version,
+                )
             try:
                 workflows_dispatcher.tick(limit=1)
             except Exception:
                 logger.debug("workflow dashboard tick failed", exc_info=True)
-            execution = wfdb.get_execution(conn, execution_id)
+            with _connect_initialized() as conn:
+                return wfdb.get_execution(conn, execution_id)
+
+        execution = await asyncio.to_thread(_run)
     except (json.JSONDecodeError, yaml.YAMLError, ValueError) as exc:
         raise _http_400(exc) from exc
     except KeyError as exc:
@@ -407,14 +417,14 @@ async def run_workflow(
 
 
 @router.get("/executions")
-async def list_executions(workflow_id: str | None = Query(default=None)) -> dict[str, Any]:
+def list_executions(workflow_id: str | None = Query(default=None)) -> dict[str, Any]:
     with _connect_initialized() as conn:
         executions = [_execution_to_dict(e) for e in _list_executions(conn, workflow_id)]
     return {"executions": executions}
 
 
 @router.get("/executions/{execution_id}")
-async def get_execution(execution_id: str) -> dict[str, Any]:
+def get_execution(execution_id: str) -> dict[str, Any]:
     try:
         with _connect_initialized() as conn:
             execution = wfdb.get_execution(conn, execution_id)
@@ -435,7 +445,7 @@ def execution_node_runs(execution_id: str) -> dict[str, Any]:
 
 
 @router.post("/executions/{execution_id}/cancel")
-async def cancel_execution(execution_id: str) -> dict[str, Any]:
+def cancel_execution(execution_id: str) -> dict[str, Any]:
     try:
         with _connect_initialized() as conn:
             execution, cancelled = wfdb.cancel_execution(
@@ -447,7 +457,7 @@ async def cancel_execution(execution_id: str) -> dict[str, Any]:
 
 
 @router.get("/executions/{execution_id}/events")
-async def list_events(execution_id: str) -> dict[str, Any]:
+def list_events(execution_id: str) -> dict[str, Any]:
     try:
         with _connect_initialized() as conn:
             wfdb.get_execution(conn, execution_id)
