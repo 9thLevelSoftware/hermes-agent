@@ -58,6 +58,7 @@ class NodeSpec(BaseModel):
     default: str | None = None
     profile: str | None = None
     prompt: Any = None
+    result_contract: dict[str, Any] = Field(default_factory=dict)
     title: str | None = None
     workspace_kind: str | None = None
     workspace_path: str | None = None

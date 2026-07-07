@@ -112,7 +112,8 @@ def _json_schema_instruction() -> str:
     "version": 1,
     "triggers": [{"type": "manual", "id": "manual"}],
     "nodes": {
-      "node_id": {"type": "pass", "output": {}}
+      "agent_node": {"type": "agent_task", "profile": "worker", "title": "Do work", "prompt": "Return JSON only with keys: summary (string), status (string).", "result_contract": {"summary": "string", "status": "string"}},
+      "done": {"type": "pass", "output": {}}
     },
     "edges": []
   }
@@ -126,8 +127,8 @@ def _assistant_rules() -> str:
 - Allowed triggers: manual, schedule.
 - Allowed nodes: pass, switch, agent_task, wait, parallel, join, fail.
 - Do not emit webhook, kanban_event, send_message, or subworkflow.
-- Every agent_task must include profile, title, and text prompt.
-- Every agent_task prompt must ask for JSON-only output and include a result contract.
+- Every agent_task must include profile, title, text prompt, and result_contract with required downstream keys.
+- Every agent_task prompt must ask for JSON-only output matching its result_contract.
 - Prefer simple graphs, no unrequested flexibility.
 - Use lowercase snake_case node ids."""
 

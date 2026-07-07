@@ -5,6 +5,7 @@ import pytest
 from hermes_cli.workflows_assistant import (
     AssistantValidationError,
     WorkflowDraftResult,
+    _json_schema_instruction,
     build_draft_prompt,
     draft_workflow,
     parse_assistant_payload,
@@ -175,6 +176,21 @@ def test_draft_prompt_uses_valid_empty_edges_example():
 
     assert '"edges": []' in prompt
     assert "next_node_id" not in prompt
+
+
+def test_draft_prompt_requires_agent_result_contracts():
+    prompt = build_draft_prompt("Build a code review workflow")
+
+    assert "result_contract" in prompt
+    assert "Every agent_task" in prompt
+
+
+def test_json_schema_instruction_includes_agent_task_result_contract_example():
+    instruction = _json_schema_instruction()
+
+    assert '"type": "agent_task"' in instruction
+    assert '"prompt": "Return JSON only with keys: summary (string), status (string)."' in instruction
+    assert '"result_contract": {"summary": "string", "status": "string"}' in instruction
 
 
 def test_default_runner_uses_agent_runtime_adapter(monkeypatch):

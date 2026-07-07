@@ -191,6 +191,31 @@ def test_agent_task_max_retries_must_be_positive():
         WorkflowSpec.model_validate(raw)
 
 
+def test_agent_task_accepts_result_contract():
+    spec = WorkflowSpec.model_validate(
+        {
+            "id": "contract_demo",
+            "name": "Contract Demo",
+            "version": 1,
+            "nodes": {
+                "ask": {
+                    "type": "agent_task",
+                    "profile": "worker",
+                    "prompt": "Return JSON",
+                    "result_contract": {"summary": "string", "status": "ok|failed"},
+                },
+                "done": {"type": "pass"},
+            },
+            "edges": [{"from": "ask", "to": "done"}],
+        }
+    )
+
+    validate_graph(spec)
+    assert spec.nodes["ask"].result_contract["status"] == "ok|failed"
+    assert spec.nodes["done"].result_contract == {}
+    assert spec.model_dump()["nodes"]["done"]["result_contract"] == {}
+
+
 def test_edge_from_alias_and_field_name_both_populate_from_():
     by_alias = EdgeSpec.model_validate({"from": "start", "to": "done"})
     by_name = EdgeSpec.model_validate({"from_": "start", "to": "done"})
