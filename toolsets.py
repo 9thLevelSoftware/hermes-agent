@@ -282,6 +282,8 @@ TOOLSETS = {
             "profiles that validate, deploy, start, inspect, or cancel workflow executions."
         ),
         "tools": [
+            "workflow_draft",
+            "workflow_refine",
             "workflow_list",
             "workflow_show",
             "workflow_validate",
