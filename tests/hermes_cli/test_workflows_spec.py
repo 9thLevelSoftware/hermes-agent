@@ -79,7 +79,41 @@ def test_workflow_requires_at_least_one_entry_node():
         {"from": "second", "to": "first"},
     ]
     spec = WorkflowSpec.model_validate(raw)
-    with pytest.raises(ValueError, match="at least one entry node"):
+    with pytest.raises(ValueError, match="workflow graph contains cycle"):
+        validate_graph(spec)
+
+
+def test_validate_graph_rejects_self_cycle():
+    raw = _minimal_spec()
+    raw["nodes"] = {
+        "start": {"type": "pass", "output": {}},
+        "loop": {"type": "pass", "output": {}},
+    }
+    raw["edges"] = [
+        {"from": "start", "to": "loop"},
+        {"from": "loop", "to": "loop"},
+    ]
+    spec = WorkflowSpec.model_validate(raw)
+
+    with pytest.raises(ValueError, match="workflow graph contains cycle: loop -> loop"):
+        validate_graph(spec)
+
+
+def test_validate_graph_rejects_multi_node_cycle():
+    raw = _minimal_spec()
+    raw["nodes"] = {
+        "start": {"type": "pass", "output": {}},
+        "a": {"type": "pass", "output": {}},
+        "b": {"type": "pass", "output": {}},
+    }
+    raw["edges"] = [
+        {"from": "start", "to": "a"},
+        {"from": "a", "to": "b"},
+        {"from": "b", "to": "a"},
+    ]
+    spec = WorkflowSpec.model_validate(raw)
+
+    with pytest.raises(ValueError, match="workflow graph contains cycle: a -> b -> a"):
         validate_graph(spec)
 
 

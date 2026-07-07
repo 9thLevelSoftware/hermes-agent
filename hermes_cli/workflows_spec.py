@@ -113,6 +113,45 @@ def _blank_prompt(value: Any) -> bool:
     return False
 
 
+def _cycle_path(spec: WorkflowSpec) -> list[str] | None:
+    adjacency: dict[str, list[str]] = {node_id: [] for node_id in spec.nodes}
+    for edge in spec.edges:
+        source_base = edge.from_.split(".", 1)[0]
+        adjacency.setdefault(source_base, []).append(edge.to)
+    for node_id, node in spec.nodes.items():
+        if node.catch:
+            adjacency.setdefault(node_id, []).append(node.catch)
+        if node.type == "switch" and node.default:
+            adjacency.setdefault(node_id, []).append(node.default)
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    stack: list[str] = []
+
+    def visit(node_id: str) -> list[str] | None:
+        if node_id in visiting:
+            start = stack.index(node_id) if node_id in stack else 0
+            return stack[start:] + [node_id]
+        if node_id in visited:
+            return None
+        visiting.add(node_id)
+        stack.append(node_id)
+        for next_id in adjacency.get(node_id, []):
+            found = visit(next_id)
+            if found:
+                return found
+        stack.pop()
+        visiting.remove(node_id)
+        visited.add(node_id)
+        return None
+
+    for node_id in spec.nodes:
+        found = visit(node_id)
+        if found:
+            return found
+    return None
+
+
 def validate_graph(spec: WorkflowSpec) -> None:
     for trigger in spec.triggers:
         expr = trigger.cron or trigger.schedule or getattr(trigger, "expr", None)
@@ -176,6 +215,10 @@ def validate_graph(spec: WorkflowSpec) -> None:
                 raise ValueError(f"agent_task node {node_id} requires a non-blank profile")
             if _blank_prompt(node.prompt):
                 raise ValueError(f"agent_task node {node_id} requires a non-empty prompt")
+
+    cycle = _cycle_path(spec)
+    if cycle:
+        raise ValueError("workflow graph contains cycle: " + " -> ".join(cycle))
 
     if not any(node_id not in incoming_targets for node_id in node_ids):
         raise ValueError("workflow must define at least one entry node")
