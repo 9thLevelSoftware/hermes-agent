@@ -408,6 +408,72 @@ def test_dashboard_bundle_registers_plugin_without_build_scaffolding():
     assert "__webpack_require__" not in bundle
 
 
+def test_dashboard_bundle_is_prompt_first_not_yaml_first():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    render_start = bundle.index('return h("div", { className: "hermes-workflows" }')
+    render_tree = bundle[render_start:]
+
+    assert "What do you want to automate?" in bundle
+    assert "Describe workflow" in bundle
+    assert "Use Kanban for one-off work queues" in bundle
+    assert "Advanced YAML" in bundle
+    assert "Validate / deploy definition" not in bundle
+    assert render_tree.index("renderGoalBuilder()") < render_tree.index(
+        'className: "hermes-workflows-grid"'
+    )
+    assert render_tree.index("renderGoalBuilder()") < render_tree.index("Workflow list")
+    assert bundle.index("What do you want to automate?") < bundle.index("Workflow list")
+
+
+def test_dashboard_bundle_syncs_editor_when_definition_is_selected():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    load_definition_pos = bundle.index("function loadDefinition")
+    next_function_pos = bundle.index("function loadEvents", load_definition_pos)
+    load_definition_body = bundle[load_definition_pos:next_function_pos]
+
+    assert "updateEditorText(specToEditorText(definition.spec))" in load_definition_body
+
+
+def test_dashboard_bundle_clears_stale_draft_state_before_empty_goal_error():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    draft_pos = bundle.index("function draftFromGoal")
+    next_function_pos = bundle.index("function importDefinitionFile", draft_pos)
+    draft_body = bundle[draft_pos:next_function_pos]
+    empty_goal_pos = draft_body.index("if (!goal)")
+
+    assert draft_body.index('setStatus("")') < empty_goal_pos
+    assert draft_body.index("setDraftResult(null)") < empty_goal_pos
+    assert "Describe what you want the workflow to automate." in draft_body
+
+
+def test_dashboard_bundle_resets_stale_selection_after_goal_draft():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    draft_pos = bundle.index("function draftFromGoal")
+    next_function_pos = bundle.index("function importDefinitionFile", draft_pos)
+    draft_body = bundle[draft_pos:next_function_pos]
+
+    for marker in [
+        "setSelectedDefinition(null)",
+        "setSelectedNode(null)",
+        'setNodeJson("")',
+        'setNodeMessage("")',
+        "setDraftSpec(draft.spec)",
+        "updateEditorText(specToEditorText(draft.spec))",
+    ]:
+        assert marker in draft_body
+    assert 'aria-label' in bundle and 'Describe workflow goal' in bundle
+
+
+def test_dashboard_bundle_keeps_yaml_as_advanced_escape_hatch():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    advanced_pos = bundle.index("function renderAdvancedYaml")
+    advanced_body = bundle[advanced_pos : bundle.index("function renderDefinitionList", advanced_pos)]
+
+    assert "showAdvancedYaml" in bundle
+    for marker in ["Validate", "Deploy", "Import YAML", "Export YAML", "Copy YAML"]:
+        assert marker in advanced_body
+
+
 def test_web_plugin_sdk_exposes_react_flow_to_static_plugins():
     package_json = json.loads((REPO_ROOT / "web" / "package.json").read_text())
     assert "@xyflow/react" in package_json["dependencies"]
@@ -524,7 +590,7 @@ def test_dashboard_bundle_contains_workflow_mvp_api_and_ui_markers():
 
     for marker in [
         "Workflow list",
-        "Validate / deploy definition",
+        "Advanced YAML",
         "Manual run form",
         "Execution list",
         "Execution detail timeline",

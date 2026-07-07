@@ -339,6 +339,18 @@
     const stateDraftSpec = useState(null);
     const draftSpec = stateDraftSpec[0];
     const setDraftSpec = stateDraftSpec[1];
+    const stateGoalText = useState("");
+    const goalText = stateGoalText[0];
+    const setGoalText = stateGoalText[1];
+    const stateDraftResult = useState(null);
+    const draftResult = stateDraftResult[0];
+    const setDraftResult = stateDraftResult[1];
+    const stateDrafting = useState(false);
+    const drafting = stateDrafting[0];
+    const setDrafting = stateDrafting[1];
+    const stateShowAdvancedYaml = useState(false);
+    const showAdvancedYaml = stateShowAdvancedYaml[0];
+    const setShowAdvancedYaml = stateShowAdvancedYaml[1];
     const stateRunWorkflowId = useState("");
     const runWorkflowId = stateRunWorkflowId[0];
     const setRunWorkflowId = stateRunWorkflowId[1];
@@ -410,6 +422,7 @@
         const definition = res.definition || null;
         setSelectedDefinition(definition);
         setDraftSpec(definition && definition.spec ? definition.spec : null);
+        if (definition && definition.spec) updateEditorText(specToEditorText(definition.spec));
         setSelectedNode(null);
         if (definition) setRunWorkflowId(definition.workflow_id || definition.id || workflowId);
         return definition;
@@ -540,6 +553,36 @@
       }).catch(fail).finally(function () { setRunning(false); });
     }
 
+    function draftFromGoal(event) {
+      event.preventDefault();
+      const goal = (goalText || "").trim();
+      setStatus("");
+      setDraftResult(null);
+      if (!goal) {
+        setError("Describe what you want the workflow to automate.");
+        return;
+      }
+      setDrafting(true);
+      setError("");
+      api("/definitions/draft", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ goal: goal }),
+      }).then(function (res) {
+        const draft = res.draft || res;
+        setDraftResult(draft);
+        if (draft.spec) {
+          setSelectedDefinition(null);
+          setSelectedNode(null);
+          setNodeJson("");
+          setNodeMessage("");
+          setDraftSpec(draft.spec);
+          updateEditorText(specToEditorText(draft.spec));
+        }
+        setStatus("Drafted workflow from goal. Review the plan before deploy.");
+      }).catch(fail).finally(function () { setDrafting(false); });
+    }
+
     function importDefinitionFile(event) {
       const file = event.target.files && event.target.files[0];
       if (!file) return;
@@ -569,7 +612,7 @@
 
     function copyYAML() {
       if (!navigator.clipboard) {
-        setError("Clipboard API unavailable; use Export YAML instead.");
+        setStatus("Clipboard API unavailable; use Export YAML instead.");
         return;
       }
       navigator.clipboard.writeText(editorText).then(function () {
@@ -686,6 +729,64 @@
         setResultContractText(jsonBlock(res.result_contract || expectedOutput));
         setNodeMessage("Prompt assistant drafted a cell prompt. Review it, then Apply cell prompt.");
       }).catch(fail);
+    }
+
+    function renderGoalBuilder() {
+      const templates = [
+        ["Code change + review", "Change code in a repository, run the tests, review the diff, and report whether it is ready."],
+        ["Research triage", "Collect sources for a research question, summarize findings, flag gaps, and produce a recommendation."],
+        ["Daily briefing", "Every morning, gather updates from configured sources and produce a concise briefing with action items."],
+        ["Human approval loop", "Prepare a proposed action, wait for human approval, then continue only if it is approved."],
+      ];
+      return h(Card, { className: "hermes-workflows-panel hermes-workflows-goal" },
+        h("h2", null, "What do you want to automate?"),
+        h("p", { className: "hermes-workflows-muted" }, "Describe the outcome in plain language. Hermes drafts the graph, cells, inputs, and output contracts for you to review."),
+        h("form", { className: "hermes-workflows-stack", onSubmit: draftFromGoal },
+          h("textarea", {
+            className: "hermes-workflows-goal-input",
+            "aria-label": "Describe workflow goal",
+            value: goalText,
+            onChange: function (event) { setGoalText(event.target.value); },
+            placeholder: "Example: review code changes, run tests, ask for approval, then deploy if approved.",
+          }),
+          h("div", { className: "hermes-workflows-row" },
+            h("button", { type: "submit", disabled: drafting, className: "hermes-workflows-primary" }, drafting ? "Drafting…" : "Describe workflow"),
+            h("button", { type: "button", onClick: function () { setShowAdvancedYaml(!showAdvancedYaml); } }, showAdvancedYaml ? "Hide Advanced YAML" : "Advanced YAML")
+          )
+        ),
+        h("p", { className: "hermes-workflows-muted" }, "Use Kanban for one-off work queues; use workflows when the same automation should run repeatedly."),
+        h("div", { className: "hermes-workflows-template-grid" }, templates.map(function (template) {
+          return h("button", {
+            key: template[0],
+            type: "button",
+            className: "hermes-workflows-template-card",
+            onClick: function () { setGoalText(template[1]); },
+          }, template[0]);
+        })),
+        draftResult && draftResult.summary ? h("p", { className: "hermes-workflows-muted" }, safeString(draftResult.summary)) : null
+      );
+    }
+
+    function renderAdvancedYaml() {
+      if (!showAdvancedYaml) return null;
+      return h(Card, { className: "hermes-workflows-panel" },
+        h("h2", null, "Advanced YAML"),
+        h("textarea", {
+          className: "hermes-workflows-editor",
+          value: editorText,
+          onChange: function (event) { updateEditorText(event.target.value); },
+        }),
+        h("div", { className: "hermes-workflows-row" },
+          h("button", { type: "button", disabled: validating, onClick: validateDefinition }, validating ? "Validating…" : "Validate"),
+          h("button", { type: "button", disabled: deploying, onClick: deployDefinition, className: "hermes-workflows-primary" }, deploying ? "Deploying…" : "Deploy"),
+          h("label", { className: "hermes-workflows-file-button" },
+            "Import YAML",
+            h("input", { type: "file", accept: ".yaml,.yml,.json,application/yaml,application/x-yaml,application/json", onChange: importDefinitionFile })
+          ),
+          h("button", { type: "button", onClick: exportYAML }, "Export YAML"),
+          h("button", { type: "button", onClick: copyYAML }, "Copy YAML")
+        )
+      );
     }
 
     function renderDefinitionList() {
@@ -945,6 +1046,7 @@
       ),
       error ? h("div", { className: "hermes-workflows-banner is-error" }, error) : null,
       status ? h("div", { className: "hermes-workflows-banner" }, status) : null,
+      renderGoalBuilder(),
       h("div", { className: "hermes-workflows-grid" },
         h("div", { className: "hermes-workflows-stack" },
           h(Card, { className: "hermes-workflows-panel" },
@@ -988,24 +1090,7 @@
           )
         ),
         h("div", { className: "hermes-workflows-stack" },
-          h(Card, { className: "hermes-workflows-panel" },
-            h("h2", null, "Validate / deploy definition"),
-            h("textarea", {
-              className: "hermes-workflows-editor",
-              value: editorText,
-              onChange: function (event) { updateEditorText(event.target.value); },
-            }),
-            h("div", { className: "hermes-workflows-row" },
-              h("button", { type: "button", disabled: validating, onClick: validateDefinition }, validating ? "Validating…" : "Validate"),
-              h("button", { type: "button", disabled: deploying, onClick: deployDefinition, className: "hermes-workflows-primary" }, deploying ? "Deploying…" : "Deploy"),
-              h("label", { className: "hermes-workflows-file-button" },
-                "Import YAML",
-                h("input", { type: "file", accept: ".yaml,.yml,.json,application/yaml,application/x-yaml,application/json", onChange: importDefinitionFile })
-              ),
-              h("button", { type: "button", onClick: exportYAML }, "Export YAML"),
-              h("button", { type: "button", onClick: copyYAML }, "Copy YAML")
-            )
-          ),
+          renderAdvancedYaml(),
           h(Card, { className: "hermes-workflows-panel" }, renderGraph()),
           h(Card, { className: "hermes-workflows-panel" },
             h("h2", null, "Execution detail timeline"),

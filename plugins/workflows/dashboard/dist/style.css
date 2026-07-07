@@ -135,6 +135,7 @@
 }
 
 .hermes-workflows .hermes-workflows-editor,
+.hermes-workflows .hermes-workflows-goal-input,
 .hermes-workflows .hermes-workflows-run-input,
 .hermes-workflows input,
 .hermes-workflows select {
@@ -157,6 +158,13 @@
 
 .hermes-workflows .hermes-workflows-run-input {
   min-height: 7rem;
+}
+
+.hermes-workflows .hermes-workflows-goal-input {
+  min-height: 9rem;
+  resize: vertical;
+  font: inherit;
+  line-height: 1.45;
 }
 
 .hermes-workflows .hermes-workflows-prompt-editor {
@@ -207,6 +215,16 @@
 
 .hermes-workflows .hermes-workflows-primary {
   background: color-mix(in srgb, var(--color-primary) 20%, var(--color-card));
+}
+
+.hermes-workflows .hermes-workflows-template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.5rem;
+}
+
+.hermes-workflows .hermes-workflows-template-card {
+  text-align: left;
 }
 
 .hermes-workflows .hermes-workflows-banner {
