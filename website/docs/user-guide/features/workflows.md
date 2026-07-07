@@ -30,7 +30,7 @@ Example prompt:
 Draft a workflow that researches a topic, scores source quality, sends high-value findings to an analyst profile, and produces a concise final report.
 ```
 
-Hermes drafts a workflow spec from that goal. Review the draft, ask for corrections with workflow refine tooling, validate it, then deploy. Use YAML/JSON only when you are importing, exporting, debugging, or intentionally authoring the definition by hand.
+Hermes drafts a workflow spec from that goal. Review the draft, ask for corrections with workflow refine tooling, validate it, then deploy. If the assistant provider fails or returns an invalid draft, dashboard/API responses return typed, privacy-safe remediation hints so you can retry, adjust the request, or switch to Advanced YAML without exposing provider secrets. Use YAML/JSON only when you are importing, exporting, debugging, or intentionally authoring the definition by hand.
 
 ## When to use Workflows vs Kanban
 
@@ -72,7 +72,7 @@ Treat the generated spec as a draft. Review:
 - each cell objective and node type
 - profile assignment for each `agent_task`
 - text-first prompts with `${ input.foo }` and `${ node.cell.output.field }` placeholders
-- explicit JSON output contracts in agent prompts
+- explicit `result_contract` mappings for downstream `agent_task` output keys
 - switch cases, parallel branches, joins, waits, and terminal states
 - workspace settings when a worker must use a specific worktree or directory
 
@@ -93,7 +93,10 @@ Always validate before deploy. The validation surface checks deployable workflow
 - node ids and workflow id are stable and valid
 - every referenced edge target exists
 - switch and parallel edges use dotted ports where required
+- the graph is acyclic
 - each `agent_task` has `profile` and `prompt`
+- only currently implemented primitives are used (`manual`/`schedule` triggers and `pass`, `switch`, `agent_task`, `wait`, `parallel`, `join`, `fail` nodes)
+- optional `result_contract` entries use enforced flat types (`string`, `number`, `boolean`, `array`, `object`) or enum strings such as `approved|rejected`
 
 Also review the draft manually before deploy for semantic issues that graph validation cannot fully prove yet, such as whether prompt placeholders refer to the intended input/upstream node output and whether scheduled trigger strings express the schedule you meant.
 
@@ -107,7 +110,7 @@ hermes workflow show <workflow_id> --json
 
 ## Run a test execution
 
-For a manual trigger, the dashboard generates a run form from the workflow's expected input shape. Fill the form, start the test run, and watch the execution enter the queue.
+For a manual trigger, the dashboard generates a run form from the workflow's expected input shape. Fill the form, start the test run, and watch the execution enter the queue. Workflow inputs and outputs are stored locally in workflow state and Kanban history. Do not paste secrets; common secret-looking keys are redacted in dashboard display responses, but raw execution data remains in local storage for dispatcher correctness.
 
 The equivalent CLI path uses a JSON object as input:
 
@@ -180,6 +183,9 @@ nodes:
     type: agent_task
     profile: researcher
     title: Research topic
+    result_contract:
+      summary: string
+      sources: array
     prompt: |
       You are the researcher profile executing workflow cell research.
       Research: ${ node.start.output.topic }
@@ -227,8 +233,8 @@ A workflow file is a YAML object with these supported top-level fields:
 |---|---|---|
 | `manual` | `id`, `input` | Run with `hermes workflow run` or the dashboard run form. The CLI/dashboard run input is the execution input; trigger `input` is for external launchers and is not merged by the CLI. |
 | `schedule` | `id`, `cron` or `schedule`, `input` | Deploy creates a row in `workflow_schedules`; dispatcher starts executions when due. Uses cron syntax accepted by `croniter`. |
-| `webhook` | `id`, `input` | Schema-accepted for future/external launchers; no built-in webhook launcher in this CLI surface yet. |
-| `kanban_event` | `id`, `input` | Schema-accepted for future/external launchers; not wired to Kanban events by default. |
+| `webhook` | `id`, `input` | Declared for future/external launchers; built-in validate/deploy reject it until a launcher is available. |
+| `kanban_event` | `id`, `input` | Declared for future/external launchers; built-in validate/deploy reject it until Kanban event launching is available. |
 
 Schedule trigger example:
 
@@ -274,7 +280,7 @@ Common fields on node specs:
 
 | Field | Meaning |
 |---|---|
-| `type` | One of `pass`, `switch`, `agent_task`, `wait`, `parallel`, `join`, `send_message`, `fail`, `subworkflow`. |
+| `type` | Declared node type. Built-in validate/deploy currently accept `pass`, `switch`, `agent_task`, `wait`, `parallel`, `join`, and `fail`; declared future nodes such as `send_message` and `subworkflow` are rejected until implemented. |
 | `catch` | Node id to run after supported node execution failures once retries are exhausted. Some validation, render, or setup errors can fail the execution directly. |
 | `retry` | `{max_attempts, delay_seconds, backoff_seconds, multiplier}` for retrying supported node execution failures. Some validation, render, or setup errors are not retryable node attempts. |
 
@@ -339,6 +345,7 @@ Supported `agent_task` fields:
 |---|---|
 | `profile` | Kanban assignee profile. Required. |
 | `prompt` | String/list/object rendered with safe templates, then used as the Kanban task body. Required. |
+| `result_contract` | Optional mapping of required output keys to flat types (`string`, `number`, `boolean`, `array`, `object`) or enum strings like `approved|rejected`. Dispatcher blocks the cell if the completed Kanban result does not match. |
 | `title` | Kanban task title. Defaults to `<workflow name>: <node id>`. |
 | `workspace_kind` | Passed to Kanban, e.g. `scratch` or `worktree`. Defaults to `scratch` when omitted. |
 | `workspace_path` | Optional Kanban workspace path. This field is not templated. |
@@ -348,7 +355,7 @@ Supported `agent_task` fields:
 | `goal_mode` | Run the Kanban worker in goal mode. |
 | `goal_max_turns` | Goal-mode turn budget. |
 
-When the Kanban task reaches `done`, the workflow resumes. If the task result or latest summary is valid JSON, that object becomes the node output. Plain text becomes `{"result": "..."}`. If the Kanban task is blocked, the workflow execution becomes `blocked` with the block reason.
+When the Kanban task reaches `done`, the workflow resumes. If the task result or latest summary is valid JSON, that object becomes the node output. Plain text becomes `{"result": "..."}`. If `result_contract` is present, the dispatcher requires every listed key to be present and to match its declared type or enum before the cell succeeds. Contract failures block the workflow instead of silently routing with malformed data. If the Kanban task is blocked, the workflow execution becomes `blocked` with the block reason.
 
 #### `wait`
 
@@ -512,8 +519,8 @@ The workflow execution stays `waiting` while the Kanban task is open. On later t
 
 ## Limitations / unsupported primitives
 
-- `send_message` and `subworkflow` are schema-accepted waiting nodes, but the bundled dispatcher does not yet include a built-in message sender or subworkflow runner to complete them.
-- `webhook` and `kanban_event` triggers are schema-accepted for future/external launchers; they are not wired to built-in launchers by default.
+- Validation and deploy reject primitives that are declared in the schema but not implemented in the bundled runtime. Today, `manual` and `schedule` triggers are implemented; `webhook` and `kanban_event` triggers are rejected by built-in validation until a launcher is available.
+- `send_message` and `subworkflow` nodes are declared for forward compatibility but are rejected by built-in validation/deploy until the dispatcher has a built-in message sender and subworkflow runner.
 - There is no standalone `hermes workflow events` CLI command yet.
 - Workflows do not run arbitrary Python, shell, JavaScript, or model-generated code.
 - `workflow.dispatch_in_gateway` defaults to `false`; a deployed workflow will not advance unattended until dispatch is enabled.
