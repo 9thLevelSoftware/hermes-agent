@@ -120,6 +120,123 @@ def test_capabilities_endpoint_lists_implemented_and_unsupported_primitives(clie
     assert "send_message" in body["nodes"]["unsupported"]
 
 
+def test_status_endpoint_reports_dispatcher_config(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    monkeypatch.setattr(
+        plugin,
+        "load_config",
+        lambda: {"workflow": {"dispatch_in_gateway": False, "tick_interval_seconds": 30}},
+    )
+
+    r = client.get("/api/plugins/workflows/status")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["dispatcher"]["dispatch_in_gateway"] is False
+    assert body["dispatcher"]["warning"]
+    assert "workflow.dispatch_in_gateway" in body["dispatcher"]["warning"]
+    assert "hermes workflow tick" in body["dispatcher"]["warning"]
+
+
+def test_status_endpoint_defaults_when_workflow_config_missing(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    monkeypatch.setattr(plugin, "load_config", lambda: {})
+
+    r = client.get("/api/plugins/workflows/status")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["dispatcher"]["dispatch_in_gateway"] is False
+    assert body["dispatcher"]["tick_interval_seconds"] == 30.0
+    assert body["dispatcher"]["warning"]
+
+
+def test_status_endpoint_handles_non_dict_workflow_config(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    monkeypatch.setattr(plugin, "load_config", lambda: {"workflow": "not-a-dict"})
+
+    r = client.get("/api/plugins/workflows/status")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["dispatcher"]["dispatch_in_gateway"] is False
+    assert body["dispatcher"]["tick_interval_seconds"] == 30.0
+    assert body["dispatcher"]["warning"]
+
+
+def test_status_endpoint_treats_string_false_as_disabled(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    monkeypatch.setattr(
+        plugin,
+        "load_config",
+        lambda: {"workflow": {"dispatch_in_gateway": "false", "tick_interval_seconds": 9}},
+    )
+
+    r = client.get("/api/plugins/workflows/status")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["dispatcher"]["dispatch_in_gateway"] is False
+    assert body["dispatcher"]["tick_interval_seconds"] == 9.0
+    assert body["dispatcher"]["warning"]
+
+
+@pytest.mark.parametrize(
+    ("raw_interval", "expected_interval"),
+    [
+        ("nan", 30.0),
+        (["bad"], 30.0),
+        (0.25, 1.0),
+        ("9", 9.0),
+    ],
+)
+def test_status_endpoint_normalizes_dispatcher_interval(
+    client, monkeypatch, raw_interval, expected_interval
+):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    monkeypatch.setattr(
+        plugin,
+        "load_config",
+        lambda: {
+            "workflow": {
+                "dispatch_in_gateway": True,
+                "tick_interval_seconds": raw_interval,
+            }
+        },
+    )
+
+    r = client.get("/api/plugins/workflows/status")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["dispatcher"]["tick_interval_seconds"] == expected_interval
+
+
+def test_status_endpoint_omits_warning_when_dispatcher_enabled(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    monkeypatch.setattr(
+        plugin,
+        "load_config",
+        lambda: {"workflow": {"dispatch_in_gateway": True, "tick_interval_seconds": 12}},
+    )
+
+    r = client.get("/api/plugins/workflows/status")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["dispatcher"] == {
+        "dispatch_in_gateway": True,
+        "tick_interval_seconds": 12.0,
+        "warning": None,
+    }
+
+
 def test_definition_draft_endpoint_returns_validated_spec(client, monkeypatch):
     import hermes_dashboard_plugin_workflows_test as plugin
 

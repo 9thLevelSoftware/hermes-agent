@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 from typing import Any
 
 import yaml
@@ -14,8 +15,10 @@ from pydantic import BaseModel, Field, ValidationError
 from hermes_cli import workflows_assistant
 from hermes_cli import workflows_db as wfdb
 from hermes_cli import workflows_dispatcher
+from hermes_cli.config import load_config
 from hermes_cli.workflows_capabilities import workflow_capabilities
 from hermes_cli.workflows_spec import WorkflowSpec, validate_graph
+from utils import is_truthy_value
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -261,6 +264,41 @@ def prompt_assistant_draft(req: PromptAssistantDraftRequest) -> dict[str, Any]:
 @router.get("/capabilities")
 def capabilities() -> dict[str, Any]:
     return workflow_capabilities()
+
+
+def _workflow_tick_interval_seconds(workflow_cfg: dict[str, Any]) -> float:
+    raw_interval = workflow_cfg.get("tick_interval_seconds", 30.0)
+    try:
+        interval = float(raw_interval)
+        if not math.isfinite(interval):
+            raise ValueError("non-finite interval")
+    except (TypeError, ValueError, OverflowError):
+        return 30.0
+    if interval < 1.0:
+        return 1.0
+    return interval
+
+
+@router.get("/status")
+def workflow_status() -> dict[str, Any]:
+    cfg = load_config()
+    workflow_cfg = cfg.get("workflow") if isinstance(cfg, dict) else {}
+    if not isinstance(workflow_cfg, dict):
+        workflow_cfg = {}
+    dispatch_enabled = is_truthy_value(
+        workflow_cfg.get("dispatch_in_gateway"), default=False
+    )
+    interval = _workflow_tick_interval_seconds(workflow_cfg)
+    warning = None
+    if not dispatch_enabled:
+        warning = "Set workflow.dispatch_in_gateway: true and restart gateway, or run hermes workflow tick manually to advance waits, schedules, and completed agent tasks."
+    return {
+        "dispatcher": {
+            "dispatch_in_gateway": dispatch_enabled,
+            "tick_interval_seconds": interval,
+            "warning": warning,
+        }
+    }
 
 
 @router.post("/definitions/draft")
