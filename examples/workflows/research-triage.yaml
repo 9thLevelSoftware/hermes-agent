@@ -28,6 +28,9 @@ nodes:
     type: agent_task
     profile: researcher
     title: "Gather research sources"
+    result_contract:
+      sources: array
+      summary: string
     prompt: |
       You are the `researcher` profile executing workflow cell `gather`.
 
@@ -63,6 +66,10 @@ nodes:
     type: agent_task
     profile: researcher
     title: "Scan research risks and duplicates"
+    result_contract:
+      risks: array
+      exclusions: array
+      confidence: number
     prompt: |
       You are the `researcher` profile executing workflow cell `risk_scan`.
 
@@ -96,6 +103,11 @@ nodes:
     type: agent_task
     profile: analyst
     title: "Summarize and score research"
+    result_contract:
+      score: number
+      summary: string
+      recommendation: publish|watch|ignore
+      next_actions: array
     prompt: |
       You are the `analyst` profile executing workflow cell `summarize`.
 

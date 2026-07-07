@@ -18,6 +18,10 @@ nodes:
     type: agent_task
     profile: implementer
     title: "Implement code change"
+    result_contract:
+      summary: string
+      changed_files: array
+      verification: array
     prompt: |
       You are the `implementer` profile executing workflow cell `implement`.
 
@@ -47,6 +51,11 @@ nodes:
     type: agent_task
     profile: reviewer
     title: "Review code change"
+    result_contract:
+      verdict: approved|changes_requested
+      confidence: number
+      reason: string
+      required_changes: array
     prompt: |
       You are the `reviewer` profile executing workflow cell `review`.
 
@@ -98,6 +107,10 @@ nodes:
     type: agent_task
     profile: implementer
     title: "Revise code change after review"
+    result_contract:
+      summary: string
+      changed_files: array
+      verification: array
     prompt: |
       You are the `implementer` profile executing workflow cell `revise`.
 
@@ -130,6 +143,10 @@ nodes:
     type: agent_task
     profile: reviewer
     title: "Review revised code change"
+    result_contract:
+      verdict: approved|changes_requested
+      confidence: number
+      reason: string
     prompt: |
       You are the `reviewer` profile executing workflow cell `second_review`.
 
