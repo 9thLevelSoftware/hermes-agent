@@ -6,7 +6,7 @@ import re
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _NODE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
@@ -50,8 +50,17 @@ class WorkspaceSpec(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
 
 
+def _optional_clean_string(value: Any, name: str = "value") -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    text = value.strip()
+    return text or None
+
+
 class NodeSpec(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     type: NodeType
     output: Any = None
@@ -64,7 +73,16 @@ class NodeSpec(BaseModel):
     workspace_kind: str | None = None
     workspace_path: str | None = None
     skills: list[str] = Field(default_factory=list)
-    model_override: str | None = None
+    provider_override: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("provider", "provider_override"),
+        serialization_alias="provider",
+    )
+    model_override: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("model", "model_override"),
+        serialization_alias="model",
+    )
     max_retries: int | None = Field(default=None, ge=1)
     goal_mode: bool = False
     goal_max_turns: int | None = Field(default=None, ge=1)
@@ -72,6 +90,43 @@ class NodeSpec(BaseModel):
     catch: str | None = None
     workspace: WorkspaceSpec | None = None
     seconds: int = Field(default=0, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_conflicting_routing_aliases(cls, data: Any) -> Any:
+        if not isinstance(data, Mapping):
+            return data
+        data = dict(data)
+
+        provider = _optional_clean_string(data.get("provider"), "provider")
+        provider_override = _optional_clean_string(data.get("provider_override"), "provider_override")
+        if provider and provider_override and provider != provider_override:
+            raise ValueError("provider and provider_override must match when both are set")
+        chosen_provider = provider or provider_override
+        if chosen_provider:
+            data["provider"] = chosen_provider
+        else:
+            data.pop("provider", None)
+        data.pop("provider_override", None)
+
+        model = _optional_clean_string(data.get("model"), "model")
+        model_override = _optional_clean_string(data.get("model_override"), "model_override")
+        if model and model_override and model != model_override:
+            raise ValueError("model and model_override must match when both are set")
+        chosen_model = model or model_override
+        if chosen_model:
+            data["model"] = chosen_model
+        else:
+            data.pop("model", None)
+        data.pop("model_override", None)
+
+        return data
+
+    @model_validator(mode="after")
+    def _normalize_routing_overrides(self) -> "NodeSpec":
+        self.provider_override = _optional_clean_string(self.provider_override)
+        self.model_override = _optional_clean_string(self.model_override)
+        return self
 
 
 class EdgeSpec(BaseModel):
