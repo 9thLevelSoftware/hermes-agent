@@ -224,6 +224,30 @@ def _parse_agent_result(raw: str | None) -> Any:
         return {"result": raw}
 
 
+def _validate_result_contract(output: Any, contract: dict[str, Any]) -> list[str]:
+    errors = []
+    if not contract:
+        return errors
+    if not isinstance(output, dict):
+        return ["agent result must be a JSON object to satisfy result_contract"]
+    for key, expected in contract.items():
+        if key not in output:
+            errors.append(f"missing required result key: {key}")
+            continue
+        value = output[key]
+        if expected == "string" and not isinstance(value, str):
+            errors.append(f"result key {key} must be string")
+        elif expected == "number" and (isinstance(value, bool) or not isinstance(value, (int, float))):
+            errors.append(f"result key {key} must be number")
+        elif expected == "boolean" and not isinstance(value, bool):
+            errors.append(f"result key {key} must be boolean")
+        elif isinstance(expected, str) and "|" in expected:
+            allowed = {part.strip() for part in expected.split("|") if part.strip()}
+            if str(value) not in allowed:
+                errors.append(f"result key {key} must be one of {sorted(allowed)}")
+    return errors
+
+
 def _kanban_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
     row = conn.execute(
         """
@@ -262,10 +286,45 @@ def _kanban_block_reason(conn: sqlite3.Connection, task_id: str) -> str:
     return "kanban task blocked"
 
 
+def _block_agent_node(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    error: dict[str, Any],
+    now: int,
+) -> None:
+    try:
+        context = json.loads(row["context_json"] or "{}")
+    except (TypeError, ValueError):
+        context = {"node": {}}
+    context["error"] = error
+    with wfdb.write_txn(conn):
+        updated = conn.execute(
+            """
+            UPDATE workflow_node_runs
+               SET status = 'blocked', error = ?, completed_at = ?
+             WHERE id = ? AND status = 'waiting'
+            """,
+            (_json_dumps(error), now, row["id"]),
+        ).rowcount
+        if updated:
+            conn.execute(
+                """
+                UPDATE workflow_executions
+                   SET status = 'blocked', context_json = ?, claim_lock = NULL,
+                       claim_expires = NULL, updated_at = ?
+                 WHERE execution_id = ? AND status = 'waiting'
+                """,
+                (_json_dumps(context), now, row["execution_id"]),
+            )
+            _append_event(conn, row["execution_id"], "execution_blocked", error, now)
+
+
 def _resume_completed_agent_tasks(conn: sqlite3.Connection, *, now: int) -> None:
     rows = conn.execute(
         """
-        SELECT nr.id, nr.execution_id, nr.node_id, nr.kanban_task_id, ex.context_json
+        SELECT nr.id, nr.execution_id, nr.node_id, nr.kanban_task_id, ex.context_json,
+               ex.workflow_id, ex.version
           FROM workflow_node_runs nr
           JOIN workflow_executions ex ON ex.execution_id = nr.execution_id
          WHERE nr.status = 'waiting'
@@ -284,6 +343,22 @@ def _resume_completed_agent_tasks(conn: sqlite3.Connection, *, now: int) -> None
                 continue
             if task.status == "done":
                 output = _parse_agent_result(task.result or kb.latest_summary(kconn, task.id))
+                spec = wfdb.get_definition(conn, row["workflow_id"], row["version"])
+                node = spec.nodes.get(row["node_id"])
+                contract = node.result_contract if node is not None else {}
+                errors = _validate_result_contract(output, contract)
+                if errors:
+                    _block_agent_node(
+                        conn,
+                        row,
+                        error={
+                            "node_id": row["node_id"],
+                            "kanban_task_id": task.id,
+                            "reason": "; ".join(errors),
+                        },
+                        now=now,
+                    )
+                    continue
                 with wfdb.write_txn(conn):
                     updated = conn.execute(
                         """
@@ -304,36 +379,16 @@ def _resume_completed_agent_tasks(conn: sqlite3.Connection, *, now: int) -> None
                             (now, row["execution_id"]),
                         )
             elif task.status == "blocked":
-                error = {
-                    "node_id": row["node_id"],
-                    "kanban_task_id": task.id,
-                    "reason": _kanban_block_reason(kconn, task.id),
-                }
-                try:
-                    context = json.loads(row["context_json"] or "{}")
-                except (TypeError, ValueError):
-                    context = {"node": {}}
-                context["error"] = error
-                with wfdb.write_txn(conn):
-                    updated = conn.execute(
-                        """
-                        UPDATE workflow_node_runs
-                           SET status = 'blocked', error = ?, completed_at = ?
-                         WHERE id = ? AND status = 'waiting'
-                        """,
-                        (_json_dumps(error), now, row["id"]),
-                    ).rowcount
-                    if updated:
-                        conn.execute(
-                            """
-                            UPDATE workflow_executions
-                               SET status = 'blocked', context_json = ?, claim_lock = NULL,
-                                   claim_expires = NULL, updated_at = ?
-                             WHERE execution_id = ? AND status = 'waiting'
-                            """,
-                            (_json_dumps(context), now, row["execution_id"]),
-                        )
-                        _append_event(conn, row["execution_id"], "execution_blocked", error, now)
+                _block_agent_node(
+                    conn,
+                    row,
+                    error={
+                        "node_id": row["node_id"],
+                        "kanban_task_id": task.id,
+                        "reason": _kanban_block_reason(kconn, task.id),
+                    },
+                    now=now,
+                )
 
 
 def _completed_wait_nodes(conn: sqlite3.Connection, execution_id: str) -> set[str]:

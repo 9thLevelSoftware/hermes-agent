@@ -136,6 +136,18 @@ def _start_spec_execution(tmp_path, monkeypatch, spec: WorkflowSpec) -> str:
         return wfdb.start_execution(conn, spec.id, input_data={}, trigger_type="manual")
 
 
+def _start_agent_spec_execution(tmp_path, monkeypatch, spec: WorkflowSpec) -> str:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    wfdb.init_db()
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, spec, created_by="test")
+        return wfdb.start_execution(conn, spec.id, input_data={}, trigger_type="manual")
+
+
 def _node_runs(exec_id: str, node_id: str):
     with wfdb.connect() as conn:
         return [dict(row) for row in conn.execute(
@@ -594,6 +606,135 @@ def test_agent_task_resumes_from_summary_only_plain_text_completion(tmp_path, mo
     assert execution.status == "succeeded"
     assert execution.context["node"]["done"]["output"] == {"agent": "plain handoff"}
     assert json.loads(ask["output_json"]) == {"result": "plain handoff"}
+
+
+def test_agent_task_blocks_when_output_missing_required_contract_key(tmp_path, monkeypatch):
+    spec = WorkflowSpec.model_validate({
+        "id": "contract_agent_demo",
+        "name": "Contract Agent Demo",
+        "version": 1,
+        "triggers": [{"type": "manual", "id": "manual"}],
+        "nodes": {
+            "ask": {
+                "type": "agent_task",
+                "profile": "worker",
+                "prompt": "Return JSON",
+                "result_contract": {"summary": "string", "status": "ok|failed"},
+            },
+            "done": {"type": "pass", "output": {"ok": True}},
+        },
+        "edges": [{"from": "ask", "to": "done"}],
+    })
+    exec_id = _start_agent_spec_execution(tmp_path, monkeypatch, spec)
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+    task_id = _node_runs(exec_id, "ask")[0]["kanban_task_id"]
+    with kb.connect() as kconn:
+        assert kb.complete_task(kconn, task_id, result=json.dumps({"summary": "missing status"}))
+
+    assert workflows_dispatcher.tick(limit=1, now=101) == 0
+
+    with wfdb.connect() as conn:
+        execution = wfdb.get_execution(conn, exec_id)
+    ask = _node_runs(exec_id, "ask")[0]
+    error_text = str(execution.context.get("error"))
+    assert execution.status == "blocked"
+    assert ask["status"] == "blocked"
+    assert "missing required result key: status" in error_text
+
+
+def test_agent_task_blocks_when_output_contract_type_or_enum_mismatch(tmp_path, monkeypatch):
+    spec = WorkflowSpec.model_validate({
+        "id": "contract_agent_mismatch_demo",
+        "name": "Contract Agent Mismatch Demo",
+        "version": 1,
+        "triggers": [{"type": "manual", "id": "manual"}],
+        "nodes": {
+            "ask": {
+                "type": "agent_task",
+                "profile": "worker",
+                "prompt": "Return JSON",
+                "result_contract": {
+                    "summary": "string",
+                    "approved": "boolean",
+                    "score": "number",
+                    "status": "ok|failed",
+                },
+            },
+            "done": {"type": "pass", "output": {"ok": True}},
+        },
+        "edges": [{"from": "ask", "to": "done"}],
+    })
+    exec_id = _start_agent_spec_execution(tmp_path, monkeypatch, spec)
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+    task_id = _node_runs(exec_id, "ask")[0]["kanban_task_id"]
+    with kb.connect() as kconn:
+        assert kb.complete_task(
+            kconn,
+            task_id,
+            result=json.dumps({
+                "summary": 123,
+                "approved": "yes",
+                "score": "high",
+                "status": "maybe",
+            }),
+        )
+
+    assert workflows_dispatcher.tick(limit=1, now=101) == 0
+
+    with wfdb.connect() as conn:
+        execution = wfdb.get_execution(conn, exec_id)
+    ask = _node_runs(exec_id, "ask")[0]
+    error_text = str(execution.context.get("error"))
+    assert execution.status == "blocked"
+    assert ask["status"] == "blocked"
+    assert "result key summary must be string" in error_text
+    assert "result key approved must be boolean" in error_text
+    assert "result key score must be number" in error_text
+    assert "result key status must be one of" in error_text
+    assert "failed" in error_text and "ok" in error_text
+
+
+def test_agent_task_with_matching_result_contract_succeeds(tmp_path, monkeypatch):
+    spec = WorkflowSpec.model_validate({
+        "id": "contract_agent_success_demo",
+        "name": "Contract Agent Success Demo",
+        "version": 1,
+        "triggers": [{"type": "manual", "id": "manual"}],
+        "nodes": {
+            "ask": {
+                "type": "agent_task",
+                "profile": "worker",
+                "prompt": "Return JSON",
+                "result_contract": {
+                    "summary": "string",
+                    "status": "ok|failed",
+                    "score": "number",
+                    "approved": "boolean",
+                },
+            },
+            "done": {"type": "pass", "output": {"ok": True}},
+        },
+        "edges": [{"from": "ask", "to": "done"}],
+    })
+    exec_id = _start_agent_spec_execution(tmp_path, monkeypatch, spec)
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+    output = {"summary": "done", "status": "ok", "score": 1, "approved": True}
+    task_id = _node_runs(exec_id, "ask")[0]["kanban_task_id"]
+    with kb.connect() as kconn:
+        assert kb.complete_task(kconn, task_id, result=json.dumps(output))
+
+    assert workflows_dispatcher.tick(limit=1, now=101) == 1
+
+    with wfdb.connect() as conn:
+        execution = wfdb.get_execution(conn, exec_id)
+    ask = _node_runs(exec_id, "ask")[0]
+    assert execution.status == "succeeded"
+    assert execution.context["node"]["done"]["output"] == {"ok": True}
+    assert ask["status"] == "succeeded"
+    assert json.loads(ask["output_json"]) == output
 
 
 def test_blocked_kanban_agent_task_blocks_workflow(tmp_path, monkeypatch):
