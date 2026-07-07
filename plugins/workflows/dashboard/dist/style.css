@@ -137,6 +137,7 @@
 .hermes-workflows .hermes-workflows-editor,
 .hermes-workflows .hermes-workflows-goal-input,
 .hermes-workflows .hermes-workflows-run-input,
+.hermes-workflows .hermes-workflows-refine-input,
 .hermes-workflows input,
 .hermes-workflows select {
   width: 100%;
@@ -162,6 +163,13 @@
 
 .hermes-workflows .hermes-workflows-goal-input {
   min-height: 9rem;
+  resize: vertical;
+  font: inherit;
+  line-height: 1.45;
+}
+
+.hermes-workflows .hermes-workflows-refine-input {
+  min-height: 6rem;
   resize: vertical;
   font: inherit;
   line-height: 1.45;
@@ -225,6 +233,55 @@
 
 .hermes-workflows .hermes-workflows-template-card {
   text-align: left;
+}
+
+.hermes-workflows .hermes-workflows-draft-review {
+  gap: 0.75rem;
+}
+
+.hermes-workflows .hermes-workflows-draft-summary {
+  border-left: 3px solid var(--color-primary);
+  padding-left: 0.75rem;
+}
+
+.hermes-workflows .hermes-workflows-draft-table-wrap {
+  overflow-x: auto;
+}
+
+.hermes-workflows .hermes-workflows-draft-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84rem;
+}
+
+.hermes-workflows .hermes-workflows-draft-table th,
+.hermes-workflows .hermes-workflows-draft-table td {
+  border-bottom: 1px solid var(--color-border);
+  padding: 0.45rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.hermes-workflows .hermes-workflows-draft-table th {
+  color: var(--color-muted-foreground);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+}
+
+.hermes-workflows .hermes-workflows-draft-sections {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+}
+
+.hermes-workflows .hermes-workflows-draft-section ul {
+  margin: 0.35rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.hermes-workflows .hermes-workflows-refine-form {
+  border-top: 1px solid var(--color-border);
+  padding-top: 0.75rem;
 }
 
 .hermes-workflows .hermes-workflows-banner {

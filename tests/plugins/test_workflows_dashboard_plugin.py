@@ -397,6 +397,65 @@ def test_dashboard_bundle_is_syntax_valid_when_node_is_available():
     assert result.returncode == 0, result.stderr or result.stdout
 
 
+def _run_node_summary_rows(spec):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    start = bundle.index("function asArray")
+    end = bundle.index("function statusClass", start)
+    helper_js = bundle[start:end]
+    script = (
+        helper_js
+        + "\nconst spec = "
+        + json.dumps(spec)
+        + ";\nconsole.log(JSON.stringify(nodeSummaryRows(spec)));\n"
+    )
+    result = subprocess.run(
+        [node, "-e", script],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    return json.loads(result.stdout)
+
+
+def test_dashboard_node_summary_rows_handles_real_workflow_shapes():
+    rows = _run_node_summary_rows(
+        {
+            "nodes": {
+                "route": {
+                    "type": "switch",
+                    "prompt": {"task": "Choose path"},
+                    "default": "low",
+                    "catch": "pause",
+                },
+                "high": {
+                    "type": "agent_task",
+                    "profile": "reviewer",
+                    "prompt": [{"objective": "Review output"}],
+                },
+                "low": {"type": "pass"},
+                "pause": {"type": "wait"},
+            },
+            "edges": [
+                {"from_": "route.high", "to": "high"},
+                {"from": "route.low", "to": "low"},
+            ],
+        }
+    )
+
+    route = next(row for row in rows if row["id"] == "route")
+    assert route["objective"] == "Choose path"
+    assert "high → high" in route["next"]
+    assert "low → low" in route["next"]
+    assert "default → low" in route["next"]
+    assert "catch → pause" in route["next"]
+    high = next(row for row in rows if row["id"] == "high")
+    assert high["objective"] == "Review output"
+
+
 def test_dashboard_bundle_registers_plugin_without_build_scaffolding():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
     assert "window.__HERMES_PLUGIN_SDK__" in bundle
@@ -425,6 +484,95 @@ def test_dashboard_bundle_is_prompt_first_not_yaml_first():
     assert bundle.index("What do you want to automate?") < bundle.index("Workflow list")
 
 
+def test_dashboard_bundle_contains_draft_review_and_refine_ui():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+
+    assert "Draft review" in bundle
+    assert "Questions" in bundle
+    assert "Assumptions" in bundle
+    assert "Unsupported requests" in bundle
+    assert "Refine workflow" in bundle
+    assert "renderDraftReview" in bundle
+    assert "refineWorkflow" in bundle
+
+
+def test_dashboard_bundle_draft_review_orders_questions_before_assumptions():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    review = bundle[
+        bundle.index("function renderDraftReview") : bundle.index("function renderAdvancedYaml")
+    ]
+
+    assert review.index("Questions") < review.index("Assumptions")
+
+
+def test_dashboard_bundle_draft_review_notes_when_assistant_metadata_is_missing():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    review = bundle[
+        bundle.index("function renderDraftReview") : bundle.index("function renderAdvancedYaml")
+    ]
+
+    assert "No assistant draft metadata available." in review
+    assert "hasDraftMetadata" in review
+
+
+def test_dashboard_bundle_goal_builder_does_not_duplicate_draft_summary():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    goal = bundle[
+        bundle.index("function renderGoalBuilder") : bundle.index("function renderDraftReview")
+    ]
+
+    assert "draftResult.summary" not in goal
+
+
+def test_dashboard_bundle_wires_draft_refine_before_advanced_yaml():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    render_start = bundle.index('return h("div", { className: "hermes-workflows" }')
+    render_tree = bundle[render_start:]
+
+    assert "/definitions/refine" in bundle
+    assert 'setRefineText("")' in bundle
+    assert "nodeSummaryRows" in bundle
+    assert render_tree.index("renderDraftReview()") < render_tree.index(
+        "renderAdvancedYaml()"
+    )
+
+
+def test_dashboard_bundle_draft_review_labels_branch_and_failure_targets():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    rows_pos = bundle.index("function nodeSummaryRows")
+    next_function_pos = bundle.index("function statusClass", rows_pos)
+    rows_body = bundle[rows_pos:next_function_pos]
+
+    for marker in ['"default → "', '"catch → "', "edge.label", "edge.condition", "parts[1]"]:
+        assert marker in rows_body
+
+
+def test_dashboard_bundle_refine_clears_stale_state_before_validation_and_requires_spec():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    refine_pos = bundle.index("function refineWorkflow")
+    next_function_pos = bundle.index("function importDefinitionFile", refine_pos)
+    refine_body = bundle[refine_pos:next_function_pos]
+    early_return_pos = refine_body.index("if (!instruction || !spec)")
+
+    assert refine_body.index('setStatus("")') < early_return_pos
+    assert refine_body.index("setDraftResult(null)") < early_return_pos
+    assert "Refine response did not include a workflow spec." in refine_body
+    for marker in [
+        "setSelectedDefinition(null)",
+        "setSelectedNode(null)",
+        'setNodeJson("")',
+        'setNodeMessage("")',
+    ]:
+        assert marker in refine_body
+    assert refine_body.index("if (!draft.spec)") < refine_body.index("setDraftResult(draft)")
+    assert refine_body.index("setDraftResult(draft)") < refine_body.index(
+        'setRefineText("")'
+    )
+    assert refine_body.index('setRefineText("")') < refine_body.index(
+        'setStatus("Refined workflow draft.")'
+    )
+
+
 def test_dashboard_bundle_syncs_editor_when_definition_is_selected():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
     load_definition_pos = bundle.index("function loadDefinition")
@@ -449,7 +597,7 @@ def test_dashboard_bundle_clears_stale_draft_state_before_empty_goal_error():
 def test_dashboard_bundle_resets_stale_selection_after_goal_draft():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
     draft_pos = bundle.index("function draftFromGoal")
-    next_function_pos = bundle.index("function importDefinitionFile", draft_pos)
+    next_function_pos = bundle.index("function refineWorkflow", draft_pos)
     draft_body = bundle[draft_pos:next_function_pos]
 
     for marker in [
@@ -894,6 +1042,52 @@ def test_bad_spec_returns_400_with_validation_message(client):
     )
     assert r.status_code == 400
     assert "workflow must define at least one node" in r.json()["detail"]
+
+
+def test_dashboard_bundle_clears_draft_metadata_when_selecting_or_importing_definition():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+
+    load_pos = bundle.index("function loadDefinition")
+    load_end = bundle.index("function loadEvents", load_pos)
+    load_body = bundle[load_pos:load_end]
+    assert "setDraftResult(null)" in load_body
+
+    import_pos = bundle.index("function importDefinitionFile")
+    import_end = bundle.index("function exportYAML", import_pos)
+    import_body = bundle[import_pos:import_end]
+    assert "setDraftResult(null)" in import_body
+
+    advanced_pos = bundle.index("function renderAdvancedYaml")
+    advanced_end = bundle.index("function renderDefinitionList", advanced_pos)
+    advanced_body = bundle[advanced_pos:advanced_end]
+    textarea_pos = advanced_body.index("onChange: function")
+    textarea_block = advanced_body[textarea_pos:textarea_pos + 200]
+    assert "setDraftResult(null)" in textarea_block
+    update_pos = textarea_block.index("updateEditorText(event.target.value)")
+    clear_pos = textarea_block.index("setDraftResult(null)")
+    assert clear_pos < update_pos
+
+
+def test_dashboard_bundle_summarizes_structured_prompts_for_draft_review():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    helper = bundle[
+        bundle.index("function promptObjectiveText") : bundle.index("function nodeSummaryRows")
+    ]
+    rows = bundle[
+        bundle.index("function nodeSummaryRows") : bundle.index(
+            "function statusClass", bundle.index("function nodeSummaryRows")
+        )
+    ]
+
+    for marker in [
+        "Array.isArray(prompt)",
+        "prompt.task",
+        "prompt.objective",
+        "prompt.description",
+    ]:
+        assert marker in helper
+    assert "promptObjectiveText(node.prompt)" in rows
+    assert "String(edge.from || edge.from_" in rows
 
 
 def test_bad_run_input_returns_400(client):

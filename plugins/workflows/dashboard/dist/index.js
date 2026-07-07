@@ -118,6 +118,38 @@
     });
   }
 
+  function promptObjectiveText(prompt) {
+    if (typeof prompt === "string") return prompt;
+    if (Array.isArray(prompt)) return prompt.map(promptObjectiveText).filter(Boolean).join("; ");
+    if (prompt && typeof prompt === "object") {
+      return prompt.task || prompt.objective || prompt.title || prompt.goal || prompt.description || "";
+    }
+    return "";
+  }
+
+  function nodeSummaryRows(spec) {
+    if (!spec || !spec.nodes) return [];
+    return nodeList(spec).map(function (node) {
+      const id = String(node.id || node.name || "node");
+      const nextTargets = [];
+      asArray(spec.edges).forEach(function (edge) {
+        const source = String(edge.from || edge.from_ || edge.source || edge.start || "");
+        const parts = source.split(".");
+        if (parts[0] === id) {
+          const target = edge.to || edge.to_ || edge.target || edge.end;
+          const label = edge.label || edge.condition || parts[1] || "next";
+          if (target) nextTargets.push(label === "next" ? String(target) : label + " → " + String(target));
+        }
+      });
+      if (node.default) nextTargets.push("default → " + node.default);
+      if (node.catch) nextTargets.push("catch → " + node.catch);
+      const outgoing = Array.from(new Set(nextTargets.map(String))).join(", ") || "—";
+      const promptObjective = promptObjectiveText(node.prompt);
+      const objective = node.title || promptObjective || node.description || node.type || "—";
+      return { id: id, type: node.type || "pass", profile: node.profile || "—", objective: objective, next: outgoing };
+    });
+  }
+
   function statusClass(status) {
     return "hermes-workflows-badge " + (status === false ? "is-off" : "is-on");
   }
@@ -348,6 +380,12 @@
     const stateDrafting = useState(false);
     const drafting = stateDrafting[0];
     const setDrafting = stateDrafting[1];
+    const stateRefineText = useState("");
+    const refineText = stateRefineText[0];
+    const setRefineText = stateRefineText[1];
+    const stateRefining = useState(false);
+    const refining = stateRefining[0];
+    const setRefining = stateRefining[1];
     const stateShowAdvancedYaml = useState(false);
     const showAdvancedYaml = stateShowAdvancedYaml[0];
     const setShowAdvancedYaml = stateShowAdvancedYaml[1];
@@ -422,6 +460,8 @@
         const definition = res.definition || null;
         setSelectedDefinition(definition);
         setDraftSpec(definition && definition.spec ? definition.spec : null);
+        setDraftResult(null);
+        setRefineText("");
         if (definition && definition.spec) updateEditorText(specToEditorText(definition.spec));
         setSelectedNode(null);
         if (definition) setRunWorkflowId(definition.workflow_id || definition.id || workflowId);
@@ -583,6 +623,37 @@
       }).catch(fail).finally(function () { setDrafting(false); });
     }
 
+    function refineWorkflow(event) {
+      if (event) event.preventDefault();
+      const instruction = (refineText || "").trim();
+      const spec = activeSpec();
+      setStatus("");
+      setDraftResult(null);
+      if (!instruction || !spec) {
+        setError("Select or draft a workflow, then describe the refinement.");
+        return;
+      }
+      setRefining(true);
+      setError("");
+      api("/definitions/refine", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ spec: spec, instruction: instruction }),
+      }).then(function (res) {
+        const draft = (res && res.draft) || res || {};
+        if (!draft.spec) throw new Error("Refine response did not include a workflow spec.");
+        setDraftResult(draft);
+        setSelectedDefinition(null);
+        setSelectedNode(null);
+        setNodeJson("");
+        setNodeMessage("");
+        setDraftSpec(draft.spec);
+        updateEditorText(specToEditorText(draft.spec));
+        setRefineText("");
+        setStatus("Refined workflow draft.");
+      }).catch(fail).finally(function () { setRefining(false); });
+    }
+
     function importDefinitionFile(event) {
       const file = event.target.files && event.target.files[0];
       if (!file) return;
@@ -590,6 +661,10 @@
       reader.onload = function () {
         updateEditorText(String(reader.result || ""));
         setStatus("Import YAML loaded " + safeString(file.name));
+        setDraftResult(null);
+        setSelectedDefinition(null);
+        setNodeJson("");
+        setNodeMessage("");
         setSelectedNode(null);
       };
       reader.onerror = function () { setError("Could not import workflow file."); };
@@ -762,8 +837,73 @@
             className: "hermes-workflows-template-card",
             onClick: function () { setGoalText(template[1]); },
           }, template[0]);
-        })),
-        draftResult && draftResult.summary ? h("p", { className: "hermes-workflows-muted" }, safeString(draftResult.summary)) : null
+        }))
+      );
+    }
+
+    function renderDraftReview() {
+      const spec = activeSpec();
+      if (!draftResult && !spec) return null;
+      const rows = nodeSummaryRows(spec);
+      const hasDraftMetadata = !!draftResult;
+
+      function renderNotes(title, items) {
+        const values = asArray(items).filter(Boolean);
+        return h("div", { className: "hermes-workflows-draft-section" },
+          h("h3", null, title),
+          values.length ? h("ul", null, values.map(function (item, index) {
+            return h("li", { key: title + index }, safeString(item));
+          })) : h("p", { className: "hermes-workflows-muted" }, "None reported.")
+        );
+      }
+
+      return h(Card, { className: "hermes-workflows-panel hermes-workflows-draft-review" },
+        h("div", null,
+          h("h2", null, "Draft review"),
+          h("p", { className: "hermes-workflows-muted" }, "Review the workflow cells in plain language before using Advanced YAML or deploying.")
+        ),
+        draftResult && draftResult.summary ? h("p", { className: "hermes-workflows-draft-summary" }, safeString(draftResult.summary)) : null,
+        rows.length ? h("div", { className: "hermes-workflows-draft-table-wrap" },
+          h("table", { className: "hermes-workflows-draft-table" },
+            h("thead", null,
+              h("tr", null,
+                h("th", null, "Cell"),
+                h("th", null, "Type"),
+                h("th", null, "Profile"),
+                h("th", null, "Objective"),
+                h("th", null, "Next")
+              )
+            ),
+            h("tbody", null, rows.map(function (row) {
+              return h("tr", { key: row.id },
+                h("td", null, safeString(row.id)),
+                h("td", null, safeString(row.type)),
+                h("td", null, safeString(row.profile)),
+                h("td", null, safeString(row.objective)),
+                h("td", null, safeString(row.next))
+              );
+            }))
+          )
+        ) : h("p", { className: "hermes-workflows-muted" }, "No workflow cells to review yet."),
+        hasDraftMetadata ? h("div", { className: "hermes-workflows-draft-sections" },
+          renderNotes("Questions", draftResult && draftResult.questions),
+          renderNotes("Assumptions", draftResult && draftResult.assumptions),
+          renderNotes("Warnings", draftResult && draftResult.warnings),
+          renderNotes("Unsupported requests", draftResult && draftResult.unsupported_requests)
+        ) : h("p", { className: "hermes-workflows-muted" }, "No assistant draft metadata available."),
+        h("form", { className: "hermes-workflows-stack hermes-workflows-refine-form", onSubmit: refineWorkflow },
+          h("label", null,
+            h("span", { className: "hermes-workflows-muted" }, "Refine workflow"),
+            h("textarea", {
+              className: "hermes-workflows-refine-input",
+              value: refineText,
+              onChange: function (event) { setRefineText(event.target.value); },
+              placeholder: "Example: add a human approval step before deployment.",
+              "aria-label": "Refine workflow",
+            })
+          ),
+          h("button", { type: "submit", disabled: refining, className: "hermes-workflows-primary" }, refining ? "Refining…" : "Refine workflow")
+        )
       );
     }
 
@@ -774,7 +914,7 @@
         h("textarea", {
           className: "hermes-workflows-editor",
           value: editorText,
-          onChange: function (event) { updateEditorText(event.target.value); },
+          onChange: function (event) { setDraftResult(null); updateEditorText(event.target.value); },
         }),
         h("div", { className: "hermes-workflows-row" },
           h("button", { type: "button", disabled: validating, onClick: validateDefinition }, validating ? "Validating…" : "Validate"),
@@ -1047,6 +1187,7 @@
       error ? h("div", { className: "hermes-workflows-banner is-error" }, error) : null,
       status ? h("div", { className: "hermes-workflows-banner" }, status) : null,
       renderGoalBuilder(),
+      renderDraftReview(),
       h("div", { className: "hermes-workflows-grid" },
         h("div", { className: "hermes-workflows-stack" },
           h(Card, { className: "hermes-workflows-panel" },
