@@ -1,5 +1,9 @@
+import json
+from argparse import Namespace
+
 import pytest
 
+from hermes_cli import workflows
 from hermes_cli import workflows_db as wfdb
 from hermes_cli.workflows_spec import WorkflowSpec
 
@@ -64,6 +68,22 @@ def test_deploy_new_version_with_different_checksum_succeeds(tmp_path, monkeypat
         records = wfdb.list_definitions(conn)
 
     assert {(r.workflow_id, r.version) for r in records} == {("immutable_demo", 1), ("immutable_demo", 2)}
+
+
+def test_cli_deploy_json_reports_exact_deployed_version(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    v1 = tmp_path / "v1.json"
+    v2 = tmp_path / "v2.json"
+    v1.write_text(json.dumps(_spec(True, version=1).model_dump(mode="json")), encoding="utf-8")
+    v2.write_text(json.dumps(_spec(False, version=2).model_dump(mode="json")), encoding="utf-8")
+
+    assert workflows._cmd_deploy(Namespace(file=str(v2), json=True)) == 0
+    capsys.readouterr()
+    assert workflows._cmd_deploy(Namespace(file=str(v1), json=True)) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["workflow_id"] == "immutable_demo"
+    assert payload["version"] == 1
 
 
 def test_redeploy_same_schedule_definition_preserves_schedule_row(tmp_path, monkeypatch):

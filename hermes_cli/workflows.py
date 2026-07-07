@@ -144,10 +144,7 @@ def _definition_to_dict(record: wfdb.WorkflowDefinitionRecord, *, include_spec: 
 
 
 def _latest_definition_record(conn, workflow_id: str) -> wfdb.WorkflowDefinitionRecord:
-    matches = [r for r in wfdb.list_definitions(conn) if r.workflow_id == workflow_id]
-    if not matches:
-        raise KeyError(f"workflow definition not found: {workflow_id}")
-    return max(matches, key=lambda r: r.version)
+    return wfdb.get_definition_record(conn, workflow_id)
 
 
 def _execution_to_dict(execution: wfdb.WorkflowExecution) -> dict[str, Any]:
@@ -219,7 +216,7 @@ def _cmd_deploy(args: argparse.Namespace) -> int:
     spec = _load_spec(args.file)
     with _connect_initialized() as conn:
         wfdb.deploy_definition(conn, spec, created_by="cli")
-        record = _latest_definition_record(conn, spec.id)
+        record = wfdb.get_definition_record(conn, spec.id, spec.version)
     if getattr(args, "json", False):
         _print_json(_definition_to_dict(record))
     else:

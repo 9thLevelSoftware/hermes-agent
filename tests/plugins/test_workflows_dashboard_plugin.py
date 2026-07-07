@@ -547,6 +547,65 @@ def test_dashboard_initial_load_refreshes_workflow_status_without_waiting_for_it
     assert "refresh(initialExecutionId);" in effect_body
 
 
+def test_dashboard_bundle_preserves_selected_definition_version():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    helpers = bundle[
+        bundle.index("function versionQuery") : bundle.index("function runInputSpec")
+    ]
+    load_definition = bundle[
+        bundle.index("function loadDefinition") : bundle.index("function loadEvents")
+    ]
+    load_definitions = bundle[
+        bundle.index("function loadDefinitions") : bundle.index("function loadExecutions")
+    ]
+    deploy = bundle[
+        bundle.index("function deployDefinition") : bundle.index("function selectedRunVersion")
+    ]
+    definition_list = bundle[
+        bundle.index("function renderDefinitionList") : bundle.index("function renderRunInputForm")
+    ]
+
+    assert '"?version=" + encodeURIComponent(value)' in helpers
+    assert "function loadDefinition(workflowId, version)" in load_definition
+    assert "const previousSelectionKey = definitionSelectionKey(selectedDefinition)" in load_definition
+    assert "const nextSelectionKey = definitionSelectionKey(definition)" in load_definition
+    assert "if (nextSelectionKey !== previousSelectionKey)" in load_definition
+    assert 'api("/definitions/" + encodeURIComponent(workflowId) + versionQuery(version))' in load_definition
+    assert "function loadDefinitions(preferId, preferVersion)" in load_definitions
+    assert "const currentVersion = selectedDefinition && selectedDefinition.version" in load_definitions
+    assert "const matches = rows.filter(function (definition)" in load_definitions
+    assert "const match = matches[matches.length - 1]" in load_definitions
+    assert "return loadDefinition(nextId, nextVersion)" in load_definitions
+    assert "const version = definition.version" in deploy
+    assert "return loadDefinitions(id, version)" in deploy
+    assert "definitionSelectionKey(definition)" in definition_list
+    assert "definitionSelectionKey(selectedDefinition)" in definition_list
+    assert "loadDefinition(definition.workflow_id, definition.version)" in definition_list
+
+
+def test_dashboard_bundle_runs_selected_or_active_definition_version():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    selected_run_version = bundle[
+        bundle.index("function selectedRunVersion") : bundle.index("function runWorkflow")
+    ]
+    run_workflow = bundle[
+        bundle.index("function runWorkflow") : bundle.index("function draftFromGoal")
+    ]
+    run_form = bundle[
+        bundle.index("function renderRunInputForm") : bundle.index("function renderExecutions")
+    ]
+
+    assert "function selectedRunVersion(workflowId)" in selected_run_version
+    assert "return selectedDefinition.version" in selected_run_version
+    assert "return versionForSpec(spec)" in selected_run_version
+    assert "const runVersion = selectedRunVersion(workflowId)" in run_workflow
+    assert '"/run" + versionQuery(runVersion)' in run_workflow
+    assert "const runSelectValue = selectedDefinition ? definitionSelectionKey(selectedDefinition)" in run_form
+    assert "value: runSelectValue" in run_form
+    assert "loadDefinition(id, version)" in run_form
+    assert "value: definitionSelectionKey(definition)" in run_form
+
+
 def test_dashboard_dispatcher_readiness_handles_unknown_status_separately():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
     render_start = bundle.index("function renderDispatcherReadiness(")

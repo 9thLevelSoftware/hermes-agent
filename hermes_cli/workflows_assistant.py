@@ -72,6 +72,16 @@ def _ensure_supported_primitives(spec: WorkflowSpec) -> None:
         raise AssistantValidationError("; ".join(errors))
 
 
+def _ensure_agent_task_contracts(spec: WorkflowSpec) -> None:
+    errors = [
+        f"agent_task node {node_id} requires a non-empty result_contract"
+        for node_id, node in spec.nodes.items()
+        if node.type == "agent_task" and not node.result_contract
+    ]
+    if errors:
+        raise AssistantValidationError("; ".join(errors))
+
+
 def parse_assistant_payload(payload: dict[str, Any] | str) -> WorkflowDraftResult:
     try:
         data = _extract_json_object(payload) if isinstance(payload, str) else payload
@@ -82,6 +92,7 @@ def parse_assistant_payload(payload: dict[str, Any] | str) -> WorkflowDraftResul
         spec = WorkflowSpec.model_validate(data["spec"])
         validate_graph(spec)
         _ensure_supported_primitives(spec)
+        _ensure_agent_task_contracts(spec)
         return WorkflowDraftResult(
             spec=spec,
             summary=data.get("summary", ""),

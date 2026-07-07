@@ -324,12 +324,20 @@ def deploy_definition(
                 )
 
 
+def get_definition_record(
+    conn: sqlite3.Connection,
+    workflow_id: str,
+    version: int | None = None,
+) -> WorkflowDefinitionRecord:
+    return _definition_record(conn, workflow_id, version)
+
+
 def get_definition(
     conn: sqlite3.Connection,
     workflow_id: str,
     version: int | None = None,
 ) -> WorkflowSpec:
-    return _definition_record(conn, workflow_id, version).spec
+    return get_definition_record(conn, workflow_id, version).spec
 
 
 def list_definitions(conn: sqlite3.Connection) -> list[WorkflowDefinitionRecord]:
@@ -446,18 +454,18 @@ def list_node_runs(conn: sqlite3.Connection, execution_id: str) -> list[dict[str
         (execution_id,),
     ).fetchall()
 
-    event_by_node_id: dict[str, dict[str, Any]] = {}
+    events_by_node_id: dict[str, list[dict[str, Any]]] = {}
     for event in events:
         payload = _json_loads_or_empty(event["payload_json"])
         node_id = payload.get("node_id") if isinstance(payload, dict) else None
         if not isinstance(node_id, str):
             continue
         output = payload.get("output", {}) if isinstance(payload, dict) else {}
-        event_by_node_id[node_id] = {
+        events_by_node_id.setdefault(node_id, []).append({
             "event_id": event["id"],
             "created_at": event["created_at"],
             "output": {} if output is None else output,
-        }
+        })
 
     result = []
     seen_node_ids = set()
@@ -466,7 +474,8 @@ def list_node_runs(conn: sqlite3.Connection, execution_id: str) -> list[dict[str
         seen_node_ids.add(node_id)
         raw_output = row["output_json"]
         output = _json_loads_or_empty(raw_output)
-        event_info = event_by_node_id.get(node_id)
+        event_infos = events_by_node_id.get(node_id, [])
+        event_info = event_infos[-1] if event_infos else None
         if row["status"] == "succeeded" and raw_output in (None, "", "null") and event_info is not None:
             output = event_info["output"]
         result.append(
@@ -485,25 +494,26 @@ def list_node_runs(conn: sqlite3.Connection, execution_id: str) -> list[dict[str
             }
         )
 
-    for node_id, event_info in event_by_node_id.items():
+    for node_id, event_infos in events_by_node_id.items():
         if node_id in seen_node_ids:
             continue
-        result.append(
-            {
-                "id": None,
-                "event_id": event_info["event_id"],
-                "execution_id": execution_id,
-                "node_id": node_id,
-                "status": "succeeded",
-                "input": {},
-                "output": event_info["output"],
-                "error": {},
-                "started_at": event_info["created_at"],
-                "completed_at": event_info["created_at"],
-                "wait_until": None,
-                "kanban_task_id": None,
-            }
-        )
+        for event_info in event_infos:
+            result.append(
+                {
+                    "id": None,
+                    "event_id": event_info["event_id"],
+                    "execution_id": execution_id,
+                    "node_id": node_id,
+                    "status": "succeeded",
+                    "input": {},
+                    "output": event_info["output"],
+                    "error": {},
+                    "started_at": event_info["created_at"],
+                    "completed_at": event_info["created_at"],
+                    "wait_until": None,
+                    "kanban_task_id": None,
+                }
+            )
 
     fallback_order = len(node_order)
     result.sort(

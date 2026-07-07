@@ -26,6 +26,7 @@ def _valid_payload():
                     "profile": "implementer",
                     "title": "Implement change",
                     "prompt": "Implement ${ input.request } and return JSON.",
+                    "result_contract": {"summary": "string", "status": "string"},
                 },
                 "done": {"type": "pass", "output": {"status": "ok"}},
             },
@@ -60,6 +61,32 @@ def test_parse_assistant_payload_rejects_unsupported_runtime_primitives():
 
     assert "unsupported node type" in str(exc.value)
     assert "send_message" in str(exc.value)
+
+
+@pytest.mark.parametrize("contract", [None, {}])
+def test_parse_assistant_payload_rejects_agent_task_without_result_contract(contract):
+    payload = _valid_payload()
+    if contract is None:
+        del payload["spec"]["nodes"]["implement"]["result_contract"]
+    else:
+        payload["spec"]["nodes"]["implement"]["result_contract"] = contract
+
+    with pytest.raises(AssistantValidationError) as exc:
+        parse_assistant_payload(payload)
+
+    assert "agent_task node implement requires a non-empty result_contract" in str(exc.value)
+
+
+def test_parse_assistant_payload_allows_non_agent_nodes_without_result_contract():
+    payload = _valid_payload()
+    payload["spec"]["nodes"] = {
+        "done": {"type": "pass", "output": {"status": "ok"}},
+    }
+    payload["spec"]["edges"] = []
+
+    result = parse_assistant_payload(payload)
+
+    assert result.spec.nodes["done"].type == "pass"
 
 
 def test_parse_assistant_payload_returns_clear_validation_errors():

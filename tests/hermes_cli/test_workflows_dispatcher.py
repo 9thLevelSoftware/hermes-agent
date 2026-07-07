@@ -228,6 +228,31 @@ def test_tick_runs_queued_pass_switch_execution(tmp_path, monkeypatch):
     assert "execution_succeeded" in events
 
 
+def test_list_node_runs_keeps_repeated_event_only_successes(tmp_path, monkeypatch):
+    exec_id = _start_spec_execution(tmp_path, monkeypatch, _switch_spec())
+    with wfdb.connect() as conn:
+        wfdb.append_event(
+            conn,
+            exec_id,
+            "node_succeeded",
+            {"node_id": "start", "output": {"n": 1}},
+        )
+        wfdb.append_event(
+            conn,
+            exec_id,
+            "node_succeeded",
+            {"node_id": "start", "output": {"n": 2}},
+        )
+        runs = [
+            run
+            for run in wfdb.list_node_runs(conn, exec_id)
+            if run["node_id"] == "start"
+        ]
+
+    assert [run["output"] for run in runs] == [{"n": 1}, {"n": 2}]
+    assert [run["id"] for run in runs] == [None, None]
+
+
 def test_tick_runs_parallel_join_execution(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     wfdb.init_db()

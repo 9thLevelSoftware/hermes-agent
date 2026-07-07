@@ -789,8 +789,30 @@
       return spec && String(spec.workflow_id || spec.id || "");
     }
 
+    function versionForSpec(spec) {
+      return spec && spec.version !== undefined && spec.version !== null ? spec.version : null;
+    }
+
+    function versionQuery(version) {
+      const value = version === undefined || version === null ? "" : String(version);
+      return value ? "?version=" + encodeURIComponent(value) : "";
+    }
+
+    function workflowIdForDefinition(definition) {
+      return definition && String(definition.workflow_id || definition.id || "");
+    }
+
+    function versionForDefinition(definition) {
+      return definition && definition.version !== undefined && definition.version !== null ? String(definition.version) : "";
+    }
+
+    function definitionSelectionKey(definition) {
+      const id = workflowIdForDefinition(definition);
+      return id ? id + ":" + versionForDefinition(definition) : "";
+    }
+
     function runInputSpec() {
-      const selectedId = selectedDefinition && String(selectedDefinition.workflow_id || selectedDefinition.id || "");
+      const selectedId = workflowIdForDefinition(selectedDefinition);
       if (selectedDefinition && selectedId === String(runWorkflowId || "")) return selectedDefinition.spec || null;
       const spec = activeSpec();
       if (spec && workflowIdForSpec(spec) === String(runWorkflowId || "")) return spec;
@@ -815,20 +837,24 @@
       setPromptAssistantConstraints("Return JSON only");
     }
 
-    function loadDefinition(workflowId) {
+    function loadDefinition(workflowId, version) {
       if (!workflowId) {
         setSelectedDefinition(null);
         setDraftSpec(null);
         setSelectedNode(null);
         return Promise.resolve(null);
       }
-      return api("/definitions/" + encodeURIComponent(workflowId)).then(function (res) {
+      const previousSelectionKey = definitionSelectionKey(selectedDefinition);
+      return api("/definitions/" + encodeURIComponent(workflowId) + versionQuery(version)).then(function (res) {
         const definition = res.definition || null;
+        const nextSelectionKey = definitionSelectionKey(definition);
         setSelectedDefinition(definition);
         setDraftSpec(definition && definition.spec ? definition.spec : null);
-        setInputFieldValues({});
-        setShowAdvancedInputJson(false);
-        setRunInputText("{}");
+        if (nextSelectionKey !== previousSelectionKey) {
+          setInputFieldValues({});
+          setShowAdvancedInputJson(false);
+          setRunInputText("{}");
+        }
         setDraftResult(null);
         setRefineText("");
         if (definition && definition.spec) updateEditorText(specToEditorText(definition.spec));
@@ -881,13 +907,23 @@
       });
     }
 
-    function loadDefinitions(preferId) {
+    function loadDefinitions(preferId, preferVersion) {
       return SDK.fetchJSON(DEFINITIONS_API).then(function (res) {
         const rows = asArray(res.definitions);
-        const currentId = selectedDefinition && (selectedDefinition.workflow_id || selectedDefinition.id);
-        const nextId = preferId || currentId || runWorkflowId || (rows[0] && (rows[0].workflow_id || rows[0].id)) || "";
+        const currentId = workflowIdForDefinition(selectedDefinition);
+        const currentVersion = selectedDefinition && selectedDefinition.version;
+        const first = rows[0] || null;
+        const nextId = preferId || currentId || runWorkflowId || workflowIdForDefinition(first) || "";
+        let nextVersion = preferId ? preferVersion : (currentId ? currentVersion : undefined);
+        if ((nextVersion === undefined || nextVersion === null || nextVersion === "") && nextId) {
+          const matches = rows.filter(function (definition) {
+            return workflowIdForDefinition(definition) === String(nextId);
+          });
+          const match = matches[matches.length - 1];
+          if (match) nextVersion = match.version;
+        }
         setDefinitions(rows);
-        if (nextId) return loadDefinition(nextId);
+        if (nextId) return loadDefinition(nextId, nextVersion);
         setRunWorkflowId("");
         setSelectedDefinition(null);
         setDraftSpec(null);
@@ -968,10 +1004,24 @@
       }).then(function (res) {
         const definition = res.definition || {};
         const id = definition.workflow_id || definition.id || "";
+        const version = definition.version;
         setDraftSpec(definition.spec || null);
         setStatus("Deployed " + safeString(id));
-        return loadDefinitions(id);
+        return loadDefinitions(id, version);
       }).catch(fail).finally(function () { setDeploying(false); });
+    }
+
+    function selectedRunVersion(workflowId) {
+      const requested = String(workflowId || "");
+      const selectedId = workflowIdForDefinition(selectedDefinition);
+      if (selectedDefinition && selectedId === requested && selectedDefinition.version !== undefined && selectedDefinition.version !== null) {
+        return selectedDefinition.version;
+      }
+      const spec = activeSpec();
+      if (spec && workflowIdForSpec(spec) === requested && versionForSpec(spec) !== null) {
+        return versionForSpec(spec);
+      }
+      return null;
     }
 
     function runWorkflow(event) {
@@ -994,7 +1044,8 @@
       }
       setRunning(true);
       setError("");
-      api("/definitions/" + encodeURIComponent(workflowId) + "/run", {
+      const runVersion = selectedRunVersion(workflowId);
+      api("/definitions/" + encodeURIComponent(workflowId) + "/run" + versionQuery(runVersion), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ input: input }),
@@ -1407,14 +1458,15 @@
       return h("div", { className: "hermes-workflows-list" },
         definitions.length ? definitions.map(function (definition) {
           const id = definition.workflow_id || definition.id;
-          const selectedId = selectedDefinition && (selectedDefinition.workflow_id || selectedDefinition.id);
+          const key = definitionSelectionKey(definition);
+          const selectedKey = definitionSelectionKey(selectedDefinition);
           return h("button", {
-            key: id + ":" + safeString(definition.version),
+            key: key,
             type: "button",
-            className: "hermes-workflows-item" + (id === selectedId ? " is-selected" : ""),
+            className: "hermes-workflows-item" + (key === selectedKey ? " is-selected" : ""),
             onClick: function () {
               setError("");
-              loadDefinition(id).catch(fail);
+              loadDefinition(definition.workflow_id, definition.version).catch(fail);
             },
           },
             h("div", { className: "hermes-workflows-item-title" },
@@ -1430,20 +1482,26 @@
     function renderRunInputForm() {
       const spec = runInputSpec();
       const fields = inputFieldsForSpec(spec);
+      const runSelectValue = selectedDefinition ? definitionSelectionKey(selectedDefinition) : "";
       return h(Card, { className: "hermes-workflows-panel hermes-workflows-run-form" },
         h("h2", null, "Run test"),
         h("form", { className: "hermes-workflows-stack", onSubmit: runWorkflow },
           h("label", null,
             h("span", { className: "hermes-workflows-muted" }, "Workflow id"),
             definitions.length ? h("select", {
-              value: runWorkflowId,
+              value: runSelectValue,
               onChange: function (event) {
-                setRunWorkflowId(event.target.value);
-                loadDefinition(event.target.value).catch(fail);
+                const selected = definitions.find(function (definition) {
+                  return definitionSelectionKey(definition) === event.target.value;
+                });
+                const id = workflowIdForDefinition(selected);
+                const version = selected && selected.version;
+                setRunWorkflowId(id);
+                loadDefinition(id, version).catch(fail);
               },
             }, definitions.map(function (definition) {
               const id = definition.workflow_id || definition.id;
-              return h("option", { key: id, value: id }, id);
+              return h("option", { key: definitionSelectionKey(definition), value: definitionSelectionKey(definition) }, id + " v" + safeString(definition.version));
             })) : h("input", {
               value: runWorkflowId,
               onChange: function (event) { setRunWorkflowId(event.target.value); },

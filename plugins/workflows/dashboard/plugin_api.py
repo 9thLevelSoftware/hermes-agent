@@ -99,14 +99,7 @@ def _definition_preview(spec: WorkflowSpec) -> dict[str, Any]:
 
 
 def _definition_record(conn, workflow_id: str, version: int | None = None):
-    records = [r for r in wfdb.list_definitions(conn) if r.workflow_id == workflow_id]
-    if version is not None:
-        records = [r for r in records if r.version == version]
-    if not records:
-        if version is None:
-            raise KeyError(f"workflow definition not found: {workflow_id}")
-        raise KeyError(f"workflow definition not found: {workflow_id} v{version}")
-    return max(records, key=lambda r: r.version)
+    return wfdb.get_definition_record(conn, workflow_id, version)
 
 
 def _definition_to_dict(record, *, include_spec: bool = False) -> dict[str, Any]:
