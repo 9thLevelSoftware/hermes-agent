@@ -392,6 +392,17 @@ async def get_execution(execution_id: str) -> dict[str, Any]:
     return {"execution": _execution_to_dict(execution)}
 
 
+@router.get("/executions/{execution_id}/node-runs")
+def execution_node_runs(execution_id: str) -> dict[str, Any]:
+    try:
+        with _connect_initialized() as conn:
+            wfdb.get_execution(conn, execution_id)
+            node_runs = wfdb.list_node_runs(conn, execution_id)
+    except KeyError as exc:
+        raise _http_404(exc) from exc
+    return {"execution_id": execution_id, "node_runs": node_runs}
+
+
 @router.post("/executions/{execution_id}/cancel")
 async def cancel_execution(execution_id: str) -> dict[str, Any]:
     try:

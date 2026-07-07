@@ -185,6 +185,16 @@ def _json_dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _json_loads_or_empty(value: str | None) -> Any:
+    if value is None:
+        return {}
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return {} if decoded is None else decoded
+
+
 def _spec_json(spec: WorkflowSpec) -> str:
     return _json_dumps(spec.model_dump(mode="json", by_alias=True))
 
@@ -384,6 +394,126 @@ def get_execution(conn: sqlite3.Connection, execution_id: str) -> WorkflowExecut
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def list_node_runs(conn: sqlite3.Connection, execution_id: str) -> list[dict[str, Any]]:
+    execution = get_execution(conn, execution_id)
+    definition = _definition_record(conn, execution.workflow_id, execution.version)
+    spec = definition.spec
+    incoming = {node_id: 0 for node_id in spec.nodes}
+    outgoing = {node_id: [] for node_id in spec.nodes}
+    for edge in spec.edges:
+        source = edge.from_.split(".", 1)[0]
+        if source in outgoing and edge.to in incoming:
+            outgoing[source].append(edge.to)
+            incoming[edge.to] += 1
+    for node_id, node in spec.nodes.items():
+        for target in (node.default, node.catch):
+            if target in incoming:
+                outgoing[node_id].append(target)
+                incoming[target] += 1
+
+    pending = [node_id for node_id in spec.nodes if incoming[node_id] == 0]
+    ordered_nodes = []
+    seen_ordered = set()
+    while pending:
+        node_id = pending.pop(0)
+        if node_id in seen_ordered:
+            continue
+        seen_ordered.add(node_id)
+        ordered_nodes.append(node_id)
+        for target in outgoing[node_id]:
+            incoming[target] -= 1
+            if incoming[target] == 0:
+                pending.append(target)
+    ordered_nodes.extend(node_id for node_id in spec.nodes if node_id not in seen_ordered)
+    node_order = {node_id: index for index, node_id in enumerate(ordered_nodes)}
+
+    rows = conn.execute(
+        """
+        SELECT * FROM workflow_node_runs
+         WHERE execution_id = ?
+         ORDER BY id
+        """,
+        (execution_id,),
+    ).fetchall()
+    events = conn.execute(
+        """
+        SELECT id, payload_json, created_at FROM workflow_events
+         WHERE execution_id = ? AND kind = 'node_succeeded'
+         ORDER BY id
+        """,
+        (execution_id,),
+    ).fetchall()
+
+    event_by_node_id: dict[str, dict[str, Any]] = {}
+    for event in events:
+        payload = _json_loads_or_empty(event["payload_json"])
+        node_id = payload.get("node_id") if isinstance(payload, dict) else None
+        if not isinstance(node_id, str):
+            continue
+        output = payload.get("output", {}) if isinstance(payload, dict) else {}
+        event_by_node_id[node_id] = {
+            "event_id": event["id"],
+            "created_at": event["created_at"],
+            "output": {} if output is None else output,
+        }
+
+    result = []
+    seen_node_ids = set()
+    for row in rows:
+        node_id = row["node_id"]
+        seen_node_ids.add(node_id)
+        raw_output = row["output_json"]
+        output = _json_loads_or_empty(raw_output)
+        event_info = event_by_node_id.get(node_id)
+        if row["status"] == "succeeded" and raw_output in (None, "", "null") and event_info is not None:
+            output = event_info["output"]
+        result.append(
+            {
+                "id": row["id"],
+                "execution_id": row["execution_id"],
+                "node_id": node_id,
+                "status": row["status"],
+                "input": _json_loads_or_empty(row["input_json"]),
+                "output": output,
+                "error": _json_loads_or_empty(row["error"]),
+                "started_at": row["started_at"],
+                "completed_at": row["completed_at"],
+                "wait_until": row["wait_until"],
+                "kanban_task_id": row["kanban_task_id"],
+            }
+        )
+
+    for node_id, event_info in event_by_node_id.items():
+        if node_id in seen_node_ids:
+            continue
+        result.append(
+            {
+                "id": None,
+                "event_id": event_info["event_id"],
+                "execution_id": execution_id,
+                "node_id": node_id,
+                "status": "succeeded",
+                "input": {},
+                "output": event_info["output"],
+                "error": {},
+                "started_at": event_info["created_at"],
+                "completed_at": event_info["created_at"],
+                "wait_until": None,
+                "kanban_task_id": None,
+            }
+        )
+
+    fallback_order = len(node_order)
+    result.sort(
+        key=lambda run: (
+            node_order.get(run["node_id"], fallback_order),
+            run["id"] is None,
+            run["id"] or run.get("event_id") or 0,
+        )
+    )
+    return result
 
 
 def cancel_execution(

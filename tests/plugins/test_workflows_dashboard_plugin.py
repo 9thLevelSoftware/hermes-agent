@@ -14,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import workflows_db as wfdb
+from hermes_cli import workflows_dispatcher
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_DIR = REPO_ROOT / "plugins" / "workflows" / "dashboard"
@@ -516,6 +517,143 @@ def test_run_endpoint_creates_execution_and_list_show_return_it(client):
     ).json()["execution"]
     assert shown["execution_id"] == execution["execution_id"]
     assert shown["input"] == {"value": 7}
+
+
+def test_execution_node_runs_endpoint_returns_workflow_native_state(client):
+    _deploy(client, WAIT_SPEC)
+    r = client.post(
+        "/api/plugins/workflows/definitions/dashboard_wait/run",
+        json={"input": {"value": "abc"}},
+    )
+    assert r.status_code == 200, r.text
+    execution_id = r.json()["execution"]["execution_id"]
+
+    r = client.get(f"/api/plugins/workflows/executions/{execution_id}/node-runs")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["execution_id"] == execution_id
+    node_ids = [run["node_id"] for run in body["node_runs"]]
+    assert node_ids.index("start") < node_ids.index("pause")
+    start_run = next(run for run in body["node_runs"] if run["node_id"] == "start")
+    assert start_run["output"] == {"seen": "abc"}
+    assert any(
+        run["node_id"] == "start" and run["status"] == "succeeded"
+        for run in body["node_runs"]
+    )
+    assert any(
+        run["node_id"] == "pause" and run["status"] == "waiting"
+        for run in body["node_runs"]
+    )
+    for run in body["node_runs"]:
+        assert "kanban_task_id" in run
+        assert "output" in run
+        assert "error" in run
+
+
+def test_execution_node_runs_endpoint_does_not_merge_success_output_into_failed_attempt(client):
+    _deploy(client, PASS_SPEC)
+    r = client.post(
+        "/api/plugins/workflows/definitions/dashboard_demo/run",
+        json={"input": {}},
+    )
+    assert r.status_code == 200, r.text
+    execution_id = r.json()["execution"]["execution_id"]
+
+    with wfdb.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO workflow_node_runs (
+                execution_id, node_id, status, error, started_at, completed_at
+            ) VALUES (?, 'start', 'failed', ?, 1, 2)
+            """,
+            (execution_id, json.dumps({"reason": "boom"})),
+        )
+        conn.commit()
+
+    r = client.get(f"/api/plugins/workflows/executions/{execution_id}/node-runs")
+
+    assert r.status_code == 200, r.text
+    failed_run = next(
+        run
+        for run in r.json()["node_runs"]
+        if run["node_id"] == "start" and run["status"] == "failed"
+    )
+    assert failed_run["output"] == {}
+    assert failed_run["error"] == {"reason": "boom"}
+
+
+def test_execution_node_runs_endpoint_returns_empty_list_for_queued_execution(client):
+    _deploy(client, PASS_SPEC)
+    with wfdb.connect() as conn:
+        execution_id = wfdb.start_execution(
+            conn,
+            PASS_SPEC["id"],
+            input_data={},
+            trigger_type="manual",
+        )
+
+    r = client.get(f"/api/plugins/workflows/executions/{execution_id}/node-runs")
+
+    assert r.status_code == 200, r.text
+    assert r.json()["node_runs"] == []
+
+
+def test_execution_node_runs_endpoint_returns_404_for_unknown_execution(client):
+    r = client.get("/api/plugins/workflows/executions/missing/node-runs")
+    assert r.status_code == 404
+
+
+def test_execution_node_runs_endpoint_defensively_parses_null_and_malformed_json(client):
+    _deploy(client, WAIT_SPEC)
+    execution_id = client.post(
+        "/api/plugins/workflows/definitions/dashboard_wait/run",
+        json={"input": {"value": "abc"}},
+    ).json()["execution"]["execution_id"]
+
+    with wfdb.connect() as conn:
+        conn.execute(
+            """
+            UPDATE workflow_node_runs
+               SET output_json = 'null', error = 'not-json'
+             WHERE execution_id = ? AND node_id = 'pause'
+            """,
+            (execution_id,),
+        )
+        conn.commit()
+
+    r = client.get(f"/api/plugins/workflows/executions/{execution_id}/node-runs")
+
+    assert r.status_code == 200, r.text
+    pause_run = next(run for run in r.json()["node_runs"] if run["node_id"] == "pause")
+    assert pause_run["output"] == {}
+    assert pause_run["error"] == {}
+
+
+def test_execution_node_runs_endpoint_merges_completed_wait_event_output(client):
+    _deploy(client, WAIT_SPEC)
+    execution_id = client.post(
+        "/api/plugins/workflows/definitions/dashboard_wait/run",
+        json={"input": {"value": "abc"}},
+    ).json()["execution"]["execution_id"]
+
+    with wfdb.connect() as conn:
+        pause = conn.execute(
+            """
+            SELECT wait_until FROM workflow_node_runs
+             WHERE execution_id = ? AND node_id = 'pause'
+            """,
+            (execution_id,),
+        ).fetchone()
+    assert pause is not None
+
+    assert workflows_dispatcher.tick(limit=1, now=pause["wait_until"] + 1) == 1
+    r = client.get(f"/api/plugins/workflows/executions/{execution_id}/node-runs")
+
+    assert r.status_code == 200, r.text
+    pause_run = next(run for run in r.json()["node_runs"] if run["node_id"] == "pause")
+    assert pause_run["status"] == "succeeded"
+    assert pause_run["output"] == {"waited": True}
 
 
 def test_events_endpoint_returns_append_only_events(client):
