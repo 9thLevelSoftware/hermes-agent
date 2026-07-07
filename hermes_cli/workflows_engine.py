@@ -15,8 +15,6 @@ _TEMPLATE_RE = re.compile(r"^\$\{\s*([^}]+?)\s*\}$")
 _WAITING_NODE_TYPES = {
     "agent_task",
     "wait",
-    "send_message",
-    "subworkflow",
 }
 
 
