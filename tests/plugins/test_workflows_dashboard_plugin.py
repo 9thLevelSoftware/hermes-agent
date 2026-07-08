@@ -106,6 +106,8 @@ def test_prompt_assistant_drafts_text_prompt(client):
                 "reason": "string",
             },
             "constraints": ["Return JSON only", "Mention required changes if any"],
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
         },
     )
 
@@ -115,6 +117,8 @@ def test_prompt_assistant_drafts_text_prompt(client):
     assert "Review code changes before merge" in body["prompt_text"]
     assert "${ input.repo }" in body["prompt_text"]
     assert "verdict" in body["prompt_text"]
+    assert "openai-codex" in body["prompt_text"]
+    assert "gpt-5.5" in body["prompt_text"]
     assert body["result_contract"]["verdict"] == "approved|changes_requested"
 
 
@@ -742,7 +746,17 @@ def _dashboard_helper_js() -> str:
     kind_end = bundle.index("const EXAMPLE_DEFINITION", kind_start)
     start = bundle.index("function asArray")
     end = bundle.index("function statusClass", start)
-    return bundle[kind_start:kind_end] + "\n" + bundle[start:end]
+    # Include helper functions used by `nodeSummaryRows` even if they are defined
+    # later in the bundle than the existing helper slice.
+    provider_start = bundle.index("function providerValue")
+    provider_end = bundle.index("function WorkflowsPage", provider_start)
+    return (
+        bundle[kind_start:kind_end]
+        + "\n"
+        + bundle[start:end]
+        + "\n"
+        + bundle[provider_start:provider_end]
+    )
 
 
 def _run_dashboard_function(function_name: str, args):

@@ -260,6 +260,8 @@ class PromptAssistantDraftRequest(BaseModel):
     workflow_goal: str = ""
     node_id: str = ""
     profile: str = ""
+    provider: str = ""
+    model: str = ""
     cell_objective: str = ""
     available_context: list[str] = Field(default_factory=list)
     expected_output: dict[str, Any] = Field(default_factory=dict)
@@ -303,7 +305,16 @@ def _draft_cell_prompt(req: PromptAssistantDraftRequest) -> PromptAssistantDraft
     contract = req.expected_output or {"summary": "string", "status": "string"}
     contract_json = json.dumps(contract, indent=2, ensure_ascii=False, sort_keys=True)
     default_constraints = "- Be concise.\n- Do not perform work outside this cell objective."
+    routing_lines = []
+    if req.provider.strip():
+        routing_lines.append(f"Provider override: {req.provider.strip()}")
+    if req.model.strip():
+        routing_lines.append(f"Model override: {req.model.strip()}")
+    routing_context = "\n".join(routing_lines) or "Provider/model: use assigned profile defaults."
     prompt = f"""You are the `{req.profile or 'assigned'}` profile executing workflow cell `{req.node_id or 'cell'}`.
+
+Routing:
+{routing_context}
 
 Workflow goal:
 {req.workflow_goal or 'Complete the workflow objective.'}

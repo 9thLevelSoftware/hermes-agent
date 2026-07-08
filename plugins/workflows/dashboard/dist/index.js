@@ -1425,6 +1425,8 @@
           workflow_goal: promptAssistantGoal,
           node_id: selectedNode && selectedNode.id,
           profile: agentProfile,
+          provider: agentProvider,
+          model: agentModel,
           cell_objective: promptAssistantObjective,
           available_context: promptAssistantContext.split(/\n+/).map(function (line) { return line.trim(); }).filter(Boolean),
           expected_output: expectedOutput,
