@@ -1799,7 +1799,9 @@ def _resolve_workflow_dispatch_settings(load_config_callable: Callable[[], Any])
     workflow_cfg = cfg.get("workflow", {}) if isinstance(cfg, dict) else {}
     if not isinstance(workflow_cfg, dict):
         workflow_cfg = {}
-    enabled = is_truthy_value(workflow_cfg.get("dispatch_in_gateway"), default=False)
+    # Default-on, matching kanban.dispatch_in_gateway — a deployed workflow
+    # should advance unattended unless the user explicitly opts out.
+    enabled = is_truthy_value(workflow_cfg.get("dispatch_in_gateway"), default=True)
 
     raw_interval = workflow_cfg.get("tick_interval_seconds", _WORKFLOW_DISPATCH_INTERVAL_DEFAULT)
     try:
@@ -7366,7 +7368,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         asyncio.create_task(self._kanban_dispatcher_watcher())
 
         # Start background workflow dispatcher — ticks queued workflow graph
-        # executions. Gated by `workflow.dispatch_in_gateway` (default False).
+        # executions. Gated by `workflow.dispatch_in_gateway` (default True).
         asyncio.create_task(self._workflow_dispatcher_watcher())
 
         # Start background reconnection watcher for platforms that failed at startup
@@ -9423,6 +9425,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "kanban":
                 return await self._handle_kanban_command(event)
 
+            # /workflow bypasses the guard for the same reason as /kanban —
+            # it reads/advances workflows.db, never the running agent's state,
+            # and checking a stalled execution mid-run is a primary use case.
+            if _cmd_def_inner and _cmd_def_inner.name == "workflow":
+                return await self._handle_workflow_command(event)
+
             # /goal is safe mid-run for status/pause/clear/wait (inspection
             # and control-plane only — doesn't interrupt the running turn).
             # Setting a new goal text mid-run is rejected with the same
@@ -9832,6 +9840,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
+
+        if canonical == "workflow":
+            return await self._handle_workflow_command(event)
 
         if canonical == "suggestions":
             return await self._handle_suggestions_command(event)

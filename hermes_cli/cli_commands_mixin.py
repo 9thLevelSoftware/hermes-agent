@@ -1514,6 +1514,29 @@ class CLICommandsMixin:
         if output:
             print(output)
 
+    def _handle_workflow_command(self, cmd: str):
+        """Handle the /workflow command — delegate to the shared workflow CLI.
+
+        Mirrors ``_handle_kanban_command``: strip the leading ``/workflow``
+        and hand the remainder to ``workflows.run_slash`` which returns a
+        single formatted string.
+        """
+        from hermes_cli.workflows import run_slash
+
+        rest = cmd.strip()
+        if rest.startswith("/"):
+            rest = rest.lstrip("/")
+        for prefix in ("workflows", "workflow"):
+            if rest.startswith(prefix):
+                rest = rest[len(prefix):].lstrip()
+                break
+        try:
+            output = run_slash(rest)
+        except Exception as exc:  # pragma: no cover - defensive
+            output = f"(._.) workflow error: {exc}"
+        if output:
+            print(output)
+
     def _handle_skills_command(self, cmd: str):
         """Handle /skills slash command — delegates to hermes_cli.skills_hub."""
         from cli import ChatConsole

@@ -2738,10 +2738,11 @@ DEFAULT_CONFIG = {
         "dispatch_stale_timeout_seconds": 14400,
     },
 
-    # Workflow graph engine dispatcher. Off by default for the first merge;
-    # long-lived gateways can opt in to ticking queued workflow executions.
+    # Workflow graph engine dispatcher. On by default (matching
+    # kanban.dispatch_in_gateway) so deployed workflows advance unattended in
+    # long-lived gateways; set to false to run `hermes workflow tick` yourself.
     "workflow": {
-        "dispatch_in_gateway": False,
+        "dispatch_in_gateway": True,
         "tick_interval_seconds": 30,
         "max_executions_per_tick": 50,
     },

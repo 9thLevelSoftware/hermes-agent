@@ -77,3 +77,31 @@ def test_require_implemented_primitives_raises_actionable_error():
 
     with pytest.raises(ValueError, match=f"unsupported trigger type: {sample}"):
         require_implemented_primitives(spec)
+
+
+def test_workspace_node_field_rejected_as_unimplemented():
+    spec = WorkflowSpec.model_validate(
+        {
+            "id": "workspace_demo",
+            "name": "Workspace Demo",
+            "version": 1,
+            "triggers": [{"type": "manual"}],
+            "nodes": {
+                "start": {
+                    "type": "pass",
+                    "output": {},
+                    "workspace": {"cwd": "/tmp/somewhere"},
+                }
+            },
+            "edges": [],
+        }
+    )
+
+    errors = implemented_primitive_errors(spec)
+
+    assert len(errors) == 1
+    assert "workspace" in errors[0]
+    assert "workspace_kind/workspace_path" in errors[0]
+
+    with pytest.raises(ValueError, match="unsupported node field: workspace"):
+        require_implemented_primitives(spec)
