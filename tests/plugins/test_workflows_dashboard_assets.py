@@ -117,6 +117,15 @@ def test_workflow_dashboard_blocks_trigger_edges_that_backend_rejects() -> None:
     assert "if (isTriggerSource(spec, connection.source))" in text
 
 
+def test_workflow_dashboard_exposes_delete_workflow_control() -> None:
+    text = BUNDLE.read_text(encoding="utf-8")
+    assert "deleteWorkflow" in text
+    assert "Delete workflow" in text
+    assert "This deletes" in text
+    assert "method: \"DELETE\"" in text
+    assert "confirm(" in text
+
+
 def test_workflow_dashboard_supports_keyboard_delete_and_context_menu() -> None:
     text = BUNDLE.read_text(encoding="utf-8")
     assert "onNodeContextMenu" in text

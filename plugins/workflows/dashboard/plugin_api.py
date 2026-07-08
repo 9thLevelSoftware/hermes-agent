@@ -529,6 +529,16 @@ def get_definition(
     return {"definition": _definition_to_dict(record, include_spec=True)}
 
 
+@router.delete("/definitions/{workflow_id}")
+def delete_definition(workflow_id: str) -> dict[str, Any]:
+    try:
+        with _connect_initialized() as conn:
+            wfdb.delete_definition(conn, workflow_id)
+    except KeyError as exc:
+        raise _http_404(exc) from exc
+    return {"deleted": True, "workflow_id": workflow_id}
+
+
 @router.post("/definitions/{workflow_id}/run")
 async def run_workflow(
     workflow_id: str,

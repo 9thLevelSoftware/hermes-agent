@@ -1099,6 +1099,9 @@
     const stateDeploying = useState(false);
     const deploying = stateDeploying[0];
     const setDeploying = stateDeploying[1];
+    const stateDeleting = useState(false);
+    const deleting = stateDeleting[0];
+    const setDeleting = stateDeleting[1];
     const stateRunning = useState(false);
     const running = stateRunning[0];
     const setRunning = stateRunning[1];
@@ -1376,6 +1379,28 @@
         setStatus("Deployed " + safeString(id));
         return loadDefinitions(id, version);
       }).catch(fail).finally(function () { setDeploying(false); });
+    }
+
+    function deleteWorkflow() {
+      const workflowId = workflowIdForDefinition(selectedDefinition);
+      if (!workflowId) return;
+      const name = selectedDefinition && selectedDefinition.name ? selectedDefinition.name : workflowId;
+      if (!confirm("Delete workflow \"" + safeString(name) + "\"? This deletes its versions, schedules, and execution history.")) return;
+      setDeleting(true);
+      setError("");
+      api("/definitions/" + encodeURIComponent(workflowId), { method: "DELETE" }).then(function () {
+        setSelectedDefinition(null);
+        setDraftSpec(null);
+        setDraftResult(null);
+        setSelectedNode(null);
+        setRunWorkflowId("");
+        setSelectedExecution(null);
+        setEvents([]);
+        setNodeRuns([]);
+        updateEditorText(EMPTY_WORKFLOW_TEXT);
+        setStatus("Deleted workflow " + safeString(workflowId));
+        return Promise.all([loadDefinitions(), loadExecutions()]);
+      }).catch(fail).finally(function () { setDeleting(false); });
     }
 
     function selectedRunVersion(workflowId) {
@@ -2576,6 +2601,7 @@
         h("div", { className: "hermes-workflows-topbar-actions" },
           h("button", { type: "button", disabled: validating || !hasDraft, onClick: validateDefinition }, validating ? "Validating…" : "Validate"),
           h("button", { type: "button", disabled: deploying || !hasDraft, onClick: deployDefinition, className: "hermes-workflows-primary" }, deploying ? "Deploying…" : "Deploy"),
+          persisted ? h("button", { type: "button", disabled: deleting, onClick: deleteWorkflow, "aria-label": "Delete workflow" }, deleting ? "Deleting…" : "Delete") : null,
           persisted ? h("button", { type: "button", disabled: running, onClick: runWorkflow }, running ? "Running…" : "Run") : null,
           h("button", { type: "button", disabled: loading, onClick: function () { refresh(); } }, loading ? "Refreshing…" : "Refresh"),
           h("button", { type: "button", onClick: function() { setShowAdvancedYaml(!showAdvancedYaml); } }, showAdvancedYaml ? "Hide YAML" : "YAML")

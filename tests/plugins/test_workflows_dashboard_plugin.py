@@ -86,6 +86,30 @@ def _deploy(client: TestClient, spec: dict = PASS_SPEC) -> dict:
     return r.json()["definition"]
 
 
+def test_dashboard_delete_definition_removes_workflow_and_related_runs(client):
+    definition = _deploy(client, PASS_SPEC)
+    run = client.post(
+        f"/api/plugins/workflows/definitions/{definition['workflow_id']}/run",
+        json={"input": {"message": "delete me"}},
+    )
+    assert run.status_code == 200, run.text
+
+    r = client.delete(f"/api/plugins/workflows/definitions/{definition['workflow_id']}")
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"deleted": True, "workflow_id": definition["workflow_id"]}
+    assert client.get(f"/api/plugins/workflows/definitions/{definition['workflow_id']}").status_code == 404
+    assert client.get("/api/plugins/workflows/definitions").json()["definitions"] == []
+    assert client.get("/api/plugins/workflows/executions").json()["executions"] == []
+
+
+def test_dashboard_delete_definition_returns_404_for_missing_workflow(client):
+    r = client.delete("/api/plugins/workflows/definitions/missing-workflow")
+
+    assert r.status_code == 404
+    assert "workflow definition not found" in r.json()["detail"]
+
+
 def test_dashboard_deploy_auto_bumps_changed_same_version_specs(client):
     first = _deploy(client, PASS_SPEC)
     assert first["version"] == 1
