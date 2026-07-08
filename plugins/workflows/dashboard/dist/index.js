@@ -1000,6 +1000,9 @@
     const stateNodePositions = useState({});
     const nodePositions = stateNodePositions[0];
     const setNodePositions = stateNodePositions[1];
+    const stateContextMenu = useState({ x: 0, y: 0, visible: false });
+    const contextMenu = stateContextMenu[0];
+    const setContextMenu = stateContextMenu[1];
     const statePromptAssistantOpen = useState(false);
     const promptAssistantOpen = statePromptAssistantOpen[0];
     const setPromptAssistantOpen = statePromptAssistantOpen[1];
@@ -2538,10 +2541,24 @@
                   setStatus("Draft connection added visually; validate/select a workflow to persist it.");
                 }
               } : undefined,
+              onNodeContextMenu: function (event, node) {
+                event.preventDefault();
+                if (node && node.data && node.data.node) {
+                  selectNodeForInspector(node.data.node);
+                  setContextMenu({ x: event.clientX, y: event.clientY, visible: true });
+                }
+              },
             },
               Controls ? h(Controls, null) : null
             )
-          )
+          ),
+          contextMenu.visible ? h("div", {
+            className: "hermes-workflows-context-menu",
+            style: { left: contextMenu.x + "px", top: contextMenu.y + "px" },
+            onClick: function () { setContextMenu({ x: 0, y: 0, visible: false }); },
+          },
+            h("button", { type: "button", onClick: function () { deleteSelectedCell(); setContextMenu({ x: 0, y: 0, visible: false }); } }, "Delete cell")
+          ) : null
         )
       );
     }

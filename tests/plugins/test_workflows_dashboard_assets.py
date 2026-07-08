@@ -117,6 +117,14 @@ def test_workflow_dashboard_blocks_trigger_edges_that_backend_rejects() -> None:
     assert "if (isTriggerSource(spec, connection.source))" in text
 
 
+def test_workflow_dashboard_supports_keyboard_delete_and_context_menu() -> None:
+    text = BUNDLE.read_text(encoding="utf-8")
+    assert "onNodeContextMenu" in text
+    assert "contextMenu" in text
+    assert "hermes-workflows-context-menu" in text
+    assert "Delete cell" in text
+
+
 def test_workflow_dashboard_prompt_assistant_is_collapsible() -> None:
     text = BUNDLE.read_text(encoding="utf-8")
     assert "promptAssistantAdvanced" in text

@@ -282,6 +282,32 @@
   outline-offset: -4px;
 }
 
+.hermes-workflows .hermes-workflows-context-menu {
+  position: fixed;
+  z-index: 1000;
+  background: var(--color-card, #fff);
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  padding: 0.25rem 0;
+}
+
+.hermes-workflows .hermes-workflows-context-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  padding: 0.3rem 0.75rem;
+  font-size: 0.82rem;
+  cursor: pointer;
+  color: var(--color-foreground);
+}
+
+.hermes-workflows .hermes-workflows-context-menu button:hover {
+  background: color-mix(in srgb, var(--color-border) 15%, transparent);
+}
+
 .hermes-workflows .hermes-workflows-palette-icon {
   grid-row: 1 / span 2;
   opacity: 0.86;
