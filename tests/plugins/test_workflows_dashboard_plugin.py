@@ -162,6 +162,7 @@ def test_agent_routing_options_endpoint_lists_profiles_and_models(client, monkey
                     "api_key": "SHOULD_NOT_LEAK",
                     "authorization": "SHOULD_NOT_LEAK",
                     "token": "SHOULD_NOT_LEAK",
+                    "warning": "paste OPENAI_API_KEY to activate",
                 },
             ],
         }

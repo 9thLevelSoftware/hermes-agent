@@ -371,7 +371,6 @@ def agent_routing_options() -> dict[str, Any]:
                 "label": str(row.get("label") or row.get("name") or row.get("slug") or ""),
                 "models": [str(model) for model in row.get("models") or []],
                 "authenticated": bool(row.get("authenticated", False)),
-                "warning": str(row.get("warning") or ""),
             }
         )
     return {
