@@ -494,11 +494,27 @@
 }
 
 /* Goal builder compact (inside sidebar) */
-.hermes-workflows .hermes-workflows-goal-compact textarea {
+.hermes-workflows .hermes-workflows-goal-compact textarea,
+.hermes-workflows .hermes-workflows-goal-compact input {
   width: 100%;
   font-size: 0.82rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  padding: 0.35rem 0.45rem;
+  background: var(--color-input, var(--color-card));
+  color: var(--color-foreground);
+  transition: border-color 0.15s ease;
+}
+
+.hermes-workflows .hermes-workflows-goal-compact textarea {
   min-height: 60px;
   resize: vertical;
+}
+
+.hermes-workflows .hermes-workflows-goal-compact textarea:focus,
+.hermes-workflows .hermes-workflows-goal-compact input:focus {
+  border-color: var(--color-primary, var(--color-foreground));
+  outline: none;
 }
 
 .hermes-workflows .hermes-workflows-link-btn {
