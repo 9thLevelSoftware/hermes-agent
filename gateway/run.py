@@ -1799,7 +1799,9 @@ def _resolve_workflow_dispatch_settings(load_config_callable: Callable[[], Any])
     workflow_cfg = cfg.get("workflow", {}) if isinstance(cfg, dict) else {}
     if not isinstance(workflow_cfg, dict):
         workflow_cfg = {}
-    enabled = is_truthy_value(workflow_cfg.get("dispatch_in_gateway"), default=False)
+    # Default-on, matching kanban.dispatch_in_gateway — a deployed workflow
+    # should advance unattended unless the user explicitly opts out.
+    enabled = is_truthy_value(workflow_cfg.get("dispatch_in_gateway"), default=True)
 
     raw_interval = workflow_cfg.get("tick_interval_seconds", _WORKFLOW_DISPATCH_INTERVAL_DEFAULT)
     try:
@@ -7366,7 +7368,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         asyncio.create_task(self._kanban_dispatcher_watcher())
 
         # Start background workflow dispatcher — ticks queued workflow graph
-        # executions. Gated by `workflow.dispatch_in_gateway` (default False).
+        # executions. Gated by `workflow.dispatch_in_gateway` (default True).
         asyncio.create_task(self._workflow_dispatcher_watcher())
 
         # Start background reconnection watcher for platforms that failed at startup

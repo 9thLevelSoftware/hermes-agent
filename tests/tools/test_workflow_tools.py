@@ -470,7 +470,9 @@ def test_workflow_run_creates_execution_with_provided_input(_isolated_workflow_h
     assert "error" not in payload
     assert payload["workflow_id"] == spec.id
     assert payload["version"] == spec.version
-    assert payload["status"] == "queued"
+    # workflow_run ticks once inline (same as CLI run / dashboard Run), so a
+    # cheap all-pass workflow completes immediately.
+    assert payload["status"] == "succeeded"
     assert payload["input"] == {"x": 1}
 
     with wfdb.connect() as conn:
@@ -478,7 +480,7 @@ def test_workflow_run_creates_execution_with_provided_input(_isolated_workflow_h
 
     assert execution.workflow_id == spec.id
     assert execution.version == spec.version
-    assert execution.status == "queued"
+    assert execution.status == "succeeded"
     assert execution.input == {"x": 1}
 
 

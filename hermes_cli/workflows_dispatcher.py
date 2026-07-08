@@ -107,15 +107,22 @@ def _fire_due_schedules(conn: sqlite3.Connection, *, now: int) -> None:
             (now,),
         ).fetchall()
         for row in rows:
-            wfdb.start_execution(
-                conn,
-                row["workflow_id"],
-                input_data=_schedule_input(conn, row),
-                trigger_type="schedule",
-                trigger_id=row["trigger_id"],
-                version=row["version"],
-                now=now,
-            )
+            try:
+                wfdb.start_execution(
+                    conn,
+                    row["workflow_id"],
+                    input_data=_schedule_input(conn, row),
+                    trigger_type="schedule",
+                    trigger_id=row["trigger_id"],
+                    version=row["version"],
+                    now=now,
+                )
+            except (KeyError, ValueError):
+                # Definition deleted or disabled after the schedule row was
+                # registered — drop the stale schedule instead of failing the
+                # whole tick forever.
+                conn.execute("DELETE FROM workflow_schedules WHERE id = ?", (row["id"],))
+                continue
             conn.execute(
                 """
                 UPDATE workflow_schedules
@@ -635,14 +642,21 @@ def _persist_failed_attempt(
             """,
             (_json_dumps(error), now, now, queued["id"]),
         )
-        return
-    conn.execute(
-        """
-        INSERT INTO workflow_node_runs (
-            execution_id, node_id, status, error, started_at, completed_at
-        ) VALUES (?, ?, 'failed', ?, ?, ?)
-        """,
-        (execution_id, node_id, _json_dumps(error), now, now),
+    else:
+        conn.execute(
+            """
+            INSERT INTO workflow_node_runs (
+                execution_id, node_id, status, error, started_at, completed_at
+            ) VALUES (?, ?, 'failed', ?, ?, ?)
+            """,
+            (execution_id, node_id, _json_dumps(error), now, now),
+        )
+    _append_event(
+        conn,
+        execution_id,
+        "node_failed",
+        {"node_id": node_id, "error": error},
+        now,
     )
 
 

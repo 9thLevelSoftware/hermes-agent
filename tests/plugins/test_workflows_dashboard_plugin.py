@@ -246,9 +246,11 @@ def test_status_endpoint_defaults_when_workflow_config_missing(client, monkeypat
 
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["dispatcher"]["dispatch_in_gateway"] is False
+    # dispatch_in_gateway defaults on — a missing workflow section behaves
+    # like the shipped default, not like an opt-out.
+    assert body["dispatcher"]["dispatch_in_gateway"] is True
     assert body["dispatcher"]["tick_interval_seconds"] == 30.0
-    assert body["dispatcher"]["warning"]
+    assert body["dispatcher"]["warning"] is None
 
 
 def test_status_endpoint_handles_non_dict_workflow_config(client, monkeypatch):
@@ -260,9 +262,9 @@ def test_status_endpoint_handles_non_dict_workflow_config(client, monkeypatch):
 
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["dispatcher"]["dispatch_in_gateway"] is False
+    assert body["dispatcher"]["dispatch_in_gateway"] is True
     assert body["dispatcher"]["tick_interval_seconds"] == 30.0
-    assert body["dispatcher"]["warning"]
+    assert body["dispatcher"]["warning"] is None
 
 
 def test_status_endpoint_treats_string_false_as_disabled(client, monkeypatch):
@@ -2033,7 +2035,9 @@ def test_run_endpoint_creates_execution_and_list_show_return_it(client):
     execution = r.json()["execution"]
     assert execution["workflow_id"] == "dashboard_demo"
     assert execution["input"] == {"value": 7}
-    assert execution["status"] in {"queued", "running", "waiting", "succeeded"}
+    # Engine/DB status vocabulary — "running" is intentionally absent
+    # (executions are queued/waiting/succeeded/failed/blocked/cancelled).
+    assert execution["status"] in {"queued", "waiting", "succeeded"}
 
     with wfdb.connect() as conn:
         stored = wfdb.get_execution(conn, execution["execution_id"])

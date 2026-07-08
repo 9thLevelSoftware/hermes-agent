@@ -229,9 +229,11 @@ def test_run_input_creates_execution_and_lists_it(workflow_home, tmp_path, capsy
     run_payload = json.loads(out)
     execution_id = run_payload["execution_id"]
     assert execution_id.startswith("wfexec_")
+    # `run` ticks once inline (same as the dashboard Run button), so a
+    # cheap all-pass workflow completes immediately.
     assert run_payload == {
         "execution_id": execution_id,
-        "status": "queued",
+        "status": "succeeded",
         "version": 1,
         "workflow_id": "code-change-review",
     }
@@ -251,15 +253,26 @@ def test_run_input_creates_execution_and_lists_it(workflow_home, tmp_path, capsy
     assert err == ""
     show_payload = json.loads(out)
     assert show_payload["execution_id"] == execution_id
-    assert show_payload["context"] == {"input": {"reviewer": "bot"}, "node": {}}
+    assert show_payload["context"]["input"] == {"reviewer": "bot"}
+    assert show_payload["context"]["node"]["done"]["output"] == {"finished": True}
+
+
+def _start_queued_execution(workflow_id: str, input_data: dict | None = None) -> str:
+    """Seed a queued execution without the run command's inline tick."""
+    wfdb.init_db()
+    with wfdb.connect() as conn:
+        return wfdb.start_execution(
+            conn,
+            workflow_id,
+            input_data=input_data or {},
+            trigger_type="manual",
+        )
 
 
 def test_tick_json_advances_cheap_workflow_to_success(workflow_home, tmp_path, capsys):
     spec_path = _write_workflow(tmp_path / "workflow.yaml")
     assert _run(["deploy", str(spec_path)], capsys)[0] == 0
-    rc, out, _err = _run(["run", "code-change-review", "--json"], capsys)
-    assert rc == 0
-    execution_id = json.loads(out)["execution_id"]
+    execution_id = _start_queued_execution("code-change-review")
 
     rc, out, err = _run(["tick", "--limit", "10", "--json"], capsys)
 
@@ -278,9 +291,7 @@ def test_tick_json_advances_cheap_workflow_to_success(workflow_home, tmp_path, c
 def test_cancel_queued_execution(workflow_home, tmp_path, capsys):
     spec_path = _write_workflow(tmp_path / "workflow.yaml")
     assert _run(["deploy", str(spec_path)], capsys)[0] == 0
-    rc, out, _err = _run(["run", "code-change-review", "--json"], capsys)
-    assert rc == 0
-    execution_id = json.loads(out)["execution_id"]
+    execution_id = _start_queued_execution("code-change-review")
 
     rc, out, err = _run(["executions", "cancel", execution_id], capsys)
 
