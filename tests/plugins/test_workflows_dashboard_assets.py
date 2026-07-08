@@ -103,13 +103,6 @@ def test_workflow_dashboard_status_banners_are_dismissible_and_self_clearing() -
     assert "formatApiError" in text
 
 
-def test_workflow_dashboard_shows_ai_draft_routing_context() -> None:
-    text = BUNDLE.read_text(encoding="utf-8")
-    assert "AI drafts use" in text
-    assert "hermes-workflows-ai-routing-note" in text
-    assert "agentRoutingOptions.default_provider" in text
-
-
 def test_workflow_dashboard_blocks_trigger_edges_that_backend_rejects() -> None:
     text = BUNDLE.read_text(encoding="utf-8")
     assert "function isTriggerSource" in text

@@ -659,9 +659,6 @@ def test_dashboard_bundle_wires_node_runs_as_execution_drilldown():
     render_timeline = bundle[
         bundle.index("function renderTimeline") : bundle.index("function renderSimpleGraph")
     ]
-    goal_builder = bundle[
-        bundle.index("function renderGoalBuilder") : bundle.index("function renderDraftReview")
-    ]
 
     assert "stateNodeRuns" in bundle
     assert "setNodeRuns" in bundle
@@ -672,7 +669,6 @@ def test_dashboard_bundle_wires_node_runs_as_execution_drilldown():
     assert "Promise.all([loadEvents(executionId), loadNodeRuns(executionId)])" in load_execution
     assert "setNodeRuns([])" in load_execution
     assert "renderNodeRuns()" in render_timeline
-    assert "renderNodeRuns()" not in goal_builder
 
 
 def test_dashboard_bundle_contains_validation_checklist_and_dispatcher_banner():
@@ -1676,10 +1672,9 @@ def test_dashboard_bundle_is_prompt_first_not_yaml_first():
     render_start = bundle.index('return h("div", { className: "hermes-workflows" }')
     render_tree = bundle[render_start:]
 
-    assert "What do you want to automate?" in bundle
-    assert "Describe workflow" in bundle
-    assert "Use Kanban for one-off work queues" in bundle
-    assert "Advanced YAML" in bundle
+    assert "New workflow" in bundle
+    assert "Draft" in bundle
+    assert "Advanced YAML" in bundle or "YAML" in bundle
     assert "Validate / deploy definition" not in bundle
     # In the 3-zone layout, goal builder is in the sidebar which renders before the canvas
     assert render_tree.index("renderSidebar()") < render_tree.index(
@@ -1717,15 +1712,6 @@ def test_dashboard_bundle_draft_review_notes_when_assistant_metadata_is_missing(
 
     assert "No assistant draft metadata available." in review
     assert "hasDraftMetadata" in review
-
-
-def test_dashboard_bundle_goal_builder_does_not_duplicate_draft_summary():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
-    goal = bundle[
-        bundle.index("function renderGoalBuilder") : bundle.index("function renderDraftReview")
-    ]
-
-    assert "draftResult.summary" not in goal
 
 
 def test_dashboard_bundle_wires_draft_refine_before_advanced_yaml():

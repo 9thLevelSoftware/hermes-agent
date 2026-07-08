@@ -1854,42 +1854,6 @@
       }).catch(fail);
     }
 
-    function renderGoalBuilder() {
-      const templates = [
-        ["Code change + review", "Change code in a repository, run the tests, review the diff, and report whether it is ready."],
-        ["Research triage", "Collect sources for a research question, summarize findings, flag gaps, and produce a recommendation."],
-        ["Daily briefing", "Every morning, gather updates from configured sources and produce a concise briefing with action items."],
-        ["Human approval loop", "Prepare a proposed action, wait for human approval, then continue only if it is approved."],
-      ];
-      return h(Card, { className: "hermes-workflows-panel hermes-workflows-goal" },
-        h("h2", null, "What do you want to automate?"),
-        h("p", { className: "hermes-workflows-muted" }, "Describe the outcome in plain language. Hermes drafts the graph, cells, inputs, and output contracts for you to review."),
-        h("p", { className: "hermes-workflows-privacy-note" }, PRIVACY_NOTE),
-        h("form", { className: "hermes-workflows-stack", onSubmit: draftFromGoal },
-          h("textarea", {
-            className: "hermes-workflows-goal-input",
-            "aria-label": "Describe workflow goal",
-            value: goalText,
-            onChange: function (event) { setGoalText(event.target.value); },
-            placeholder: "Example: review code changes, run tests, ask for approval, then deploy if approved.",
-          }),
-          h("div", { className: "hermes-workflows-row" },
-            h("button", { type: "submit", disabled: drafting, className: "hermes-workflows-primary" }, drafting ? "Drafting…" : "Describe workflow"),
-            h("button", { type: "button", onClick: function () { setShowAdvancedYaml(!showAdvancedYaml); } }, showAdvancedYaml ? "Hide Advanced YAML" : "Advanced YAML")
-          )
-        ),
-        h("p", { className: "hermes-workflows-muted" }, "Use Kanban for one-off work queues; use workflows when the same automation should run repeatedly."),
-        h("div", { className: "hermes-workflows-template-grid" }, templates.map(function (template) {
-          return h("button", {
-            key: template[0],
-            type: "button",
-            className: "hermes-workflows-template-card",
-            onClick: function () { setGoalText(template[1]); },
-          }, template[0]);
-        }))
-      );
-    }
-
     function renderDraftReview() {
       const spec = activeSpec();
       if (!draftResult && !spec) return null;
@@ -2614,8 +2578,6 @@
       var goalCollapsed = sidebarCollapsed.goal === undefined ? !!spec : !!sidebarCollapsed.goal;
       var wfCollapsed = !!sidebarCollapsed.workflows;
       var execCollapsed = !!sidebarCollapsed.executions;
-      var aiDraftProvider = safeString(agentRoutingOptions.default_provider || "Hermes default provider");
-      var aiDraftModel = safeString(agentRoutingOptions.default_model || "profile default model");
       function toggleSection(key) {
         var next = Object.assign({}, sidebarCollapsed);
         next[key] = !(key === "goal" ? goalCollapsed : !!sidebarCollapsed[key]);
@@ -2625,7 +2587,6 @@
         h("div", { className: "hermes-workflows-sidebar-section hermes-workflows-goal-compact hermes-workflows-sidebar-collapsible" + (goalCollapsed ? " is-collapsed" : "") },
           h("h3", { onClick: function () { toggleSection("goal"); } }, spec ? "New workflow / prompt" : "New workflow"),
           h("p", { className: "hermes-workflows-muted", style: {fontSize: "0.78rem"} }, "Describe it or start from blank."),
-          h("div", { className: "hermes-workflows-ai-routing-note" }, "AI drafts use " + aiDraftProvider + " / " + aiDraftModel),
           h("input", {
             value: newWorkflowName,
             onChange: function (event) { setNewWorkflowName(event.target.value); },
@@ -2641,19 +2602,6 @@
           h("div", { className: "hermes-workflows-row", style: {marginTop: "0.3rem"} },
             h("button", { type: "button", disabled: drafting, onClick: draftFromGoal, className: "hermes-workflows-primary", style: {fontSize: "0.78rem"} }, drafting ? "Drafting…" : "Draft"),
             h("button", { type: "button", "aria-label": "Start from blank workflow", onClick: startBlankWorkflow, style: {fontSize: "0.78rem"} }, "Blank")
-          ),
-          h("div", { className: "hermes-workflows-template-grid" },
-            ["Code change + review", "Research triage", "Daily briefing", "Human approval loop"].map(function (label) {
-              return h("button", { key: label, type: "button", className: "hermes-workflows-template-card", style: {fontSize: "0.72rem"}, onClick: function () {
-                var templates = {
-                  "Code change + review": "Change code in a repository, run the tests, review the diff, and report whether it is ready.",
-                  "Research triage": "Collect sources for a research question, summarize findings, flag gaps, and produce a recommendation.",
-                  "Daily briefing": "Every morning, gather updates from configured sources and produce a concise briefing with action items.",
-                  "Human approval loop": "Prepare a proposed action, wait for human approval, then continue only if it is approved."
-                };
-                setGoalText(templates[label] || "");
-              } }, label);
-            })
           )
         ),
         h("div", { className: "hermes-workflows-sidebar-section" + (wfCollapsed ? " hermes-workflows-sidebar-collapsible is-collapsed" : " hermes-workflows-sidebar-collapsible"), onClick: function() { toggleSection("workflows"); } },

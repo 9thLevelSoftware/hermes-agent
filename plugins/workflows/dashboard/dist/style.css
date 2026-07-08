@@ -501,15 +501,6 @@
   resize: vertical;
 }
 
-.hermes-workflows .hermes-workflows-ai-routing-note {
-  border: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
-  border-radius: 0.45rem;
-  color: var(--color-muted-foreground);
-  font-size: 0.72rem;
-  margin: 0.3rem 0 0.45rem;
-  padding: 0.28rem 0.4rem;
-}
-
 .hermes-workflows .hermes-workflows-link-btn {
   border: none;
   background: transparent;
@@ -518,18 +509,6 @@
   font-size: 0.78rem;
   padding: 0.2rem 0;
   text-decoration: underline;
-}
-
-.hermes-workflows .hermes-workflows-goal-compact .hermes-workflows-template-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-  margin-top: 0.4rem;
-}
-
-.hermes-workflows .hermes-workflows-goal-compact .hermes-workflows-template-card {
-  font-size: 0.74rem;
-  padding: 0.2rem 0.4rem;
 }
 
 /* Responsive: stack vertically on narrow screens */
@@ -770,16 +749,6 @@
 
 .hermes-workflows .hermes-workflows-primary {
   background: color-mix(in srgb, var(--color-primary) 20%, var(--color-card));
-}
-
-.hermes-workflows .hermes-workflows-template-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 0.5rem;
-}
-
-.hermes-workflows .hermes-workflows-template-card {
-  text-align: left;
 }
 
 .hermes-workflows .hermes-workflows-draft-review {
