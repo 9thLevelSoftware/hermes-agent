@@ -13,6 +13,8 @@ import yaml
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ValidationError
 
+from hermes_cli import inventory as inventory_mod
+from hermes_cli import profiles as profiles_mod
 from hermes_cli import workflows_assistant
 from hermes_cli import workflows_db as wfdb
 from hermes_cli import workflows_dispatcher
@@ -281,6 +283,16 @@ class PromptAssistantDraftResponse(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+def _profile_option(profile: Any) -> dict[str, Any]:
+    return {
+        "name": str(getattr(profile, "name", "") or ""),
+        "provider": str(getattr(profile, "provider", "") or ""),
+        "model": str(getattr(profile, "model", "") or ""),
+        "description": str(getattr(profile, "description", "") or ""),
+        "is_default": bool(getattr(profile, "is_default", False)),
+    }
+
+
 def _draft_cell_prompt(req: PromptAssistantDraftRequest) -> PromptAssistantDraftResponse:
     context_lines = "\n".join(
         f"- {item}" for item in req.available_context if str(item).strip()
@@ -325,6 +337,38 @@ def prompt_assistant_draft(req: PromptAssistantDraftRequest) -> dict[str, Any]:
 @router.get("/capabilities")
 def capabilities() -> dict[str, Any]:
     return workflow_capabilities()
+
+
+@router.get("/agent-routing-options")
+def agent_routing_options() -> dict[str, Any]:
+    profiles = [_profile_option(profile) for profile in profiles_mod.list_profiles()]
+    models_payload = inventory_mod.build_models_payload(
+        inventory_mod.load_picker_context(),
+        include_unconfigured=True,
+        picker_hints=True,
+        canonical_order=True,
+        probe_custom_providers=False,
+        max_models=500,
+    )
+    providers = []
+    for row in models_payload.get("providers", []):
+        if not isinstance(row, dict):
+            continue
+        providers.append(
+            {
+                "slug": str(row.get("slug") or row.get("provider") or ""),
+                "label": str(row.get("label") or row.get("name") or row.get("slug") or ""),
+                "models": [str(model) for model in row.get("models") or []],
+                "authenticated": bool(row.get("authenticated", False)),
+                "warning": str(row.get("warning") or ""),
+            }
+        )
+    return {
+        "profiles": profiles,
+        "providers": providers,
+        "default_provider": str(models_payload.get("provider") or ""),
+        "default_model": str(models_payload.get("model") or ""),
+    }
 
 
 def _workflow_tick_interval_seconds(workflow_cfg: dict[str, Any]) -> float:

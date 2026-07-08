@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -115,6 +116,72 @@ def test_prompt_assistant_drafts_text_prompt(client):
     assert "${ input.repo }" in body["prompt_text"]
     assert "verdict" in body["prompt_text"]
     assert body["result_contract"]["verdict"] == "approved|changes_requested"
+
+
+def test_agent_routing_options_endpoint_lists_profiles_and_models(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    class Profile:
+        def __init__(self, name, provider, model):
+            self.name = name
+            self.provider = provider
+            self.model = model
+            self.description = ""
+            self.is_default = name == "default"
+
+    profiles_mod = SimpleNamespace(
+        list_profiles=lambda: [
+            Profile("default", "xiaomi-token-plan", "mimo-vl-7b"),
+            Profile("reviewer", "openai-codex", "gpt-5.5"),
+        ]
+    )
+    picker_context = object()
+
+    def build_models_payload(*args, **kwargs):
+        assert args == (picker_context,)
+        assert kwargs == {
+            "include_unconfigured": True,
+            "picker_hints": True,
+            "canonical_order": True,
+            "probe_custom_providers": False,
+            "max_models": 500,
+        }
+        return {
+            "provider": "xiaomi-token-plan",
+            "model": "mimo-vl-7b",
+            "providers": [
+                {"slug": "xiaomi-token-plan", "label": "Xiaomi", "models": ["mimo-vl-7b"]},
+                {
+                    "slug": "openai-codex",
+                    "label": "OpenAI Codex",
+                    "models": ["gpt-5.5"],
+                    "api_key": "SHOULD_NOT_LEAK",
+                    "authorization": "SHOULD_NOT_LEAK",
+                    "token": "SHOULD_NOT_LEAK",
+                },
+            ],
+        }
+
+    inventory_mod = SimpleNamespace(
+        load_picker_context=lambda: picker_context,
+        build_models_payload=build_models_payload,
+    )
+    monkeypatch.setattr(plugin, "profiles_mod", profiles_mod, raising=False)
+    monkeypatch.setattr(plugin, "inventory_mod", inventory_mod, raising=False)
+
+    r = client.get("/api/plugins/workflows/agent-routing-options")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["profiles"][0]["name"] == "default"
+    assert body["profiles"][1]["name"] == "reviewer"
+    assert body["providers"][1]["slug"] == "openai-codex"
+    assert body["providers"][1]["models"] == ["gpt-5.5"]
+    text = r.text.lower()
+    assert "api_key" not in text
+    assert "authorization" not in text
+    assert '"token"' not in text
+    assert "should_not_leak" not in text
 
 
 def test_capabilities_endpoint_lists_implemented_and_unsupported_primitives(client):
