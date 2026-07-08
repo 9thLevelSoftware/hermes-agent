@@ -1526,6 +1526,46 @@ def test_failed_node_without_catch_fails_execution_and_records_attempt(tmp_path,
     assert json.loads(runs[0]["error"]) == execution.context["error"]
 
 
+def test_failed_node_emits_node_failed_event(tmp_path, monkeypatch):
+    exec_id = _start_spec_execution(tmp_path, monkeypatch, _fail_spec())
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+
+    _execution, _claim, events = _execution_state(exec_id)
+    node_failed = [e for e in events if e["kind"] == "node_failed"]
+    assert len(node_failed) == 1
+    payload = json.loads(node_failed[0]["payload_json"])
+    assert payload["node_id"] == "flaky"
+    assert payload["error"]["node"] == "flaky"
+
+
+def test_fire_due_schedules_drops_stale_disabled_schedule(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    wfdb.init_db()
+    spec = WorkflowSpec.model_validate({
+        "id": "sched_demo", "name": "Sched Demo", "version": 1,
+        "triggers": [{"type": "schedule", "id": "daily", "cron": "0 9 * * *"}],
+        "nodes": {"start": {"type": "pass", "output": {"ok": True}}},
+    })
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, spec, created_by="test")
+        # Simulate config drift: definition disabled after the schedule row
+        # was registered (e.g. direct DB edit or a crash mid-toggle).
+        conn.execute("UPDATE workflow_definitions SET enabled = 0 WHERE workflow_id = 'sched_demo'")
+        conn.execute("UPDATE workflow_schedules SET next_run_at = 50 WHERE workflow_id = 'sched_demo'")
+
+    # The stale schedule must not kill the tick — it gets dropped instead.
+    assert workflows_dispatcher.tick(limit=5, now=100) == 0
+
+    with wfdb.connect() as conn:
+        remaining = conn.execute(
+            "SELECT count(*) FROM workflow_schedules WHERE workflow_id = 'sched_demo'"
+        ).fetchone()[0]
+        executions = conn.execute("SELECT count(*) FROM workflow_executions").fetchone()[0]
+    assert remaining == 0
+    assert executions == 0
+
+
 def test_retry_backoff_multiplier_sets_next_wait_until(tmp_path, monkeypatch):
     exec_id = _start_spec_execution(
         tmp_path,

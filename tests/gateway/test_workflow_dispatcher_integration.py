@@ -267,6 +267,25 @@ def test_start_schedules_workflow_dispatcher_watcher(tmp_path):
     assert "_workflow_dispatcher_watcher" in scheduled
 
 
+def test_gateway_workflow_slash_command_delegates_to_run_slash(monkeypatch):
+    from types import SimpleNamespace
+
+    runner = _runner()
+    seen = []
+
+    def fake_run_slash(rest: str) -> str:
+        seen.append(rest)
+        return "workflow output"
+
+    monkeypatch.setattr("hermes_cli.workflows.run_slash", fake_run_slash)
+
+    event = SimpleNamespace(text="/workflow executions list --limit 5")
+    result = asyncio.run(GatewayRunner._handle_workflow_command(runner, event))
+
+    assert result == "workflow output"
+    assert seen == ["executions list --limit 5"]
+
+
 def test_workflow_dispatch_default_matches_kanban():
     """Both embedded dispatchers ship default-on so deployed work advances
     unattended; the two defaults must not drift apart again."""
