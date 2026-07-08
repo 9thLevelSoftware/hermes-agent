@@ -979,30 +979,15 @@
     const stateNewWorkflowName = useState("");
     const newWorkflowName = stateNewWorkflowName[0];
     const setNewWorkflowName = stateNewWorkflowName[1];
-    const stateNewCellId = useState("");
-    const newCellId = stateNewCellId[0];
-    const setNewCellId = stateNewCellId[1];
     const stateNewCellType = useState("pass");
     const newCellType = stateNewCellType[0];
     const setNewCellType = stateNewCellType[1];
-    const stateNewCellAfter = useState("");
-    const newCellAfter = stateNewCellAfter[0];
-    const setNewCellAfter = stateNewCellAfter[1];
-    const stateNewTriggerId = useState("");
-    const newTriggerId = stateNewTriggerId[0];
-    const setNewTriggerId = stateNewTriggerId[1];
     const stateNewTriggerType = useState("manual");
     const newTriggerType = stateNewTriggerType[0];
     const setNewTriggerType = stateNewTriggerType[1];
     const stateNewTriggerSchedule = useState("0 9 * * *");
     const newTriggerSchedule = stateNewTriggerSchedule[0];
     const setNewTriggerSchedule = stateNewTriggerSchedule[1];
-    const stateEdgeFrom = useState("");
-    const edgeFrom = stateEdgeFrom[0];
-    const setEdgeFrom = stateEdgeFrom[1];
-    const stateEdgeTo = useState("");
-    const edgeTo = stateEdgeTo[0];
-    const setEdgeTo = stateEdgeTo[1];
     const stateAdvancedJsonOpen = useState(false);
     const advancedJsonOpen = stateAdvancedJsonOpen[0];
     const setAdvancedJsonOpen = stateAdvancedJsonOpen[1];
@@ -1736,16 +1721,6 @@
       setNodeMessage("");
     }
 
-    function addWorkflowCellFromUi() {
-      const baseSpec = activeSpec() || newWorkflowSpec(newWorkflowName || goalText || "Workflow Draft");
-      const nextSpec = addSpecNodeAfter(baseSpec, newCellId || newCellType, newCellType, newCellAfter);
-      setActiveDraftSpec(nextSpec, "Added workflow cell from the visual builder.");
-      const id = Object.keys(nextSpec.nodes || {}).slice(-1)[0];
-      const node = findSpecNode(nextSpec, id);
-      if (node) selectNodeForInspector(node);
-      setNewCellId("");
-    }
-
     function addWorkflowCellOfType(type) {
       const safeType = type || "pass";
       const baseSpec = activeSpec() || newWorkflowSpec(newWorkflowName || goalText || "Workflow Draft");
@@ -1766,29 +1741,6 @@
       const trigger = asArray(nextSpec.triggers).slice(-1)[0];
       if (trigger) selectNodeForInspector(Object.assign({}, trigger, { id: trigger.id || trigger.name, specKind: "trigger", trigger_type: trigger.type }));
       setNewTriggerType(safeType);
-    }
-
-    function addTriggerFromUi() {
-      const baseSpec = activeSpec() || newWorkflowSpec(newWorkflowName || goalText || "Workflow Draft");
-      const nextSpec = addSpecTrigger(baseSpec, newTriggerId || newTriggerType, newTriggerType, newTriggerSchedule);
-      setActiveDraftSpec(nextSpec, "Added workflow trigger from the visual builder.");
-      setNewTriggerId("");
-    }
-
-    function connectCellsFromUi() {
-      const spec = activeSpec();
-      if (!spec) {
-        setStatus("Start or validate a workflow before connecting cells.");
-        return;
-      }
-      const source = edgeFrom.trim();
-      const target = edgeTo.trim();
-      if (!source || !target) {
-        setStatus("Choose both a source and target cell before connecting cells.");
-        return;
-      }
-      const nextSpec = upsertSpecEdge(spec, source, target);
-      setActiveDraftSpec(nextSpec, "Connected workflow cells.");
     }
 
     function addSwitchCaseFromUi() {
@@ -2240,10 +2192,6 @@
           );
         })
       );
-    }
-
-    function renderBuilderActions(spec) {
-      return null;
     }
 
     function renderCellList(spec) {
@@ -2720,7 +2668,6 @@
           h("h2", null, "Visual workflow editor"),
           h("p", { className: "hermes-workflows-muted" }, spec ? safeString(spec.name || spec.id || spec.workflow_id) : "Select or validate a workflow to render its nodes and edges.")
         ),
-        renderBuilderActions(spec),
         spec ? renderReactFlowGraph(spec) : h("p", { className: "hermes-workflows-muted" }, "No workflow graph available yet."),
         !ReactFlow ? h("p", { className: "hermes-workflows-muted" }, "React Flow SDK unavailable; showing the simple HTML graph fallback.") : null
       );

@@ -117,6 +117,21 @@ def test_workflow_dashboard_blocks_trigger_edges_that_backend_rejects() -> None:
     assert "if (isTriggerSource(spec, connection.source))" in text
 
 
+def test_workflow_dashboard_has_no_dead_builder_code() -> None:
+    text = BUNDLE.read_text(encoding="utf-8")
+    for dead_marker in [
+        "function addWorkflowCellFromUi",
+        "function addTriggerFromUi",
+        "function connectCellsFromUi",
+        "function renderBuilderActions",
+        'placeholder: "New cell id"',
+        'placeholder: "New trigger id"',
+        'placeholder: "Connect from source',
+        'placeholder: "Connect to target',
+    ]:
+        assert dead_marker not in text, f"Dead code marker still present: {dead_marker}"
+
+
 def test_workflow_dashboard_uses_three_zone_builder_layout() -> None:
     text = BUNDLE.read_text(encoding="utf-8")
     css = (ROOT / "plugins" / "workflows" / "dashboard" / "dist" / "style.css").read_text(encoding="utf-8")
