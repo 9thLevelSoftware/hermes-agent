@@ -439,6 +439,23 @@ def test_definition_draft_endpoint_redacts_unexpected_runtime_errors(client, mon
     assert "abc123" not in r.text
 
 
+def test_definition_draft_endpoint_surfaces_non_secret_errors(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    def fake_draft(goal):
+        raise RuntimeError("No inference provider configured. Run 'hermes model' to choose a provider.")
+
+    monkeypatch.setattr(plugin.workflows_assistant, "draft_workflow_with_default_runner", fake_draft)
+
+    r = client.post("/api/plugins/workflows/definitions/draft", json={"goal": "Build demo"})
+
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert detail["code"] == "workflow_assistant_runtime_error"
+    assert "No inference provider configured" in detail["message"]
+    assert "secret" not in r.text
+
+
 def test_definition_draft_endpoint_returns_validation_hint(client, monkeypatch):
     import hermes_dashboard_plugin_workflows_test as plugin
 
