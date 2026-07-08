@@ -9425,6 +9425,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "kanban":
                 return await self._handle_kanban_command(event)
 
+            # /workflow bypasses the guard for the same reason as /kanban —
+            # it reads/advances workflows.db, never the running agent's state,
+            # and checking a stalled execution mid-run is a primary use case.
+            if _cmd_def_inner and _cmd_def_inner.name == "workflow":
+                return await self._handle_workflow_command(event)
+
             # /goal is safe mid-run for status/pause/clear/wait (inspection
             # and control-plane only — doesn't interrupt the running turn).
             # Setting a new goal text mid-run is rejected with the same
@@ -9834,6 +9840,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
+
+        if canonical == "workflow":
+            return await self._handle_workflow_command(event)
 
         if canonical == "suggestions":
             return await self._handle_suggestions_command(event)
