@@ -117,6 +117,13 @@ def test_workflow_dashboard_blocks_trigger_edges_that_backend_rejects() -> None:
     assert "if (isTriggerSource(spec, connection.source))" in text
 
 
+def test_workflow_dashboard_prompt_assistant_is_collapsible() -> None:
+    text = BUNDLE.read_text(encoding="utf-8")
+    assert "promptAssistantAdvanced" in text
+    assert "setPromptAssistantAdvanced" in text
+    assert "Show advanced fields" in text
+
+
 def test_workflow_dashboard_inspector_shows_only_relevant_fields() -> None:
     text = BUNDLE.read_text(encoding="utf-8")
     assert "renderInspectorForType" in text

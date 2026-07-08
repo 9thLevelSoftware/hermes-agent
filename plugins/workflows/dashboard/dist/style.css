@@ -490,6 +490,16 @@
   padding: 0.28rem 0.4rem;
 }
 
+.hermes-workflows .hermes-workflows-link-btn {
+  border: none;
+  background: transparent;
+  color: var(--color-primary, var(--color-foreground));
+  cursor: pointer;
+  font-size: 0.78rem;
+  padding: 0.2rem 0;
+  text-decoration: underline;
+}
+
 .hermes-workflows .hermes-workflows-goal-compact .hermes-workflows-template-grid {
   display: flex;
   flex-wrap: wrap;

@@ -1003,6 +1003,9 @@
     const statePromptAssistantOpen = useState(false);
     const promptAssistantOpen = statePromptAssistantOpen[0];
     const setPromptAssistantOpen = statePromptAssistantOpen[1];
+    const statePromptAssistantAdvanced = useState(false);
+    const promptAssistantAdvanced = statePromptAssistantAdvanced[0];
+    const setPromptAssistantAdvanced = statePromptAssistantAdvanced[1];
     const statePromptAssistantGoal = useState("");
     const promptAssistantGoal = statePromptAssistantGoal[0];
     const setPromptAssistantGoal = statePromptAssistantGoal[1];
@@ -2288,22 +2291,25 @@
           h("span", { className: "hermes-workflows-muted" }, "Workflow goal"),
           h("textarea", { value: promptAssistantGoal, onChange: function (event) { setPromptAssistantGoal(event.target.value); } })
         ),
-        h("label", null,
-          h("span", { className: "hermes-workflows-muted" }, "Cell objective"),
-          h("textarea", { value: promptAssistantObjective, onChange: function (event) { setPromptAssistantObjective(event.target.value); } })
-        ),
-        h("label", null,
-          h("span", { className: "hermes-workflows-muted" }, "Available context placeholders, one per line"),
-          h("textarea", { value: promptAssistantContext, onChange: function (event) { setPromptAssistantContext(event.target.value); } })
-        ),
-        h("label", null,
-          h("span", { className: "hermes-workflows-muted" }, "Expected output contract JSON"),
-          h("textarea", { value: promptAssistantOutput, onChange: function (event) { setPromptAssistantOutput(event.target.value); } })
-        ),
-        h("label", null,
-          h("span", { className: "hermes-workflows-muted" }, "Constraints, one per line"),
-          h("textarea", { value: promptAssistantConstraints, onChange: function (event) { setPromptAssistantConstraints(event.target.value); } })
-        ),
+        promptAssistantAdvanced ? h("div", { className: "hermes-workflows-stack" },
+          h("label", null,
+            h("span", { className: "hermes-workflows-muted" }, "Cell objective"),
+            h("textarea", { value: promptAssistantObjective, onChange: function (event) { setPromptAssistantObjective(event.target.value); } })
+          ),
+          h("label", null,
+            h("span", { className: "hermes-workflows-muted" }, "Context placeholders"),
+            h("textarea", { value: promptAssistantContext, onChange: function (event) { setPromptAssistantContext(event.target.value); } })
+          ),
+          h("label", null,
+            h("span", { className: "hermes-workflows-muted" }, "Output contract JSON"),
+            h("textarea", { value: promptAssistantOutput, onChange: function (event) { setPromptAssistantOutput(event.target.value); } })
+          ),
+          h("label", null,
+            h("span", { className: "hermes-workflows-muted" }, "Constraints"),
+            h("textarea", { value: promptAssistantConstraints, onChange: function (event) { setPromptAssistantConstraints(event.target.value); } })
+          ),
+          h("button", { type: "button", onClick: function () { setPromptAssistantAdvanced(false); }, className: "hermes-workflows-link-btn" }, "Hide advanced fields")
+        ) : h("button", { type: "button", onClick: function () { setPromptAssistantAdvanced(true); }, className: "hermes-workflows-link-btn" }, "Show advanced fields"),
         h("button", { type: "button", onClick: draftPromptWithAssistant, className: "hermes-workflows-primary" }, "Draft prompt")
       );
     }
