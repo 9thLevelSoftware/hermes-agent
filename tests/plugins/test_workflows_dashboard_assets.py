@@ -76,3 +76,33 @@ def test_workflow_dashboard_exposes_ui_only_builder_controls() -> None:
     for label in required_labels:
         assert label in text
     assert "No JSON/YAML required" in text
+
+
+def test_workflow_dashboard_uses_three_zone_builder_layout() -> None:
+    text = BUNDLE.read_text(encoding="utf-8")
+    css = (ROOT / "plugins" / "workflows" / "dashboard" / "dist" / "style.css").read_text(encoding="utf-8")
+
+    for marker in [
+        "function renderTopBar",
+        "function renderSidebar",
+        "function renderBuilderToolbar",
+        "function renderBottomPanel",
+        "hermes-workflows-topbar",
+        "hermes-workflows-sidebar",
+        "hermes-workflows-canvas-area",
+        "hermes-workflows-builder-toolbar",
+        "hermes-workflows-bottom-panel",
+        "sidebarCollapsed.goal === undefined ? !!spec",
+        "const stateBottomCollapsed = useState(true)",
+        "var persisted = !!(selectedDefinition && workflowIdForDefinition(selectedDefinition)",
+    ]:
+        assert marker in text
+
+    for marker in [
+        ".hermes-workflows .hermes-workflows-app",
+        ".hermes-workflows .hermes-workflows-sidebar",
+        ".hermes-workflows .hermes-workflows-builder-toolbar",
+        ".hermes-workflows .hermes-workflows-flow-surface",
+        ".hermes-workflows .hermes-workflows-bottom-panel",
+    ]:
+        assert marker in css

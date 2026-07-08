@@ -726,6 +726,21 @@ def test_dashboard_bundle_preserves_selected_definition_version():
     assert "loadDefinition(definition.workflow_id, definition.version)" in definition_list
 
 
+def test_dashboard_validate_keeps_draft_unrunnable_until_deploy():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    validate = bundle[
+        bundle.index("function validateDefinition") : bundle.index("function deployDefinition")
+    ]
+    topbar = bundle[
+        bundle.index("function renderTopBar") : bundle.index("function renderSidebar")
+    ]
+
+    assert "setSelectedDefinition" not in validate
+    assert "updateEditorText(specToEditorText(definition.spec))" in validate
+    assert "var persisted = !!(selectedDefinition && workflowIdForDefinition(selectedDefinition)" in topbar
+    assert "persisted ? h(\"button\", { type: \"button\", disabled: running, onClick: runWorkflow }" in topbar
+
+
 def test_dashboard_bundle_runs_selected_or_active_definition_version():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
     selected_run_version = bundle[
@@ -1625,11 +1640,11 @@ def test_dashboard_bundle_is_prompt_first_not_yaml_first():
     assert "Use Kanban for one-off work queues" in bundle
     assert "Advanced YAML" in bundle
     assert "Validate / deploy definition" not in bundle
-    assert render_tree.index("renderGoalBuilder()") < render_tree.index(
-        'className: "hermes-workflows-grid"'
+    # In the 3-zone layout, goal builder is in the sidebar which renders before the canvas
+    assert render_tree.index("renderSidebar()") < render_tree.index(
+        "renderBottomPanel()"
     )
-    assert render_tree.index("renderGoalBuilder()") < render_tree.index("Workflow list")
-    assert bundle.index("What do you want to automate?") < bundle.index("Workflow list")
+    assert bundle.index("New workflow") < bundle.index("renderBuilderToolbar")
 
 
 def test_dashboard_bundle_contains_draft_review_and_refine_ui():
@@ -1680,7 +1695,8 @@ def test_dashboard_bundle_wires_draft_refine_before_advanced_yaml():
     assert "/definitions/refine" in bundle
     assert 'setRefineText("")' in bundle
     assert "nodeSummaryRows" in bundle
-    assert render_tree.index("renderDraftReview()") < render_tree.index(
+    # In the 3-zone layout, draft review is in the bottom panel which renders before advanced YAML
+    assert render_tree.index("renderBottomPanel()") < render_tree.index(
         "renderAdvancedYaml()"
     )
 
@@ -1885,11 +1901,8 @@ def test_dashboard_bundle_contains_workflow_mvp_api_and_ui_markers():
         assert marker in bundle
 
     for marker in [
-        "Workflow list",
         "Advanced YAML",
         "Run test",
-        "Execution list",
-        "Execution detail timeline",
         "Visual workflow editor",
         "hermes-workflows-list",
         "hermes-workflows-editor",
