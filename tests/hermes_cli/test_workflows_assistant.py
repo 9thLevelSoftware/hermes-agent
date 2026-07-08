@@ -297,6 +297,20 @@ def test_json_schema_instruction_includes_agent_task_result_contract_example():
     assert '"result_contract": {"summary": "string", "status": "string"}' in instruction
 
 
+def test_draft_prompt_mentions_optional_cell_provider_and_model() -> None:
+    prompt = build_draft_prompt("Create a routed review workflow")
+    assert "provider" in prompt
+    assert "model" in prompt
+    assert "profile" in prompt
+    assert "Use provider/model only when requested" in prompt
+
+    agent_example = next(
+        line for line in _json_schema_instruction().splitlines() if '"agent_node"' in line
+    )
+    assert '"provider"' not in agent_example
+    assert '"model"' not in agent_example
+
+
 def test_default_runner_uses_agent_runtime_adapter(monkeypatch):
     from hermes_cli import workflows_assistant as wa
 

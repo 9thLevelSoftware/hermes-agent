@@ -169,6 +169,7 @@ def _json_schema_instruction() -> str:
     "edges": []
   }
 }
+Optional agent_task routing fields, only when the user explicitly asks for provider/model routing: "provider": "provider-slug", "model": "model-name".
 Do not include Markdown fences or prose outside the JSON object."""
 
 
@@ -180,6 +181,8 @@ def _assistant_rules() -> str:
 - Do not emit webhook, kanban_event, send_message, or subworkflow.
 - Every agent_task must include profile, title, text prompt, and result_contract with required downstream keys.
 - Every agent_task prompt must ask for JSON-only output matching its result_contract.
+- Use provider/model only when requested: only include provider and model fields when the user explicitly asks for provider/model routing; otherwise omit them so the profile defaults apply.
+- If provider/model routing is requested, set provider and model on each affected agent_task cell independently.
 - Prefer simple graphs, no unrequested flexibility.
 - Use lowercase snake_case node ids."""
 
