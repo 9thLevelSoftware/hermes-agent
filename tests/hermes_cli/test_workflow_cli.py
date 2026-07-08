@@ -176,6 +176,43 @@ def test_deploy_then_list_and_show_json(workflow_home, tmp_path, capsys):
     assert payload["spec"]["edges"] == [{"from": "start", "to": "done"}]
 
 
+def test_deploy_show_preserves_agent_provider_model_fields(
+    workflow_home, tmp_path, capsys
+):
+    spec_path = tmp_path / "routed.yaml"
+    spec_path.write_text(
+        """
+id: routed_review
+name: Routed Review
+version: 1
+triggers:
+  - type: manual
+    id: manual
+nodes:
+  review:
+    type: agent_task
+    profile: reviewer
+    provider: openai-codex
+    model: gpt-5.5
+    prompt: 'Return JSON only: {"ok": true}'
+    result_contract:
+      ok: boolean
+edges: []
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    assert _run(["deploy", str(spec_path)], capsys)[0] == 0
+    rc, out, err = _run(["show", "routed_review", "--json"], capsys)
+
+    assert rc == 0
+    assert err == ""
+    payload = json.loads(out)
+    node = payload["spec"]["nodes"]["review"]
+    assert node["provider"] == "openai-codex"
+    assert node["model"] == "gpt-5.5"
+
+
 def test_run_input_creates_execution_and_lists_it(workflow_home, tmp_path, capsys):
     spec_path = _write_workflow(tmp_path / "workflow.yaml")
     input_path = tmp_path / "input.json"
