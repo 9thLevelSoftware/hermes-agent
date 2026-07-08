@@ -1397,7 +1397,7 @@
         setSelectedExecution(null);
         setEvents([]);
         setNodeRuns([]);
-        updateEditorText(EMPTY_WORKFLOW_TEXT);
+        updateEditorText(specToEditorText(newWorkflowSpec("Untitled Workflow")));
         setStatus("Deleted workflow " + safeString(workflowId));
         return Promise.all([loadDefinitions(), loadExecutions()]);
       }).catch(fail).finally(function () { setDeleting(false); });
