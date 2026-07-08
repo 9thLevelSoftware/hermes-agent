@@ -117,6 +117,15 @@ def test_workflow_dashboard_blocks_trigger_edges_that_backend_rejects() -> None:
     assert "if (isTriggerSource(spec, connection.source))" in text
 
 
+def test_workflow_dashboard_persists_node_positions() -> None:
+    text = BUNDLE.read_text(encoding="utf-8")
+    assert "function buildFlowNodes" in text
+    assert "nodePositions" in text
+    assert "setNodePositions" in text
+    assert "onNodeDragStop" in text or "onNodesChange" in text
+    assert "posMap[id]" in text or "posMap[" in text or "nodePositions[id]" in text or "nodePositions[" in text
+
+
 def test_workflow_dashboard_supports_drag_from_palette_to_canvas() -> None:
     text = BUNDLE.read_text(encoding="utf-8")
     assert "draggable: true" in text

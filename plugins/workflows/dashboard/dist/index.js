@@ -600,14 +600,17 @@
     fail: makeWorkflowNode("fail"),
   };
 
-  function buildFlowNodes(spec, statuses, selectedNode, onSelect) {
+  function buildFlowNodes(spec, statuses, selectedNode, onSelect, nodePositions) {
+    var posMap = nodePositions || {};
     return graphNodeList(spec).map(function (node, index) {
       const id = node.id || node.name || "node_" + (index + 1);
       const kind = NODE_TYPES[node.type] ? node.type : "pass";
+      const savedPos = posMap[id];
+      const pos = savedPos || { x: (index % 3) * 250, y: Math.floor(index / 3) * 155 };
       return {
         id: id,
         type: kind,
-        position: { x: (index % 3) * 250, y: Math.floor(index / 3) * 155 },
+        position: pos,
         className: "hermes-workflows-rf-node-shell is-status-" + classSafe(statuses[id] || "idle") + (selectedNode && selectedNode.id === id ? " is-selected" : ""),
         data: { id: id, node: node, status: statuses[id] || "idle", onSelect: onSelect },
       };
@@ -994,6 +997,9 @@
     const stateIsDragOver = useState(false);
     const isDragOver = stateIsDragOver[0];
     const setIsDragOver = stateIsDragOver[1];
+    const stateNodePositions = useState({});
+    const nodePositions = stateNodePositions[0];
+    const setNodePositions = stateNodePositions[1];
     const statePromptAssistantOpen = useState(false);
     const promptAssistantOpen = statePromptAssistantOpen[0];
     const setPromptAssistantOpen = statePromptAssistantOpen[1];
@@ -1324,9 +1330,9 @@
     useEffect(function () {
       const spec = activeSpec();
       const statuses = statusByNode(events);
-      setFlowNodes(spec ? buildFlowNodes(spec, statuses, selectedNode, selectNodeForInspector) : []);
+      setFlowNodes(spec ? buildFlowNodes(spec, statuses, selectedNode, selectNodeForInspector, nodePositions) : []);
       setFlowEdges(spec ? buildFlowEdges(spec) : []);
-    }, [draftSpec, editorText, events, selectedNode]);
+    }, [draftSpec, editorText, events, selectedNode, nodePositions]);
 
     useEffect(function () {
       if (!error && !status) return undefined;
@@ -2474,7 +2480,18 @@
               onNodeClick: function (_, node) {
                 if (node && node.data && node.data.node) selectNodeForInspector(node.data.node);
               },
-              onNodesChange: applyNodeChanges ? function (changes) { setFlowNodes(applyNodeChanges(changes, flowNodes)); } : undefined,
+              onNodesChange: applyNodeChanges ? function (changes) {
+                setFlowNodes(applyNodeChanges(changes, flowNodes));
+                changes.forEach(function (change) {
+                  if (change.type === "position" && change.position && change.dragging === false) {
+                    setNodePositions(function (prev) {
+                      var next = Object.assign({}, prev);
+                      next[change.id] = change.position;
+                      return next;
+                    });
+                  }
+                });
+              } : undefined,
               onEdgesChange: applyEdgeChanges ? function (changes) { setFlowEdges(applyEdgeChanges(changes, flowEdges)); } : undefined,
               onConnect: addEdge ? function (connection) {
                 const spec = activeSpec();
