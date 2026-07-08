@@ -216,6 +216,7 @@ def _create_or_get_agent_task(
             goal_max_turns=node.goal_max_turns,
             workflow_template_id=spec.id,
             current_step_key=node_id,
+            provider_override=node.provider_override,
             model_override=node.model_override,
             idempotency_key=f"workflow:{execution_id}:{node_id}",
         )
@@ -248,6 +249,10 @@ def _validate_result_contract(output: Any, contract: dict[str, Any]) -> list[str
             errors.append(f"result key {key} must be number")
         elif expected == "boolean" and not isinstance(value, bool):
             errors.append(f"result key {key} must be boolean")
+        elif expected == "array" and not isinstance(value, list):
+            errors.append(f"result key {key} must be array")
+        elif expected == "object" and not isinstance(value, dict):
+            errors.append(f"result key {key} must be object")
         elif isinstance(expected, str) and "|" in expected:
             allowed = {part.strip() for part in expected.split("|") if part.strip()}
             actual = "true" if value is True else "false" if value is False else str(value)

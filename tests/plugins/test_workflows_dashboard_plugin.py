@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -25,6 +27,14 @@ PASS_SPEC = {
     "version": 1,
     "triggers": [{"type": "manual", "id": "manual"}],
     "nodes": {"start": {"type": "pass", "output": {"ok": True}}},
+}
+
+UNSUPPORTED_SPEC = {
+    "id": "unsupported_dashboard_demo",
+    "name": "Unsupported Dashboard Demo",
+    "version": 1,
+    "triggers": [{"type": "manual", "id": "manual"}],
+    "nodes": {"start": {"type": "send_message", "output": {"text": "hi"}}},
 }
 
 WAIT_SPEC = {
@@ -76,6 +86,23 @@ def _deploy(client: TestClient, spec: dict = PASS_SPEC) -> dict:
     return r.json()["definition"]
 
 
+def test_dashboard_deploy_auto_bumps_changed_same_version_specs(client):
+    first = _deploy(client, PASS_SPEC)
+    assert first["version"] == 1
+
+    changed = copy.deepcopy(PASS_SPEC)
+    changed["name"] = "Dashboard Demo Updated"
+    changed["nodes"]["start"]["output"] = {"message": "updated"}
+    r = client.post("/api/plugins/workflows/definitions/deploy", json={"spec": changed})
+
+    assert r.status_code == 200, r.text
+    definition = r.json()["definition"]
+    assert definition["workflow_id"] == PASS_SPEC["id"]
+    assert definition["version"] == 2
+    assert definition["spec"]["version"] == 2
+    assert definition["spec"]["nodes"]["start"]["output"] == {"message": "updated"}
+
+
 def _assert_pass_spec(spec: dict) -> None:
     assert spec["id"] == PASS_SPEC["id"]
     assert spec["name"] == PASS_SPEC["name"]
@@ -97,6 +124,8 @@ def test_prompt_assistant_drafts_text_prompt(client):
                 "reason": "string",
             },
             "constraints": ["Return JSON only", "Mention required changes if any"],
+            "provider": "openai-codex",
+            "model": "gpt-5.5",
         },
     )
 
@@ -106,7 +135,76 @@ def test_prompt_assistant_drafts_text_prompt(client):
     assert "Review code changes before merge" in body["prompt_text"]
     assert "${ input.repo }" in body["prompt_text"]
     assert "verdict" in body["prompt_text"]
+    assert "openai-codex" in body["prompt_text"]
+    assert "gpt-5.5" in body["prompt_text"]
     assert body["result_contract"]["verdict"] == "approved|changes_requested"
+
+
+def test_agent_routing_options_endpoint_lists_profiles_and_models(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    class Profile:
+        def __init__(self, name, provider, model):
+            self.name = name
+            self.provider = provider
+            self.model = model
+            self.description = ""
+            self.is_default = name == "default"
+
+    profiles_mod = SimpleNamespace(
+        list_profiles=lambda: [
+            Profile("default", "xiaomi-token-plan", "mimo-vl-7b"),
+            Profile("reviewer", "openai-codex", "gpt-5.5"),
+        ]
+    )
+    picker_context = object()
+
+    def build_models_payload(*args, **kwargs):
+        assert args == (picker_context,)
+        assert kwargs == {
+            "include_unconfigured": True,
+            "picker_hints": True,
+            "canonical_order": True,
+            "probe_custom_providers": False,
+            "max_models": 500,
+        }
+        return {
+            "provider": "xiaomi-token-plan",
+            "model": "mimo-vl-7b",
+            "providers": [
+                {"slug": "xiaomi-token-plan", "label": "Xiaomi", "models": ["mimo-vl-7b"]},
+                {
+                    "slug": "openai-codex",
+                    "label": "OpenAI Codex",
+                    "models": ["gpt-5.5"],
+                    "api_key": "SHOULD_NOT_LEAK",
+                    "authorization": "SHOULD_NOT_LEAK",
+                    "token": "SHOULD_NOT_LEAK",
+                    "warning": "paste OPENAI_API_KEY to activate",
+                },
+            ],
+        }
+
+    inventory_mod = SimpleNamespace(
+        load_picker_context=lambda: picker_context,
+        build_models_payload=build_models_payload,
+    )
+    monkeypatch.setattr(plugin, "profiles_mod", profiles_mod, raising=False)
+    monkeypatch.setattr(plugin, "inventory_mod", inventory_mod, raising=False)
+
+    r = client.get("/api/plugins/workflows/agent-routing-options")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["profiles"][0]["name"] == "default"
+    assert body["profiles"][1]["name"] == "reviewer"
+    assert body["providers"][1]["slug"] == "openai-codex"
+    assert body["providers"][1]["models"] == ["gpt-5.5"]
+    text = r.text.lower()
+    assert "api_key" not in text
+    assert "authorization" not in text
+    assert '"token"' not in text
+    assert "should_not_leak" not in text
 
 
 def test_capabilities_endpoint_lists_implemented_and_unsupported_primitives(client):
@@ -333,10 +431,31 @@ def test_definition_draft_endpoint_redacts_unexpected_runtime_errors(client, mon
 
     r = client.post("/api/plugins/workflows/definitions/draft", json={"goal": "Build demo"})
 
-    assert r.status_code == 500
-    assert r.json()["detail"] == "workflow assistant failed"
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert detail["code"] == "workflow_assistant_runtime_error"
+    assert "Check workflow assistant provider/model configuration" in detail["hint"]
     assert "secret" not in r.text
     assert "abc123" not in r.text
+
+
+def test_definition_draft_endpoint_returns_validation_hint(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    def fake_draft(goal):
+        raise plugin.workflows_assistant.AssistantValidationError(
+            "assistant draft failed validation (invalid JSON)"
+        )
+
+    monkeypatch.setattr(plugin.workflows_assistant, "draft_workflow_with_default_runner", fake_draft)
+
+    r = client.post("/api/plugins/workflows/definitions/draft", json={"goal": "draft this"})
+
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert detail["code"] == "workflow_assistant_validation_error"
+    assert "Advanced YAML" in detail["hint"]
+    assert "draft this" not in r.text
 
 
 def test_definition_refine_endpoint_uses_existing_spec(client, monkeypatch):
@@ -421,10 +540,34 @@ def test_definition_refine_endpoint_redacts_unexpected_runtime_errors(client, mo
         json={"spec": PASS_SPEC, "instruction": "Rename it"},
     )
 
-    assert r.status_code == 500
-    assert r.json()["detail"] == "workflow assistant failed"
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert detail["code"] == "workflow_assistant_runtime_error"
+    assert "Check workflow assistant provider/model configuration" in detail["hint"]
     assert "secret" not in r.text
     assert "abc123" not in r.text
+
+
+def test_definition_refine_endpoint_returns_validation_hint(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    def fake_refine(spec, instruction):
+        raise plugin.workflows_assistant.AssistantValidationError(
+            "assistant draft failed validation (unsupported workflow primitive)"
+        )
+
+    monkeypatch.setattr(plugin.workflows_assistant, "refine_workflow_with_default_runner", fake_refine)
+
+    r = client.post(
+        "/api/plugins/workflows/definitions/refine",
+        json={"spec": PASS_SPEC, "instruction": "Rename it"},
+    )
+
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert detail["code"] == "workflow_assistant_validation_error"
+    assert "Advanced YAML" in detail["hint"]
+    assert "Rename it" not in r.text
 
 
 def test_manifest_points_to_plugin_api():
@@ -583,6 +726,21 @@ def test_dashboard_bundle_preserves_selected_definition_version():
     assert "loadDefinition(definition.workflow_id, definition.version)" in definition_list
 
 
+def test_dashboard_validate_keeps_draft_unrunnable_until_deploy():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    validate = bundle[
+        bundle.index("function validateDefinition") : bundle.index("function deployDefinition")
+    ]
+    topbar = bundle[
+        bundle.index("function renderTopBar") : bundle.index("function renderSidebar")
+    ]
+
+    assert "setSelectedDefinition" not in validate
+    assert "updateEditorText(specToEditorText(definition.spec))" in validate
+    assert "var persisted = !!(selectedDefinition && workflowIdForDefinition(selectedDefinition)" in topbar
+    assert "persisted ? h(\"button\", { type: \"button\", disabled: running, onClick: runWorkflow }" in topbar
+
+
 def test_dashboard_bundle_runs_selected_or_active_definition_version():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
     selected_run_version = bundle[
@@ -622,7 +780,16 @@ def _dashboard_helper_js() -> str:
     kind_end = bundle.index("const EXAMPLE_DEFINITION", kind_start)
     start = bundle.index("function asArray")
     end = bundle.index("function statusClass", start)
-    return bundle[kind_start:kind_end] + "\n" + bundle[start:end]
+    # Include editor helper functions used by UI-only builder tests.
+    editor_start = bundle.index("function cleanedNodeForSpec")
+    editor_end = bundle.index("function WorkflowsPage", editor_start)
+    return (
+        bundle[kind_start:kind_end]
+        + "\n"
+        + bundle[start:end]
+        + "\n"
+        + bundle[editor_start:editor_end]
+    )
 
 
 def _run_dashboard_function(function_name: str, args):
@@ -688,6 +855,68 @@ def _run_validation_checklist(spec, capabilities=None):
     if capabilities is not None:
         args.append(capabilities)
     return _run_dashboard_function("validationChecklist", args)
+
+
+def test_dashboard_ui_builder_helpers_create_add_connect_delete_cells_without_json():
+    spec = _run_dashboard_function("newWorkflowSpec", ["Blank Slate Demo"])
+    assert spec["id"] == "blank_slate_demo"
+    assert spec["triggers"] == [{"id": "manual", "type": "manual"}]
+    assert spec["nodes"] == {}
+
+    spec = _run_dashboard_function("addSpecNodeAfter", [spec, "review", "agent_task", ""])
+    assert spec["nodes"]["review"]["type"] == "agent_task"
+    assert spec["nodes"]["review"]["profile"] == "default"
+    assert spec["nodes"]["review"]["prompt"]
+    assert spec["nodes"]["review"]["result_contract"]
+    assert spec["edges"] == []
+
+    spec = _run_dashboard_function("addSpecNodeAfter", [spec, "done", "pass", "review"])
+    assert spec["nodes"]["done"]["type"] == "pass"
+    assert {"from": "review", "to": "done"} in spec["edges"]
+
+    renamed = _run_dashboard_function("upsertSpecNode", [spec, "done", {"id": "finished", "type": "pass"}])
+    assert "finished" in renamed["nodes"]
+    assert "done" not in renamed["nodes"]
+    assert {"from": "review", "to": "finished"} in renamed["edges"]
+    assert all(item["ok"] for item in _run_validation_checklist(renamed))
+
+    spec = _run_dashboard_function("removeSpecNode", [spec, "review"])
+    assert "review" not in spec["nodes"]
+    assert spec["edges"] == []
+
+
+def test_dashboard_ui_builder_helpers_add_schedule_trigger_and_switch_branch_edges():
+    spec = _run_dashboard_function("newWorkflowSpec", ["Branch Demo"])
+    spec = _run_dashboard_function("addSpecTrigger", [spec, "weekday", "schedule", "0 9 * * *"])
+    assert {"id": "weekday", "type": "schedule", "schedule": "0 9 * * *"} in spec["triggers"]
+
+    spec = _run_dashboard_function("addSpecNodeAfter", [spec, "route", "switch", ""])
+    spec = _run_dashboard_function("addSpecNodeAfter", [spec, "approved", "pass", "route.default"])
+    spec = _run_dashboard_function("addSwitchCaseToSpec", [spec, "route", "approved", "$.input.status", "approved"])
+    spec = _run_dashboard_function("upsertSpecEdge", [spec, "route.approved", "approved"])
+    assert {"from": "route.default", "to": "approved"} in spec["edges"]
+    assert {"from": "route.approved", "to": "approved"} in spec["edges"]
+    assert {"name": "approved", "when": {"op": "eq", "left": {"path": "$.input.status"}, "right": "approved"}} in spec["nodes"]["route"]["cases"]
+    checklist = _run_validation_checklist(spec)
+    assert all(item["ok"] for item in checklist), checklist
+
+
+def test_dashboard_cleaned_node_removes_agent_only_fields_when_switching_types():
+    clean = _run_dashboard_function(
+        "cleanedNodeForSpec",
+        [
+            {
+                "id": "review",
+                "type": "pass",
+                "profile": "reviewer",
+                "provider": "openai-codex",
+                "model": "gpt-5.5",
+                "result_contract": {"ok": "boolean"},
+                "prompt": "notes",
+            }
+        ],
+    )
+    assert clean == {"id": "review", "type": "pass", "prompt": "notes"}
 
 
 def test_dashboard_validation_checklist_accepts_minimal_valid_spec():
@@ -1411,11 +1640,11 @@ def test_dashboard_bundle_is_prompt_first_not_yaml_first():
     assert "Use Kanban for one-off work queues" in bundle
     assert "Advanced YAML" in bundle
     assert "Validate / deploy definition" not in bundle
-    assert render_tree.index("renderGoalBuilder()") < render_tree.index(
-        'className: "hermes-workflows-grid"'
+    # In the 3-zone layout, goal builder is in the sidebar which renders before the canvas
+    assert render_tree.index("renderSidebar()") < render_tree.index(
+        "renderBottomPanel()"
     )
-    assert render_tree.index("renderGoalBuilder()") < render_tree.index("Workflow list")
-    assert bundle.index("What do you want to automate?") < bundle.index("Workflow list")
+    assert bundle.index("New workflow") < bundle.index("renderBuilderToolbar")
 
 
 def test_dashboard_bundle_contains_draft_review_and_refine_ui():
@@ -1466,7 +1695,8 @@ def test_dashboard_bundle_wires_draft_refine_before_advanced_yaml():
     assert "/definitions/refine" in bundle
     assert 'setRefineText("")' in bundle
     assert "nodeSummaryRows" in bundle
-    assert render_tree.index("renderDraftReview()") < render_tree.index(
+    # In the 3-zone layout, draft review is in the bottom panel which renders before advanced YAML
+    assert render_tree.index("renderBottomPanel()") < render_tree.index(
         "renderAdvancedYaml()"
     )
 
@@ -1671,11 +1901,8 @@ def test_dashboard_bundle_contains_workflow_mvp_api_and_ui_markers():
         assert marker in bundle
 
     for marker in [
-        "Workflow list",
         "Advanced YAML",
         "Run test",
-        "Execution list",
-        "Execution detail timeline",
         "Visual workflow editor",
         "hermes-workflows-list",
         "hermes-workflows-editor",
@@ -1719,6 +1946,47 @@ def test_validate_deploy_list_show_roundtrip(client):
     assert shown["workflow_id"] == "dashboard_demo"
     assert shown["version"] == 1
     _assert_pass_spec(shown["spec"])
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/plugins/workflows/definitions/validate",
+        "/api/plugins/workflows/definitions/deploy",
+    ],
+)
+def test_definition_validate_and_deploy_reject_unsupported_primitives(client, path):
+    response = client.post(path, json={"spec": UNSUPPORTED_SPEC})
+
+    assert response.status_code == 400
+    assert "unsupported node type: send_message on node start" in str(response.json()["detail"])
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/plugins/workflows/definitions/validate", "x" * 1_100_000),
+        ("/api/plugins/workflows/definitions/deploy", "x" * 1_100_000),
+        ("/api/plugins/workflows/definitions/dashboard_demo/run", "x" * 1_100_000),
+        ("/api/plugins/workflows/definitions/draft", {"goal": "x" * 1_100_000}),
+        (
+            "/api/plugins/workflows/definitions/refine",
+            {"instruction": "x" * 1_100_000, "spec": PASS_SPEC},
+        ),
+    ],
+)
+def test_workflow_plugin_rejects_oversized_bodies(client, path, payload):
+    if isinstance(payload, str):
+        response = client.post(
+            path,
+            content=payload,
+            headers={"content-type": "application/x-yaml"},
+        )
+    else:
+        response = client.post(path, json=payload)
+
+    assert response.status_code == 413
+    assert response.json()["detail"]["code"] == "workflow_request_too_large"
 
 
 def test_deploy_endpoint_returns_deployed_version_not_latest(client):
@@ -1782,6 +2050,54 @@ def test_run_endpoint_creates_execution_and_list_show_return_it(client):
     ).json()["execution"]
     assert shown["execution_id"] == execution["execution_id"]
     assert shown["input"] == {"value": 7}
+
+
+def test_execution_detail_redacts_secret_like_values_for_dashboard_display(client):
+    secret_spec = {
+        "id": "dashboard_secret_demo",
+        "name": "Dashboard Secret Demo",
+        "version": 1,
+        "triggers": [{"type": "manual", "id": "manual"}],
+        "nodes": {
+            "start": {
+                "type": "pass",
+                "output": {
+                    "api_key": "${ input.api_key }",
+                    "topic": "${ input.topic }",
+                },
+            }
+        },
+    }
+    _deploy(client, secret_spec)
+
+    r = client.post(
+        "/api/plugins/workflows/definitions/dashboard_secret_demo/run",
+        json={"input": {"api_key": "secret-value", "topic": "safe-topic"}},
+    )
+    assert r.status_code == 200, r.text
+    execution = r.json()["execution"]
+    execution_id = execution["execution_id"]
+
+    assert execution["input"] == {"api_key": "[REDACTED]", "topic": "safe-topic"}
+    assert "secret-value" not in r.text
+
+    shown = client.get(f"/api/plugins/workflows/executions/{execution_id}").json()["execution"]
+    assert shown["input"] == {"api_key": "[REDACTED]", "topic": "safe-topic"}
+    assert shown["context"]["input"] == {"api_key": "[REDACTED]", "topic": "safe-topic"}
+
+    node_runs = client.get(
+        f"/api/plugins/workflows/executions/{execution_id}/node-runs"
+    ).json()["node_runs"]
+    start_run = next(run for run in node_runs if run["node_id"] == "start")
+    assert start_run["output"] == {"api_key": "[REDACTED]", "topic": "safe-topic"}
+
+    events = client.get(f"/api/plugins/workflows/executions/{execution_id}/events").json()["events"]
+    assert "secret-value" not in json.dumps(events)
+    assert "safe-topic" in json.dumps(events)
+
+    with wfdb.connect() as conn:
+        stored = wfdb.get_execution(conn, execution_id)
+    assert stored.input == {"api_key": "secret-value", "topic": "safe-topic"}
 
 
 def test_execution_node_runs_endpoint_returns_workflow_native_state(client):

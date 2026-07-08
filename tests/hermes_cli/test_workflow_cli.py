@@ -78,6 +78,33 @@ def test_validate_reports_bad_edge_target(workflow_home, tmp_path, capsys):
     assert "Traceback" not in err
 
 
+def test_validate_rejects_unsupported_send_message(workflow_home, tmp_path, capsys):
+    spec_path = tmp_path / "unsupported.yaml"
+    spec_path.write_text(
+        """
+id: unsupported_send_message_demo
+name: Unsupported Send Message Demo
+version: 1
+triggers:
+  - type: manual
+nodes:
+  start:
+    type: send_message
+    output:
+      text: hi
+edges: []
+""".strip(),
+        encoding="utf-8",
+    )
+
+    rc, out, err = _run(["validate", str(spec_path)], capsys)
+
+    assert rc == 1
+    assert out == ""
+    assert "unsupported node type: send_message on node start" in err
+    assert "Traceback" not in err
+
+
 def test_main_workflow_validate_bad_edge_exits_without_traceback(
     workflow_home,
     tmp_path,
@@ -147,6 +174,43 @@ def test_deploy_then_list_and_show_json(workflow_home, tmp_path, capsys):
     assert payload["workflow_id"] == "code-change-review"
     assert payload["spec"]["id"] == "code-change-review"
     assert payload["spec"]["edges"] == [{"from": "start", "to": "done"}]
+
+
+def test_deploy_show_preserves_agent_provider_model_fields(
+    workflow_home, tmp_path, capsys
+):
+    spec_path = tmp_path / "routed.yaml"
+    spec_path.write_text(
+        """
+id: routed_review
+name: Routed Review
+version: 1
+triggers:
+  - type: manual
+    id: manual
+nodes:
+  review:
+    type: agent_task
+    profile: reviewer
+    provider: openai-codex
+    model: gpt-5.5
+    prompt: 'Return JSON only: {"ok": true}'
+    result_contract:
+      ok: boolean
+edges: []
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    assert _run(["deploy", str(spec_path)], capsys)[0] == 0
+    rc, out, err = _run(["show", "routed_review", "--json"], capsys)
+
+    assert rc == 0
+    assert err == ""
+    payload = json.loads(out)
+    node = payload["spec"]["nodes"]["review"]
+    assert node["provider"] == "openai-codex"
+    assert node["model"] == "gpt-5.5"
 
 
 def test_run_input_creates_execution_and_lists_it(workflow_home, tmp_path, capsys):

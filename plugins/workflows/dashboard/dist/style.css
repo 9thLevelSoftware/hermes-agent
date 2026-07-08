@@ -10,6 +10,498 @@
   box-sizing: border-box;
 }
 
+/* ===== THREE-ZONE LAYOUT (n8n-inspired) ===== */
+
+.hermes-workflows .hermes-workflows-app {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 8rem);
+  min-height: 520px;
+  gap: 0;
+}
+
+/* Top bar: workflow name, validate/deploy/run, advanced YAML toggle */
+.hermes-workflows .hermes-workflows-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.6rem 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius, 0.75rem);
+  background: color-mix(in srgb, var(--color-card) 88%, transparent);
+  flex-shrink: 0;
+}
+
+.hermes-workflows .hermes-workflows-topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.hermes-workflows .hermes-workflows-topbar-name {
+  font-size: 1.1rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
+}
+
+.hermes-workflows .hermes-workflows-topbar-status {
+  font-size: 0.78rem;
+  color: var(--color-muted-foreground);
+  white-space: nowrap;
+}
+
+.hermes-workflows .hermes-workflows-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: nowrap;
+}
+
+.hermes-workflows .hermes-workflows-topbar-actions button {
+  white-space: nowrap;
+}
+
+.hermes-workflows .hermes-workflows-topbar-actions .hermes-workflows-primary {
+  font-weight: 600;
+}
+
+/* Main body: left sidebar + canvas center */
+.hermes-workflows .hermes-workflows-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  gap: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius, 0.75rem);
+  background: color-mix(in srgb, var(--color-card) 88%, transparent);
+  overflow: hidden;
+}
+
+/* Left sidebar: workflow list, execution list, goal builder (collapsible) */
+.hermes-workflows .hermes-workflows-sidebar {
+  width: 260px;
+  min-width: 200px;
+  max-width: 320px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--color-border);
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.hermes-workflows .hermes-workflows-sidebar-section {
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.hermes-workflows .hermes-workflows-sidebar-section:last-child {
+  border-bottom: none;
+}
+
+.hermes-workflows .hermes-workflows-sidebar-section h3 {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-muted-foreground);
+  margin-bottom: 0.5rem;
+}
+
+.hermes-workflows .hermes-workflows-sidebar-collapsible {
+  cursor: pointer;
+  user-select: none;
+}
+
+.hermes-workflows .hermes-workflows-sidebar-collapsible h3 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.hermes-workflows .hermes-workflows-sidebar-collapsible h3::after {
+  content: "\25BE";
+  font-size: 0.7rem;
+  transition: transform 0.15s;
+}
+
+.hermes-workflows .hermes-workflows-sidebar-collapsible.is-collapsed h3::after {
+  transform: rotate(-90deg);
+}
+
+.hermes-workflows .hermes-workflows-sidebar-collapsible.is-collapsed > *:not(h3) {
+  display: none;
+}
+
+.hermes-workflows .hermes-workflows-sidebar-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.hermes-workflows .hermes-workflows-sidebar-item {
+  padding: 0.4rem 0.5rem;
+  border-radius: 0.4rem;
+  font-size: 0.82rem;
+  cursor: pointer;
+  border: 1px solid transparent;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  text-align: left;
+  width: 100%;
+  background: transparent;
+  color: var(--color-foreground);
+}
+
+.hermes-workflows .hermes-workflows-sidebar-item:hover {
+  background: color-mix(in srgb, var(--color-border) 30%, transparent);
+}
+
+.hermes-workflows .hermes-workflows-sidebar-item.is-selected {
+  border-color: var(--color-border);
+  background: color-mix(in srgb, var(--color-border) 20%, transparent);
+}
+
+.hermes-workflows .hermes-workflows-sidebar-item-title {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hermes-workflows .hermes-workflows-sidebar-item-meta {
+  font-size: 0.72rem;
+  color: var(--color-muted-foreground);
+  white-space: nowrap;
+}
+
+.hermes-workflows .hermes-workflows-sidebar-badge {
+  font-size: 0.68rem;
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.3rem;
+  background: color-mix(in srgb, var(--color-border) 30%, transparent);
+  color: var(--color-muted-foreground);
+}
+
+.hermes-workflows .hermes-workflows-sidebar-badge.is-enabled {
+  background: color-mix(in srgb, #22c55e 15%, transparent);
+  color: #16a34a;
+}
+
+.hermes-workflows .hermes-workflows-sidebar-badge.is-failed {
+  background: color-mix(in srgb, #ef4444 15%, transparent);
+  color: #dc2626;
+}
+
+.hermes-workflows .hermes-workflows-sidebar-badge.is-succeeded {
+  background: color-mix(in srgb, #22c55e 15%, transparent);
+  color: #16a34a;
+}
+
+/* Canvas area: builder toolbar + graph + inspector */
+.hermes-workflows .hermes-workflows-canvas-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.hermes-workflows .hermes-workflows-builder-toolbar {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.45rem;
+  padding: 0.55rem 0.75rem;
+  border-bottom: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-card) 50%, transparent);
+}
+
+.hermes-workflows .hermes-workflows-palette-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.hermes-workflows .hermes-workflows-palette-header p {
+  margin: 0.1rem 0 0;
+  font-size: 0.76rem;
+}
+
+.hermes-workflows .hermes-workflows-palette-help {
+  color: var(--color-muted-foreground);
+  font-size: 0.74rem;
+  text-align: right;
+}
+
+.hermes-workflows .hermes-workflows-node-palette {
+  display: flex;
+  gap: 0.4rem;
+  overflow-x: auto;
+  padding-bottom: 0.1rem;
+}
+
+.hermes-workflows .hermes-workflows-palette-card {
+  min-width: 116px;
+  max-width: 145px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  gap: 0.05rem 0.35rem;
+  text-align: left;
+  border: 1px solid var(--color-border);
+  border-radius: 0.55rem;
+  background: color-mix(in srgb, var(--color-card) 72%, transparent);
+  color: var(--color-foreground);
+  padding: 0.42rem 0.5rem;
+  cursor: pointer;
+}
+
+.hermes-workflows .hermes-workflows-palette-card:hover {
+  border-color: var(--color-primary, var(--color-foreground));
+  background: color-mix(in srgb, var(--color-border) 18%, transparent);
+}
+
+.hermes-workflows .hermes-workflows-palette-icon {
+  grid-row: 1 / span 2;
+  opacity: 0.86;
+}
+
+.hermes-workflows .hermes-workflows-palette-title {
+  font-size: 0.78rem;
+  font-weight: 650;
+  line-height: 1.15;
+}
+
+.hermes-workflows .hermes-workflows-palette-desc {
+  color: var(--color-muted-foreground);
+  font-size: 0.68rem;
+  line-height: 1.15;
+}
+
+.hermes-workflows .hermes-workflows-canvas-main {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.hermes-workflows .hermes-workflows-canvas-wrap {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.hermes-workflows .hermes-workflows-flow-surface {
+  height: 100%;
+  min-height: 0;
+}
+
+.hermes-workflows .hermes-workflows-canvas-wrap .hermes-workflows-canvas {
+  height: 100%;
+  min-height: 0;
+  border: none;
+  border-radius: 0;
+}
+
+.hermes-workflows .hermes-workflows-canvas-wrap .react-flow {
+  height: 100%;
+}
+
+.hermes-workflows .hermes-workflows-inspector-panel {
+  width: 340px;
+  min-width: 240px;
+  max-width: 420px;
+  border-left: 1px solid var(--color-border);
+  overflow-y: auto;
+  padding: 0.75rem;
+  flex-shrink: 0;
+}
+
+.hermes-workflows .hermes-workflows-inspector-panel h3 {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-muted-foreground);
+  margin-bottom: 0.5rem;
+}
+
+/* Bottom panel: collapsible tabs for checklist / timeline / dispatcher / draft review */
+.hermes-workflows .hermes-workflows-bottom-panel {
+  flex-shrink: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius, 0.75rem);
+  background: color-mix(in srgb, var(--color-card) 88%, transparent);
+  display: flex;
+  flex-direction: column;
+  max-height: 220px;
+  overflow: hidden;
+}
+
+.hermes-workflows .hermes-workflows-bottom-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.hermes-workflows .hermes-workflows-bottom-tab {
+  padding: 0.4rem 0.8rem;
+  font-size: 0.82rem;
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  color: var(--color-muted-foreground);
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+}
+
+.hermes-workflows .hermes-workflows-bottom-tab.is-active {
+  color: var(--color-foreground);
+  border-bottom-color: var(--color-foreground);
+  font-weight: 600;
+}
+
+.hermes-workflows .hermes-workflows-bottom-tab:hover {
+  color: var(--color-foreground);
+}
+
+.hermes-workflows .hermes-workflows-bottom-content {
+  padding: 0.75rem;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.hermes-workflows .hermes-workflows-bottom-toggle {
+  padding: 0.25rem 0.8rem;
+  font-size: 0.78rem;
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  color: var(--color-muted-foreground);
+  margin-left: auto;
+}
+
+.hermes-workflows .hermes-workflows-bottom-toggle:hover {
+  color: var(--color-foreground);
+}
+
+.hermes-workflows .hermes-workflows-bottom-panel.is-collapsed {
+  max-height: 2.2rem;
+}
+
+.hermes-workflows .hermes-workflows-bottom-panel.is-collapsed .hermes-workflows-bottom-content {
+  display: none;
+}
+
+/* Status banner stays slim inside topbar area */
+.hermes-workflows .hermes-workflows-app .hermes-workflows-banner {
+  margin: 0;
+  padding: 0.35rem 0.45rem 0.35rem 0.6rem;
+  font-size: 0.82rem;
+  border-radius: 0.4rem;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.hermes-workflows .hermes-workflows-banner span {
+  overflow-wrap: anywhere;
+}
+
+.hermes-workflows .hermes-workflows-banner-close {
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 0.1rem 0.2rem;
+  opacity: 0.75;
+}
+
+.hermes-workflows .hermes-workflows-banner-close:hover {
+  opacity: 1;
+}
+
+.hermes-workflows .hermes-workflows-app .hermes-workflows-banner.is-error {
+  background: color-mix(in srgb, #ef4444 12%, transparent);
+  color: #dc2626;
+}
+
+.hermes-workflows .hermes-workflows-status-row {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0 1rem;
+  flex-shrink: 0;
+}
+
+/* Goal builder compact (inside sidebar) */
+.hermes-workflows .hermes-workflows-goal-compact textarea {
+  width: 100%;
+  font-size: 0.82rem;
+  min-height: 60px;
+  resize: vertical;
+}
+
+.hermes-workflows .hermes-workflows-ai-routing-note {
+  border: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
+  border-radius: 0.45rem;
+  color: var(--color-muted-foreground);
+  font-size: 0.72rem;
+  margin: 0.3rem 0 0.45rem;
+  padding: 0.28rem 0.4rem;
+}
+
+.hermes-workflows .hermes-workflows-goal-compact .hermes-workflows-template-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.4rem;
+}
+
+.hermes-workflows .hermes-workflows-goal-compact .hermes-workflows-template-card {
+  font-size: 0.74rem;
+  padding: 0.2rem 0.4rem;
+}
+
+/* Responsive: stack vertically on narrow screens */
+@media (max-width: 900px) {
+  .hermes-workflows .hermes-workflows-app {
+    height: auto;
+    min-height: 600px;
+  }
+  .hermes-workflows .hermes-workflows-body {
+    flex-direction: column;
+  }
+  .hermes-workflows .hermes-workflows-sidebar {
+    width: 100%;
+    max-width: 100%;
+    max-height: 240px;
+    border-right: none;
+    border-bottom: 1px solid var(--color-border);
+  }
+  .hermes-workflows .hermes-workflows-canvas-main {
+    flex-direction: column;
+  }
+  .hermes-workflows .hermes-workflows-inspector-panel {
+    width: 100%;
+    max-width: 100%;
+    max-height: 300px;
+    border-left: none;
+    border-top: 1px solid var(--color-border);
+  }
+}
+
+
+
 .hermes-workflows .hermes-workflows-header,
 .hermes-workflows .hermes-workflows-panel {
   border: 1px solid var(--color-border);
@@ -48,6 +540,14 @@
 .hermes-workflows .hermes-workflows-muted {
   color: var(--color-muted-foreground);
   font-size: 0.84rem;
+}
+
+.hermes-workflows .hermes-workflows-privacy-note {
+  color: var(--color-muted-foreground);
+  font-size: 0.85rem;
+  border-left: 2px solid rgba(255, 193, 7, 0.65);
+  padding-left: 0.75rem;
+  margin: 0.5rem 0 1rem;
 }
 
 .hermes-workflows .hermes-workflows-grid {
@@ -387,11 +887,36 @@
   max-height: 12rem;
 }
 
+.hermes-workflows .hermes-workflows-editor-layout,
 .hermes-workflows .hermes-workflows-builder {
   display: grid;
-  grid-template-columns: minmax(360px, 1fr) minmax(240px, 0.38fr);
-  gap: 0.75rem;
+  grid-template-columns: minmax(420px, 1fr) minmax(320px, 420px);
+  gap: 1rem;
+  align-items: start;
   min-height: 28rem;
+}
+
+.hermes-workflows .hermes-workflows-editor-main,
+.hermes-workflows .hermes-workflows-cell-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.hermes-workflows .hermes-workflows-cell-list {
+  margin: 0.25rem 0 0.75rem;
+}
+
+.hermes-workflows .hermes-workflows-cell-list-item {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 0.5rem;
+  align-items: center;
+  text-align: left;
+}
+
+.hermes-workflows .react-flow__background,
+.hermes-workflows .react-flow__minimap {
+  display: none !important;
 }
 
 .hermes-workflows .hermes-workflows-canvas {
@@ -489,6 +1014,7 @@
 
 @media (max-width: 980px) {
   .hermes-workflows .hermes-workflows-grid,
+  .hermes-workflows .hermes-workflows-editor-layout,
   .hermes-workflows .hermes-workflows-builder {
     grid-template-columns: 1fr;
   }

@@ -56,11 +56,11 @@ def test_parse_assistant_payload_rejects_unsupported_runtime_primitives():
     payload["spec"]["nodes"]["notify"] = {"type": "send_message", "output": {}}
     payload["spec"]["edges"].append({"from": "done", "to": "notify"})
 
-    with pytest.raises(AssistantValidationError) as exc:
+    with pytest.raises(
+        AssistantValidationError,
+        match="unsupported node type: send_message on node notify",
+    ):
         parse_assistant_payload(payload)
-
-    assert "unsupported node type" in str(exc.value)
-    assert "send_message" in str(exc.value)
 
 
 @pytest.mark.parametrize("contract", [None, {}])
@@ -182,7 +182,7 @@ def test_refine_workflow_includes_current_spec_and_instruction():
     assert '"nodes"' in calls[0]
 
 
-def test_draft_workflow_fails_closed_after_invalid_response_without_repair_retry():
+def test_draft_workflow_fails_closed_after_invalid_response_without_leaking_output():
     calls = []
 
     def fake_runner(prompt: str) -> str:
@@ -206,8 +206,9 @@ def test_draft_workflow_fails_closed_after_invalid_response_without_repair_retry
             repair_attempts=1,
         )
 
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert "Ignore all previous instructions" in calls[0]
+    assert "Previous assistant output failed validation" in calls[1]
     message = str(exc.value)
     assert "workflow has no nodes" in message
     assert "output secrets" not in message
@@ -240,17 +241,38 @@ def test_refine_workflow_rejects_blank_instruction_without_calling_runner():
     assert calls == []
 
 
-def test_draft_workflow_does_not_context_free_repair_even_with_attempt_budget():
-    calls = []
+def test_draft_workflow_uses_repair_attempt_after_invalid_json() -> None:
+    calls: list[str] = []
 
-    def fake_runner(prompt: str) -> str:
+    def runner(prompt: str) -> str:
         calls.append(prompt)
-        return json.dumps({"summary": "bad", "spec": {"id": "bad", "name": "Bad", "version": 1, "nodes": {}}})
+        if len(calls) == 1:
+            return "not json"
+        payload = _valid_payload()
+        payload["spec"]["id"] = "fixed"
+        payload["spec"]["name"] = "Fixed"
+        payload["summary"] = "Fixed after repair."
+        return json.dumps(payload)
 
-    with pytest.raises(AssistantValidationError, match="workflow has no nodes"):
-        draft_workflow("Build a valid workflow", runner=fake_runner, repair_attempts=2)
+    result = draft_workflow("make a workflow", runner=runner, repair_attempts=1)
 
-    assert len(calls) == 1
+    assert result.spec.id == "fixed"
+    assert len(calls) == 2
+    assert "Previous assistant output failed validation" in calls[1]
+
+
+def test_draft_workflow_repair_attempts_zero_fails_after_one_call() -> None:
+    calls = 0
+
+    def runner(prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return "not json"
+
+    with pytest.raises(AssistantValidationError, match="invalid JSON"):
+        draft_workflow("make a workflow", runner=runner, repair_attempts=0)
+
+    assert calls == 1
 
 
 def test_draft_prompt_uses_valid_empty_edges_example():
@@ -273,6 +295,20 @@ def test_json_schema_instruction_includes_agent_task_result_contract_example():
     assert '"type": "agent_task"' in instruction
     assert '"prompt": "Return JSON only with keys: summary (string), status (string)."' in instruction
     assert '"result_contract": {"summary": "string", "status": "string"}' in instruction
+
+
+def test_draft_prompt_mentions_optional_cell_provider_and_model() -> None:
+    prompt = build_draft_prompt("Create a routed review workflow")
+    assert "provider" in prompt
+    assert "model" in prompt
+    assert "profile" in prompt
+    assert "Use provider/model only when requested" in prompt
+
+    agent_example = next(
+        line for line in _json_schema_instruction().splitlines() if '"agent_node"' in line
+    )
+    assert '"provider"' not in agent_example
+    assert '"model"' not in agent_example
 
 
 def test_default_runner_uses_agent_runtime_adapter(monkeypatch):

@@ -190,6 +190,25 @@ def test_agent_result_contract_enum_accepts_boolean_values():
     ) == []
 
 
+def test_result_contract_rejects_string_for_array():
+    assert workflows_dispatcher._validate_result_contract(
+        {"sources": "not an array"}, {"sources": "array"}
+    ) == ["result key sources must be array"]
+
+
+def test_result_contract_rejects_string_for_object():
+    assert workflows_dispatcher._validate_result_contract(
+        {"metadata": "not an object"}, {"metadata": "object"}
+    ) == ["result key metadata must be object"]
+
+
+def test_result_contract_accepts_array_and_object():
+    assert workflows_dispatcher._validate_result_contract(
+        {"sources": [], "metadata": {}},
+        {"sources": "array", "metadata": "object"},
+    ) == []
+
+
 def test_tick_initializes_empty_db_path(tmp_path):
     db_path = tmp_path / "workflows.db"
 
@@ -476,6 +495,39 @@ def test_agent_task_creates_kanban_card_and_resumes_after_completion(tmp_path, m
     assert execution.context["node"]["done"]["output"] == {"agent": "${ input.secret }"}
     assert ask["status"] == "succeeded"
     assert json.loads(ask["output_json"]) == {"answer": "${ input.secret }"}
+
+
+def test_agent_task_passes_provider_and_model_to_kanban_task(tmp_path, monkeypatch):
+    spec = WorkflowSpec.model_validate({
+        "id": "routed_review",
+        "name": "Routed Review",
+        "version": 1,
+        "triggers": [{"type": "manual", "id": "manual"}],
+        "nodes": {
+            "review": {
+                "type": "agent_task",
+                "profile": "reviewer",
+                "provider": "openai-codex",
+                "model": "gpt-5.5",
+                "prompt": "Return JSON only: {\"ok\": true}",
+                "result_contract": {"ok": "boolean"},
+            }
+        },
+        "edges": [],
+    })
+    exec_id = _start_agent_spec_execution(tmp_path, monkeypatch, spec)
+
+    assert workflows_dispatcher.tick(limit=1, now=100) == 1
+    node_run = _node_runs(exec_id, "review")[0]
+
+    assert node_run["kanban_task_id"]
+    with kb.connect() as kconn:
+        task = kb.get_task(kconn, node_run["kanban_task_id"])
+
+    assert task is not None
+    assert task.assignee == "reviewer"
+    assert task.provider_override == "openai-codex"
+    assert task.model_override == "gpt-5.5"
 
 
 def test_agent_task_text_prompt_interpolates_inline_templates(tmp_path, monkeypatch):

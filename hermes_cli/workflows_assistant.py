@@ -11,10 +11,7 @@ AIAgent = None
 
 from pydantic import BaseModel, Field, ValidationError
 
-from hermes_cli.workflows_capabilities import (
-    IMPLEMENTED_NODE_TYPES,
-    IMPLEMENTED_TRIGGER_TYPES,
-)
+from hermes_cli.workflows_capabilities import require_implemented_primitives
 from hermes_cli.workflows_spec import WorkflowSpec, validate_graph
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
@@ -92,15 +89,10 @@ def _json_object_candidates(text: str) -> list[dict[str, Any]]:
 
 
 def _ensure_supported_primitives(spec: WorkflowSpec) -> None:
-    errors: list[str] = []
-    for trigger in spec.triggers:
-        if trigger.type not in IMPLEMENTED_TRIGGER_TYPES:
-            errors.append(f"unsupported trigger type {trigger.type}")
-    for node_id, node in spec.nodes.items():
-        if node.type not in IMPLEMENTED_NODE_TYPES:
-            errors.append(f"unsupported node type {node.type} on node {node_id}")
-    if errors:
-        raise AssistantValidationError("; ".join(errors))
+    try:
+        require_implemented_primitives(spec)
+    except ValueError as exc:
+        raise AssistantValidationError(str(exc)) from exc
 
 
 def _ensure_agent_task_contracts(spec: WorkflowSpec) -> None:
@@ -177,6 +169,7 @@ def _json_schema_instruction() -> str:
     "edges": []
   }
 }
+Optional agent_task routing fields, only when the user explicitly asks for provider/model routing: "provider": "provider-slug", "model": "model-name".
 Do not include Markdown fences or prose outside the JSON object."""
 
 
@@ -188,6 +181,8 @@ def _assistant_rules() -> str:
 - Do not emit webhook, kanban_event, send_message, or subworkflow.
 - Every agent_task must include profile, title, text prompt, and result_contract with required downstream keys.
 - Every agent_task prompt must ask for JSON-only output matching its result_contract.
+- Use provider/model only when requested: only include provider and model fields when the user explicitly asks for provider/model routing; otherwise omit them so the profile defaults apply.
+- If provider/model routing is requested, set provider and model on each affected agent_task cell independently.
 - Prefer simple graphs, no unrequested flexibility.
 - Use lowercase snake_case node ids."""
 
@@ -282,14 +277,43 @@ def _validation_error_summary(error: AssistantValidationError) -> str:
     return "schema or graph validation failed"
 
 
+def _build_repair_prompt(
+    original_prompt: str,
+    previous_output: str,
+    error: AssistantValidationError,
+) -> str:
+    return "\n\n".join(
+        [
+            original_prompt,
+            "Previous assistant output failed validation.",
+            f"Validation error summary: {_validation_error_summary(error)}",
+            "Return a corrected JSON object only. Do not include Markdown fences or commentary.",
+            "Previous assistant output:",
+            previous_output[:6000],
+        ]
+    )
+
+
 def _call_with_repair(prompt: str, runner: Runner, repair_attempts: int) -> WorkflowDraftResult:
-    try:
-        return parse_assistant_payload(runner(prompt))
-    except AssistantValidationError as exc:
-        raise AssistantValidationError(
-            "assistant draft failed validation "
-            f"({_validation_error_summary(exc)}); revise the request or workflow and retry"
-        ) from exc
+    attempts = max(0, int(repair_attempts or 0))
+    current_prompt = prompt
+    last_error: AssistantValidationError | None = None
+
+    for attempt in range(attempts + 1):
+        output = runner(current_prompt)
+        try:
+            return parse_assistant_payload(output)
+        except AssistantValidationError as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            current_prompt = _build_repair_prompt(prompt, output, exc)
+
+    assert last_error is not None
+    raise AssistantValidationError(
+        "assistant draft failed validation "
+        f"({_validation_error_summary(last_error)}); revise the request or workflow and retry"
+    ) from last_error
 
 
 def draft_workflow(goal: str, *, runner: Runner, repair_attempts: int = 1) -> WorkflowDraftResult:

@@ -6,7 +6,7 @@ import re
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _NODE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
@@ -50,8 +50,17 @@ class WorkspaceSpec(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
 
 
+def _optional_clean_string(value: Any, name: str = "value") -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    text = value.strip()
+    return text or None
+
+
 class NodeSpec(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     type: NodeType
     output: Any = None
@@ -64,7 +73,16 @@ class NodeSpec(BaseModel):
     workspace_kind: str | None = None
     workspace_path: str | None = None
     skills: list[str] = Field(default_factory=list)
-    model_override: str | None = None
+    provider_override: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("provider", "provider_override"),
+        serialization_alias="provider",
+    )
+    model_override: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("model", "model_override"),
+        serialization_alias="model",
+    )
     max_retries: int | None = Field(default=None, ge=1)
     goal_mode: bool = False
     goal_max_turns: int | None = Field(default=None, ge=1)
@@ -72,6 +90,43 @@ class NodeSpec(BaseModel):
     catch: str | None = None
     workspace: WorkspaceSpec | None = None
     seconds: int = Field(default=0, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_conflicting_routing_aliases(cls, data: Any) -> Any:
+        if not isinstance(data, Mapping):
+            return data
+        data = dict(data)
+
+        provider = _optional_clean_string(data.get("provider"), "provider")
+        provider_override = _optional_clean_string(data.get("provider_override"), "provider_override")
+        if provider and provider_override and provider != provider_override:
+            raise ValueError("provider and provider_override must match when both are set")
+        chosen_provider = provider or provider_override
+        if chosen_provider:
+            data["provider"] = chosen_provider
+        else:
+            data.pop("provider", None)
+        data.pop("provider_override", None)
+
+        model = _optional_clean_string(data.get("model"), "model")
+        model_override = _optional_clean_string(data.get("model_override"), "model_override")
+        if model and model_override and model != model_override:
+            raise ValueError("model and model_override must match when both are set")
+        chosen_model = model or model_override
+        if chosen_model:
+            data["model"] = chosen_model
+        else:
+            data.pop("model", None)
+        data.pop("model_override", None)
+
+        return data
+
+    @model_validator(mode="after")
+    def _normalize_routing_overrides(self) -> "NodeSpec":
+        self.provider_override = _optional_clean_string(self.provider_override)
+        self.model_override = _optional_clean_string(self.model_override)
+        return self
 
 
 class EdgeSpec(BaseModel):
@@ -111,6 +166,45 @@ def _blank_prompt(value: Any) -> bool:
     if isinstance(value, (dict, list, tuple, set)):
         return len(value) == 0
     return False
+
+
+def _cycle_path(spec: WorkflowSpec) -> list[str] | None:
+    adjacency: dict[str, list[str]] = {node_id: [] for node_id in spec.nodes}
+    for edge in spec.edges:
+        source_base = edge.from_.split(".", 1)[0]
+        adjacency.setdefault(source_base, []).append(edge.to)
+    for node_id, node in spec.nodes.items():
+        if node.catch:
+            adjacency.setdefault(node_id, []).append(node.catch)
+        if node.type == "switch" and node.default:
+            adjacency.setdefault(node_id, []).append(node.default)
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    stack: list[str] = []
+
+    def visit(node_id: str) -> list[str] | None:
+        if node_id in visiting:
+            start = stack.index(node_id) if node_id in stack else 0
+            return stack[start:] + [node_id]
+        if node_id in visited:
+            return None
+        visiting.add(node_id)
+        stack.append(node_id)
+        for next_id in adjacency.get(node_id, []):
+            found = visit(next_id)
+            if found:
+                return found
+        stack.pop()
+        visiting.remove(node_id)
+        visited.add(node_id)
+        return None
+
+    for node_id in spec.nodes:
+        found = visit(node_id)
+        if found:
+            return found
+    return None
 
 
 def validate_graph(spec: WorkflowSpec) -> None:
@@ -176,6 +270,10 @@ def validate_graph(spec: WorkflowSpec) -> None:
                 raise ValueError(f"agent_task node {node_id} requires a non-blank profile")
             if _blank_prompt(node.prompt):
                 raise ValueError(f"agent_task node {node_id} requires a non-empty prompt")
+
+    cycle = _cycle_path(spec)
+    if cycle:
+        raise ValueError("workflow graph contains cycle: " + " -> ".join(cycle))
 
     if not any(node_id not in incoming_targets for node_id in node_ids):
         raise ValueError("workflow must define at least one entry node")
