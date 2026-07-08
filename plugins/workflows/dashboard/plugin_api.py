@@ -489,8 +489,20 @@ async def deploy_definition(request: Request) -> dict[str, Any]:
 
         def _deploy():
             with _connect_initialized() as conn:
-                wfdb.deploy_definition(conn, spec, created_by="dashboard")
-                return _definition_record(conn, spec.id, spec.version)
+                try:
+                    wfdb.deploy_definition(conn, spec, created_by="dashboard")
+                    return _definition_record(conn, spec.id, spec.version)
+                except ValueError as exc:
+                    if "already exists with different checksum" not in str(exc):
+                        raise
+                    versions = [
+                        record.version
+                        for record in wfdb.list_definitions(conn)
+                        if record.workflow_id == spec.id
+                    ]
+                    bumped = spec.model_copy(update={"version": (max(versions) if versions else spec.version) + 1})
+                    wfdb.deploy_definition(conn, bumped, created_by="dashboard")
+                    return _definition_record(conn, bumped.id, bumped.version)
 
         record = await asyncio.to_thread(_deploy)
     except (json.JSONDecodeError, yaml.YAMLError, ValidationError, ValueError) as exc:

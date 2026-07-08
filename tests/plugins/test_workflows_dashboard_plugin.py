@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import shutil
@@ -83,6 +84,23 @@ def _deploy(client: TestClient, spec: dict = PASS_SPEC) -> dict:
     r = client.post("/api/plugins/workflows/definitions/deploy", json={"spec": spec})
     assert r.status_code == 200, r.text
     return r.json()["definition"]
+
+
+def test_dashboard_deploy_auto_bumps_changed_same_version_specs(client):
+    first = _deploy(client, PASS_SPEC)
+    assert first["version"] == 1
+
+    changed = copy.deepcopy(PASS_SPEC)
+    changed["name"] = "Dashboard Demo Updated"
+    changed["nodes"]["start"]["output"] = {"message": "updated"}
+    r = client.post("/api/plugins/workflows/definitions/deploy", json={"spec": changed})
+
+    assert r.status_code == 200, r.text
+    definition = r.json()["definition"]
+    assert definition["workflow_id"] == PASS_SPEC["id"]
+    assert definition["version"] == 2
+    assert definition["spec"]["version"] == 2
+    assert definition["spec"]["nodes"]["start"]["output"] == {"message": "updated"}
 
 
 def _assert_pass_spec(spec: dict) -> None:
@@ -747,16 +765,15 @@ def _dashboard_helper_js() -> str:
     kind_end = bundle.index("const EXAMPLE_DEFINITION", kind_start)
     start = bundle.index("function asArray")
     end = bundle.index("function statusClass", start)
-    # Include helper functions used by `nodeSummaryRows` even if they are defined
-    # later in the bundle than the existing helper slice.
-    provider_start = bundle.index("function providerValue")
-    provider_end = bundle.index("function WorkflowsPage", provider_start)
+    # Include editor helper functions used by UI-only builder tests.
+    editor_start = bundle.index("function cleanedNodeForSpec")
+    editor_end = bundle.index("function WorkflowsPage", editor_start)
     return (
         bundle[kind_start:kind_end]
         + "\n"
         + bundle[start:end]
         + "\n"
-        + bundle[provider_start:provider_end]
+        + bundle[editor_start:editor_end]
     )
 
 
@@ -823,6 +840,68 @@ def _run_validation_checklist(spec, capabilities=None):
     if capabilities is not None:
         args.append(capabilities)
     return _run_dashboard_function("validationChecklist", args)
+
+
+def test_dashboard_ui_builder_helpers_create_add_connect_delete_cells_without_json():
+    spec = _run_dashboard_function("newWorkflowSpec", ["Blank Slate Demo"])
+    assert spec["id"] == "blank_slate_demo"
+    assert spec["triggers"] == [{"id": "manual", "type": "manual"}]
+    assert spec["nodes"] == {}
+
+    spec = _run_dashboard_function("addSpecNodeAfter", [spec, "review", "agent_task", ""])
+    assert spec["nodes"]["review"]["type"] == "agent_task"
+    assert spec["nodes"]["review"]["profile"] == "default"
+    assert spec["nodes"]["review"]["prompt"]
+    assert spec["nodes"]["review"]["result_contract"]
+    assert spec["edges"] == []
+
+    spec = _run_dashboard_function("addSpecNodeAfter", [spec, "done", "pass", "review"])
+    assert spec["nodes"]["done"]["type"] == "pass"
+    assert {"from": "review", "to": "done"} in spec["edges"]
+
+    renamed = _run_dashboard_function("upsertSpecNode", [spec, "done", {"id": "finished", "type": "pass"}])
+    assert "finished" in renamed["nodes"]
+    assert "done" not in renamed["nodes"]
+    assert {"from": "review", "to": "finished"} in renamed["edges"]
+    assert all(item["ok"] for item in _run_validation_checklist(renamed))
+
+    spec = _run_dashboard_function("removeSpecNode", [spec, "review"])
+    assert "review" not in spec["nodes"]
+    assert spec["edges"] == []
+
+
+def test_dashboard_ui_builder_helpers_add_schedule_trigger_and_switch_branch_edges():
+    spec = _run_dashboard_function("newWorkflowSpec", ["Branch Demo"])
+    spec = _run_dashboard_function("addSpecTrigger", [spec, "weekday", "schedule", "0 9 * * *"])
+    assert {"id": "weekday", "type": "schedule", "schedule": "0 9 * * *"} in spec["triggers"]
+
+    spec = _run_dashboard_function("addSpecNodeAfter", [spec, "route", "switch", ""])
+    spec = _run_dashboard_function("addSpecNodeAfter", [spec, "approved", "pass", "route.default"])
+    spec = _run_dashboard_function("addSwitchCaseToSpec", [spec, "route", "approved", "$.input.status", "approved"])
+    spec = _run_dashboard_function("upsertSpecEdge", [spec, "route.approved", "approved"])
+    assert {"from": "route.default", "to": "approved"} in spec["edges"]
+    assert {"from": "route.approved", "to": "approved"} in spec["edges"]
+    assert {"name": "approved", "when": {"op": "eq", "left": {"path": "$.input.status"}, "right": "approved"}} in spec["nodes"]["route"]["cases"]
+    checklist = _run_validation_checklist(spec)
+    assert all(item["ok"] for item in checklist), checklist
+
+
+def test_dashboard_cleaned_node_removes_agent_only_fields_when_switching_types():
+    clean = _run_dashboard_function(
+        "cleanedNodeForSpec",
+        [
+            {
+                "id": "review",
+                "type": "pass",
+                "profile": "reviewer",
+                "provider": "openai-codex",
+                "model": "gpt-5.5",
+                "result_contract": {"ok": "boolean"},
+                "prompt": "notes",
+            }
+        ],
+    )
+    assert clean == {"id": "review", "type": "pass", "prompt": "notes"}
 
 
 def test_dashboard_validation_checklist_accepts_minimal_valid_spec():

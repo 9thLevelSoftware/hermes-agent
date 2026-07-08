@@ -618,7 +618,21 @@
     if (cleaned.type === "agent_task") {
       if (providerText) cleaned.provider = providerText;
       if (modelText) cleaned.model = modelText;
+    } else {
+      delete cleaned.profile;
+      delete cleaned.result_contract;
+      delete cleaned.skills;
+      delete cleaned.workspace_kind;
+      delete cleaned.workspace_path;
+      delete cleaned.goal_mode;
+      delete cleaned.goal_max_turns;
+      delete cleaned.max_retries;
     }
+    if (cleaned.type !== "switch") {
+      delete cleaned.cases;
+      delete cleaned.default;
+    }
+    if (cleaned.type !== "wait") delete cleaned.seconds;
     return cleaned;
   }
 
@@ -662,12 +676,38 @@
           return nodeIndex === index || id !== nextId;
         });
       } else next.nodes.push(nodeWithId);
-      return next;
+    } else {
+      next.nodes = next.nodes || {};
+      if (nodeId && nodeId !== nextId) delete next.nodes[nodeId];
+      next.nodes[nextId] = clean;
     }
-    next.nodes = next.nodes || {};
-    if (nodeId && nodeId !== nextId) delete next.nodes[nodeId];
-    next.nodes[nextId] = clean;
+    if (nodeId && nodeId !== nextId) rewriteSpecNodeReferences(next, nodeId, nextId);
     return next;
+  }
+
+  function rewriteSpecNodeReferences(spec, oldId, newId) {
+    const oldText = String(oldId || "");
+    const newText = String(newId || "");
+    if (!oldText || !newText || oldText === newText) return spec;
+    spec.edges = asArray(spec.edges).map(function (edge) {
+      const nextEdge = Object.assign({}, edge || {});
+      ["from", "source"].forEach(function (key) {
+        if (typeof nextEdge[key] !== "string") return;
+        if (nextEdge[key] === oldText) nextEdge[key] = newText;
+        else if (nextEdge[key].indexOf(oldText + ".") === 0) nextEdge[key] = newText + nextEdge[key].slice(oldText.length);
+      });
+      ["to", "target"].forEach(function (key) {
+        if (nextEdge[key] === oldText) nextEdge[key] = newText;
+      });
+      return nextEdge;
+    });
+    Object.keys(spec.nodes || {}).forEach(function (key) {
+      const node = spec.nodes[key];
+      if (!node || typeof node !== "object") return;
+      if (node.default === oldText) node.default = newText;
+      if (node.catch === oldText) node.catch = newText;
+    });
+    return spec;
   }
 
   function upsertSpecEdge(spec, source, target) {
@@ -677,6 +717,143 @@
       return (edge.from || edge.source) === source && (edge.to || edge.target) === target;
     });
     if (!exists && source && target) next.edges.push({ from: source, to: target });
+    return next;
+  }
+
+  function workflowIdFromText(value) {
+    const text = String(value || "workflow draft").trim().toLowerCase();
+    const slug = text.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 64);
+    if (slug && /^[a-z]/.test(slug)) return slug;
+    return "workflow_draft";
+  }
+
+  function nodeIdsForSpec(spec) {
+    return nodeList(spec).map(function (node) { return String(node.id || node.name || ""); }).filter(Boolean);
+  }
+
+  function uniqueWorkflowId(spec, requested) {
+    const existing = Object.create(null);
+    nodeIdsForSpec(spec).forEach(function (id) { existing[id] = true; });
+    asArray(spec && spec.triggers).forEach(function (trigger) {
+      const id = trigger && (trigger.id || trigger.name);
+      if (id) existing[String(id)] = true;
+    });
+    const base = workflowIdFromText(requested || "cell").replace(/_+/g, "_") || "cell";
+    let candidate = base;
+    let index = 2;
+    while (existing[candidate]) {
+      candidate = (base + "_" + index).slice(0, 64);
+      index += 1;
+    }
+    return candidate;
+  }
+
+  function newWorkflowSpec(name) {
+    const title = String(name || "Untitled Workflow").trim() || "Untitled Workflow";
+    return {
+      id: workflowIdFromText(title),
+      name: title,
+      version: 1,
+      enabled: true,
+      triggers: [{ id: "manual", type: "manual" }],
+      nodes: {},
+      edges: [],
+    };
+  }
+
+  function defaultNodeForType(type, nodeId) {
+    const safeType = NODE_KIND_LIST.indexOf(type) === -1 || type === "trigger" ? "pass" : type;
+    const title = String(nodeId || safeType || "cell").replace(/[_-]+/g, " ").trim() || safeType;
+    const node = { type: safeType, title: title };
+    if (safeType === "agent_task") {
+      node.profile = "default";
+      node.prompt = "Return JSON only matching the result contract.";
+      node.result_contract = { summary: "string", status: "string" };
+    } else if (safeType === "wait") {
+      node.seconds = 60;
+    } else if (safeType === "fail") {
+      node.output = "Workflow failed.";
+    } else if (safeType === "switch") {
+      node.cases = [];
+    }
+    return node;
+  }
+
+  function addSpecNodeAfter(spec, nodeId, type, afterSource) {
+    const next = cloneSpec(spec || newWorkflowSpec("Workflow Draft"));
+    next.nodes = next.nodes || {};
+    next.edges = asArray(next.edges);
+    const id = uniqueWorkflowId(next, nodeId || type || "cell");
+    const clean = defaultNodeForType(type || "pass", id);
+    if (Array.isArray(next.nodes)) next.nodes.push(Object.assign({ id: id }, clean));
+    else next.nodes[id] = clean;
+    const source = String(afterSource || "").trim();
+    if (source) return upsertSpecEdge(next, source, id);
+    return next;
+  }
+
+  function addSpecTrigger(spec, triggerId, triggerType, scheduleText) {
+    const next = cloneSpec(spec || newWorkflowSpec("Workflow Draft"));
+    const type = triggerType === "schedule" ? "schedule" : "manual";
+    const id = uniqueWorkflowId(next, triggerId || type || "trigger");
+    const trigger = { id: id, type: type };
+    if (type === "schedule") trigger.schedule = String(scheduleText || "0 9 * * *").trim() || "0 9 * * *";
+    next.triggers = asArray(next.triggers).filter(function (existing) {
+      return String((existing && (existing.id || existing.name)) || "") !== id;
+    });
+    next.triggers.push(trigger);
+    return next;
+  }
+
+  function addSwitchCaseToSpec(spec, nodeId, caseName, path, equalsValue) {
+    const next = cloneSpec(spec || {});
+    const id = String(nodeId || "");
+    const name = workflowIdFromText(caseName || "case");
+    const comparePath = String(path || "$.input.status").trim() || "$.input.status";
+    if (!id || !next.nodes || !next.nodes[id]) return next;
+    const node = Object.assign({}, next.nodes[id], { type: "switch" });
+    const caseSpec = {
+      name: name,
+      when: {
+        op: "eq",
+        left: { path: comparePath },
+        right: String(equalsValue || name),
+      },
+    };
+    node.cases = asArray(node.cases).filter(function (item) { return item && item.name !== name; }).concat([caseSpec]);
+    next.nodes[id] = node;
+    return next;
+  }
+
+  function removeSpecNode(spec, nodeId) {
+    const next = cloneSpec(spec || {});
+    const id = String(nodeId || "");
+    if (!id) return next;
+    if (Array.isArray(next.nodes)) {
+      next.nodes = next.nodes.filter(function (node) { return String((node && (node.id || node.name)) || "") !== id; });
+    } else if (next.nodes && typeof next.nodes === "object") {
+      delete next.nodes[id];
+    }
+    next.edges = asArray(next.edges).filter(function (edge) {
+      const sourceBase = String((edge && (edge.from || edge.source)) || "").split(".", 1)[0];
+      const target = String((edge && (edge.to || edge.target)) || "");
+      return sourceBase !== id && target !== id;
+    });
+    Object.keys(next.nodes || {}).forEach(function (key) {
+      const node = next.nodes[key];
+      if (!node || typeof node !== "object") return;
+      if (node.default === id) delete node.default;
+      if (node.catch === id) delete node.catch;
+    });
+    return next;
+  }
+
+  function removeSpecTrigger(spec, triggerId) {
+    const next = cloneSpec(spec || {});
+    const id = String(triggerId || "");
+    next.triggers = asArray(next.triggers).filter(function (trigger) {
+      return String((trigger && (trigger.id || trigger.name)) || "") !== id;
+    });
     return next;
   }
 
@@ -754,6 +931,57 @@
     const stateCellType = useState("pass");
     const cellType = stateCellType[0];
     const setCellType = stateCellType[1];
+    const stateTriggerSchedule = useState("");
+    const triggerSchedule = stateTriggerSchedule[0];
+    const setTriggerSchedule = stateTriggerSchedule[1];
+    const stateCellOutputText = useState("");
+    const cellOutputText = stateCellOutputText[0];
+    const setCellOutputText = stateCellOutputText[1];
+    const stateCellSeconds = useState("60");
+    const cellSeconds = stateCellSeconds[0];
+    const setCellSeconds = stateCellSeconds[1];
+    const stateSwitchDefault = useState("");
+    const switchDefault = stateSwitchDefault[0];
+    const setSwitchDefault = stateSwitchDefault[1];
+    const stateSwitchCases = useState([]);
+    const switchCases = stateSwitchCases[0];
+    const setSwitchCases = stateSwitchCases[1];
+    const stateSwitchCaseName = useState("");
+    const switchCaseName = stateSwitchCaseName[0];
+    const setSwitchCaseName = stateSwitchCaseName[1];
+    const stateSwitchCasePath = useState("$.input.status");
+    const switchCasePath = stateSwitchCasePath[0];
+    const setSwitchCasePath = stateSwitchCasePath[1];
+    const stateSwitchCaseEquals = useState("");
+    const switchCaseEquals = stateSwitchCaseEquals[0];
+    const setSwitchCaseEquals = stateSwitchCaseEquals[1];
+    const stateNewWorkflowName = useState("");
+    const newWorkflowName = stateNewWorkflowName[0];
+    const setNewWorkflowName = stateNewWorkflowName[1];
+    const stateNewCellId = useState("");
+    const newCellId = stateNewCellId[0];
+    const setNewCellId = stateNewCellId[1];
+    const stateNewCellType = useState("pass");
+    const newCellType = stateNewCellType[0];
+    const setNewCellType = stateNewCellType[1];
+    const stateNewCellAfter = useState("");
+    const newCellAfter = stateNewCellAfter[0];
+    const setNewCellAfter = stateNewCellAfter[1];
+    const stateNewTriggerId = useState("");
+    const newTriggerId = stateNewTriggerId[0];
+    const setNewTriggerId = stateNewTriggerId[1];
+    const stateNewTriggerType = useState("manual");
+    const newTriggerType = stateNewTriggerType[0];
+    const setNewTriggerType = stateNewTriggerType[1];
+    const stateNewTriggerSchedule = useState("0 9 * * *");
+    const newTriggerSchedule = stateNewTriggerSchedule[0];
+    const setNewTriggerSchedule = stateNewTriggerSchedule[1];
+    const stateEdgeFrom = useState("");
+    const edgeFrom = stateEdgeFrom[0];
+    const setEdgeFrom = stateEdgeFrom[1];
+    const stateEdgeTo = useState("");
+    const edgeTo = stateEdgeTo[0];
+    const setEdgeTo = stateEdgeTo[1];
     const stateAdvancedJsonOpen = useState(false);
     const advancedJsonOpen = stateAdvancedJsonOpen[0];
     const setAdvancedJsonOpen = stateAdvancedJsonOpen[1];
@@ -907,6 +1135,13 @@
       const assistantOutput = node && node.result_contract ? jsonBlock(node.result_contract) : '{"summary":"string","status":"string"}';
       setCellId(node && (node.id || node.name) ? String(node.id || node.name) : "");
       setCellType(node && node.specKind === "trigger" ? String(node.trigger_type || node.type || "manual") : String((node && node.type) || "pass"));
+      setTriggerSchedule(node && (node.schedule || node.cron || node.expr) ? String(node.schedule || node.cron || node.expr) : "");
+      setCellOutputText(node && node.output !== undefined && node.output !== null ? (typeof node.output === "string" ? node.output : jsonBlock(node.output)) : "");
+      setCellSeconds(node && node.seconds !== undefined && node.seconds !== null ? String(node.seconds) : "60");
+      setSwitchDefault(node && node.default ? String(node.default) : "");
+      setSwitchCases(asArray(node && node.cases));
+      setSwitchCaseName("");
+      setSwitchCaseEquals("");
       setAgentProfile(node && node.profile ? String(node.profile) : "");
       setAgentProvider(providerValue(node));
       setAgentModel(modelValue(node));
@@ -1313,15 +1548,21 @@
 
     function applyAgentCellForm() {
       if (!selectedNode) return;
+      if (cellType !== "agent_task") {
+        applyBasicCellForm();
+        return;
+      }
       const spec = activeSpec();
       if (!spec) {
         setNodeMessage("Validate the YAML draft before applying cell edits; no stale workflow was used.");
         return;
       }
+      const nextId = cellId.trim() || selectedNode.id;
       const nextNode = Object.assign({}, selectedNode, {
+        id: nextId,
         type: "agent_task",
         profile: agentProfile.trim(),
-        title: agentTitle.trim() || selectedNode.id,
+        title: agentTitle.trim() || nextId,
         prompt: promptText,
       });
       const contractText = resultContractText.trim();
@@ -1347,8 +1588,8 @@
       updateEditorText(specToEditorText(nextSpec));
       setDraftSpec(nextSpec);
       setSelectedDefinition(Object.assign({}, selectedDefinition || {}, { spec: nextSpec }));
-      setSelectedNode(nextNode);
-      setNodeJson(jsonBlock(nextNode));
+      setSelectedNode(Object.assign({}, nextNode, { id: nextId }));
+      setNodeJson(jsonBlock(Object.assign({}, nextNode, { id: nextId })));
       setNodeMessage("Applied agent cell prompt to workflow draft.");
     }
 
@@ -1364,16 +1605,38 @@
       const nextNode = Object.assign({}, selectedNode, { id: nextId, type: nextType });
       const titleText = agentTitle.trim();
       const promptValue = promptText.trim();
+      const outputValue = cellOutputText.trim();
       if (titleText) nextNode.title = titleText;
       else delete nextNode.title;
       if (promptValue && selectedNode.specKind !== "trigger") nextNode.prompt = promptText;
       else delete nextNode.prompt;
+      if (selectedNode.specKind !== "trigger") {
+        if (nextType === "wait") nextNode.seconds = Math.max(0, parseInt(cellSeconds || "0", 10) || 0);
+        else delete nextNode.seconds;
+        if (nextType === "pass" || nextType === "fail") {
+          if (outputValue) nextNode.output = cellOutputText;
+          else delete nextNode.output;
+        } else {
+          delete nextNode.output;
+        }
+        if (nextType === "switch") {
+          nextNode.cases = asArray(switchCases);
+          if (switchDefault.trim()) nextNode.default = switchDefault.trim();
+          else delete nextNode.default;
+        } else {
+          delete nextNode.cases;
+          delete nextNode.default;
+        }
+      }
 
       delete nextNode.provider_override;
       delete nextNode.model_override;
       if (nextType === "agent_task") {
         const providerText = agentProvider.trim();
         const modelText = agentModel.trim();
+        nextNode.profile = agentProfile.trim() || nextNode.profile || "default";
+        if (!promptValue) nextNode.prompt = "Return JSON only matching the result contract.";
+        if (!nextNode.result_contract || !Object.keys(nextNode.result_contract).length) nextNode.result_contract = { summary: "string", status: "string" };
         if (providerText) nextNode.provider = providerText;
         else delete nextNode.provider;
         if (modelText) nextNode.model = modelText;
@@ -1391,6 +1654,12 @@
           const clean = cleanedNodeForSpec(Object.assign({}, trigger, { id: nextId, type: nextType }));
           if (titleText) clean.title = titleText;
           else delete clean.title;
+          if (nextType === "schedule") clean.schedule = triggerSchedule.trim() || trigger.schedule || trigger.cron || "0 9 * * *";
+          else {
+            delete clean.schedule;
+            delete clean.cron;
+            delete clean.expr;
+          }
           return clean;
         });
         updateEditorText(specToEditorText(nextSpec));
@@ -1409,6 +1678,85 @@
       setSelectedNode(nextNode);
       setNodeJson(jsonBlock(nextNode));
       setNodeMessage("Applied cell changes to workflow draft.");
+    }
+
+    function setActiveDraftSpec(nextSpec, message) {
+      updateEditorText(specToEditorText(nextSpec));
+      setDraftSpec(nextSpec);
+      setSelectedDefinition(Object.assign({}, selectedDefinition || {}, { spec: nextSpec }));
+      if (message) setStatus(message);
+    }
+
+    function startBlankWorkflow() {
+      const nextSpec = newWorkflowSpec(newWorkflowName || goalText || "Untitled Workflow");
+      setActiveDraftSpec(nextSpec, "Started blank workflow draft. No JSON/YAML required.");
+      setSelectedNode(null);
+      setNodeJson("");
+      setNodeMessage("");
+    }
+
+    function addWorkflowCellFromUi() {
+      const baseSpec = activeSpec() || newWorkflowSpec(newWorkflowName || goalText || "Workflow Draft");
+      const nextSpec = addSpecNodeAfter(baseSpec, newCellId || newCellType, newCellType, newCellAfter);
+      setActiveDraftSpec(nextSpec, "Added workflow cell from the visual builder.");
+      const id = Object.keys(nextSpec.nodes || {}).slice(-1)[0];
+      const node = findSpecNode(nextSpec, id);
+      if (node) selectNodeForInspector(node);
+      setNewCellId("");
+    }
+
+    function addTriggerFromUi() {
+      const baseSpec = activeSpec() || newWorkflowSpec(newWorkflowName || goalText || "Workflow Draft");
+      const nextSpec = addSpecTrigger(baseSpec, newTriggerId || newTriggerType, newTriggerType, newTriggerSchedule);
+      setActiveDraftSpec(nextSpec, "Added workflow trigger from the visual builder.");
+      setNewTriggerId("");
+    }
+
+    function connectCellsFromUi() {
+      const spec = activeSpec();
+      if (!spec) {
+        setStatus("Start or validate a workflow before connecting cells.");
+        return;
+      }
+      const source = edgeFrom.trim();
+      const target = edgeTo.trim();
+      if (!source || !target) {
+        setStatus("Choose both a source and target cell before connecting cells.");
+        return;
+      }
+      const nextSpec = upsertSpecEdge(spec, source, target);
+      setActiveDraftSpec(nextSpec, "Connected workflow cells.");
+    }
+
+    function addSwitchCaseFromUi() {
+      if (!selectedNode) return;
+      const spec = activeSpec();
+      if (!spec) {
+        setNodeMessage("Start or validate a workflow before adding switch cases.");
+        return;
+      }
+      const nextSpec = addSwitchCaseToSpec(spec, selectedNode.id, switchCaseName || switchCaseEquals || "case", switchCasePath, switchCaseEquals || switchCaseName || "case");
+      const nextNode = findSpecNode(nextSpec, selectedNode.id);
+      setSwitchCases(asArray(nextNode && nextNode.cases));
+      setActiveDraftSpec(nextSpec, "Added switch case. Connect cells from " + safeString(selectedNode.id) + "." + workflowIdFromText(switchCaseName || switchCaseEquals || "case") + " to route that branch.");
+      if (nextNode) setSelectedNode(nextNode);
+      setSwitchCaseName("");
+      setSwitchCaseEquals("");
+    }
+
+    function deleteSelectedCell() {
+      if (!selectedNode) return;
+      const spec = activeSpec();
+      if (!spec) {
+        setNodeMessage("Start or validate a workflow before deleting a cell.");
+        return;
+      }
+      const id = selectedNode.id || selectedNode.name;
+      const nextSpec = selectedNode.specKind === "trigger" ? removeSpecTrigger(spec, id) : removeSpecNode(spec, id);
+      setActiveDraftSpec(nextSpec, "Deleted selected cell from workflow draft.");
+      setSelectedNode(null);
+      setNodeJson("");
+      setNodeMessage("");
     }
 
     function draftPromptWithAssistant() {
@@ -1527,6 +1875,10 @@
           renderNotes("Warnings", draftResult && draftResult.warnings),
           renderNotes("Unsupported requests", draftResult && draftResult.unsupported_requests)
         ) : h("p", { className: "hermes-workflows-muted" }, "No assistant draft metadata available."),
+        h("div", { className: "hermes-workflows-row" },
+          h("button", { type: "button", disabled: validating || !draftSpec, onClick: validateDefinition }, validating ? "Validating draft…" : "Validate draft"),
+          h("button", { type: "button", disabled: deploying || !draftSpec, onClick: deployDefinition, className: "hermes-workflows-primary" }, deploying ? "Deploying draft…" : "Deploy draft")
+        ),
         h("form", { className: "hermes-workflows-stack hermes-workflows-refine-form", onSubmit: refineWorkflow },
           h("label", null,
             h("span", { className: "hermes-workflows-muted" }, "Refine workflow"),
@@ -1827,6 +2179,49 @@
       );
     }
 
+    function renderBuilderActions(spec) {
+      const ids = nodeIdsForSpec(spec || {});
+      return h("section", { className: "hermes-workflows-builder-actions", "aria-label": "UI workflow builder controls" },
+        h("h3", null, "Build workflow visually"),
+        h("p", { className: "hermes-workflows-muted" }, "No JSON/YAML required: start from a blank workflow, add cells/triggers, connect cells, then edit the selected cell."),
+        h("div", { className: "hermes-workflows-row" },
+          h("input", { value: newWorkflowName, onChange: function (event) { setNewWorkflowName(event.target.value); }, placeholder: "New workflow name" }),
+          h("button", { type: "button", onClick: startBlankWorkflow }, "Start from blank workflow")
+        ),
+        h("div", { className: "hermes-workflows-row" },
+          h("input", { value: newCellId, onChange: function (event) { setNewCellId(event.target.value); }, placeholder: "New cell id" }),
+          h("input", { value: newCellType, onChange: function (event) { setNewCellType(event.target.value); }, placeholder: "Cell type", list: "workflow-cell-type-options" }),
+          h("input", { value: newCellAfter, onChange: function (event) { setNewCellAfter(event.target.value); }, placeholder: "Insert after source, e.g. review or switch.default", list: "workflow-node-source-options" }),
+          h("button", { type: "button", onClick: addWorkflowCellFromUi }, "Add workflow cell")
+        ),
+        h("div", { className: "hermes-workflows-row" }, ["pass", "switch", "agent_task", "wait", "parallel", "join", "fail"].map(function (type) {
+          return h("button", { key: type, type: "button", onClick: function () { setNewCellType(type); } }, "Cell type: " + type);
+        })),
+        h("datalist", { id: "workflow-cell-type-options" }, ["pass", "switch", "agent_task", "wait", "parallel", "join", "fail"].map(function (type) {
+          return h("option", { key: type, value: type });
+        })),
+        h("datalist", { id: "workflow-node-source-options" }, ids.map(function (id) { return h("option", { key: id, value: id }); })),
+        h("div", { className: "hermes-workflows-row" },
+          h("input", { value: newTriggerId, onChange: function (event) { setNewTriggerId(event.target.value); }, placeholder: "New trigger id" }),
+          h("input", { value: newTriggerType, onChange: function (event) { setNewTriggerType(event.target.value); }, placeholder: "Trigger type", list: "workflow-trigger-type-options" }),
+          newTriggerType === "schedule" ? h("input", { value: newTriggerSchedule, onChange: function (event) { setNewTriggerSchedule(event.target.value); }, placeholder: "0 9 * * *" }) : null,
+          h("button", { type: "button", onClick: addTriggerFromUi }, "Add trigger")
+        ),
+        h("div", { className: "hermes-workflows-row" }, ["manual", "schedule"].map(function (type) {
+          return h("button", { key: type, type: "button", onClick: function () { setNewTriggerType(type); } }, "Trigger type: " + type);
+        })),
+        h("datalist", { id: "workflow-trigger-type-options" }, ["manual", "schedule"].map(function (type) {
+          return h("option", { key: type, value: type });
+        })),
+        h("div", { className: "hermes-workflows-row" },
+          h("input", { value: edgeFrom, onChange: function (event) { setEdgeFrom(event.target.value); }, placeholder: "Connect from source or source.branch", list: "workflow-node-source-options" }),
+          h("input", { value: edgeTo, onChange: function (event) { setEdgeTo(event.target.value); }, placeholder: "Connect to target cell", list: "workflow-node-target-options" }),
+          h("button", { type: "button", onClick: connectCellsFromUi }, "Connect cells")
+        ),
+        h("datalist", { id: "workflow-node-target-options" }, ids.map(function (id) { return h("option", { key: id, value: id }); }))
+      );
+    }
+
     function renderCellList(spec) {
       const nodes = graphNodeList(spec);
       return h("section", { className: "hermes-workflows-cell-list", "aria-label": "Workflow cell list" },
@@ -1931,6 +2326,18 @@
         h("h3", null, "Cell editor"),
         h("div", { className: "hermes-workflows-meta" }, "Agent task " + safeString(selectedNode.id)),
         h("label", null,
+          h("span", { className: "hermes-workflows-muted" }, "Cell id"),
+          h("input", { value: cellId, onChange: function (event) { setCellId(event.target.value); }, placeholder: "cell-id" })
+        ),
+        h("label", null,
+          h("span", { className: "hermes-workflows-muted" }, "Cell type"),
+          h("input", { value: cellType, onChange: function (event) { setCellType(event.target.value); }, placeholder: "agent_task", list: "workflow-cell-type-options" })
+        ),
+        h("div", { className: "hermes-workflows-row" }, ["pass", "switch", "agent_task", "wait", "parallel", "join", "fail"].map(function (type) {
+          return h("button", { key: type, type: "button", onClick: function () { setCellType(type); } }, "Switch selected cell to: " + type);
+        })),
+        cellType !== "agent_task" ? h("p", { className: "hermes-workflows-muted" }, "Changing away from agent_task removes agent-only routing and contract fields when you apply.") : null,
+        h("label", null,
           h("span", { className: "hermes-workflows-muted" }, "Assigned profile"),
           profiles.length ? h("select", { value: agentProfile, onChange: function (event) { setAgentProfile(event.target.value); } },
             [h("option", { key: "", value: "" }, "Choose profile")].concat(profiles.map(function (profile) {
@@ -2001,14 +2408,42 @@
         ),
         h("label", null,
           h("span", { className: "hermes-workflows-muted" }, selectedNode && selectedNode.specKind === "trigger" ? "Trigger type" : "Cell type"),
-          h("select", { value: cellType, onChange: function (event) { setCellType(event.target.value); } }, typeOptions.map(function (type) {
-            return h("option", { key: type, value: type }, type);
-          }))
+          h("input", { value: cellType, onChange: function (event) { setCellType(event.target.value); }, placeholder: selectedNode && selectedNode.specKind === "trigger" ? "manual" : "pass", list: selectedNode && selectedNode.specKind === "trigger" ? "workflow-trigger-type-options" : "workflow-cell-type-options" })
         ),
+        h("div", { className: "hermes-workflows-row" }, typeOptions.map(function (type) {
+          return h("button", { key: type, type: "button", onClick: function () { setCellType(type); } }, (selectedNode && selectedNode.specKind === "trigger" ? "Switch trigger to: " : "Switch selected cell to: ") + type);
+        })),
         h("label", null,
           h("span", { className: "hermes-workflows-muted" }, "Title / description"),
           h("input", { value: agentTitle, onChange: function (event) { setAgentTitle(event.target.value); }, placeholder: "What this cell does" })
         ),
+        selectedNode && selectedNode.specKind === "trigger" && cellType === "schedule" ? h("label", null,
+          h("span", { className: "hermes-workflows-muted" }, "Schedule / cron"),
+          h("input", { value: triggerSchedule, onChange: function (event) { setTriggerSchedule(event.target.value); }, placeholder: "0 9 * * *" })
+        ) : null,
+        selectedNode && selectedNode.specKind !== "trigger" && cellType === "wait" ? h("label", null,
+          h("span", { className: "hermes-workflows-muted" }, "Wait seconds"),
+          h("input", { value: cellSeconds, onChange: function (event) { setCellSeconds(event.target.value); }, placeholder: "60" })
+        ) : null,
+        selectedNode && selectedNode.specKind !== "trigger" && (cellType === "pass" || cellType === "fail") ? h("label", null,
+          h("span", { className: "hermes-workflows-muted" }, cellType === "fail" ? "Failure message" : "Output text"),
+          h("textarea", { className: "hermes-workflows-prompt-editor", value: cellOutputText, onChange: function (event) { setCellOutputText(event.target.value); }, placeholder: cellType === "fail" ? "Why this workflow should fail." : "Optional output text for this cell." })
+        ) : null,
+        selectedNode && selectedNode.specKind !== "trigger" && cellType === "switch" ? h("div", { className: "hermes-workflows-stack" },
+          h("label", null,
+            h("span", { className: "hermes-workflows-muted" }, "Default target cell"),
+            h("input", { value: switchDefault, onChange: function (event) { setSwitchDefault(event.target.value); }, placeholder: "Optional target id; or connect from switch.default" })
+          ),
+          h("div", { className: "hermes-workflows-meta" }, "Switch cases: " + (switchCases.length ? switchCases.map(function (item) { return item && item.name; }).filter(Boolean).join(", ") : "none yet")),
+          h("div", { className: "hermes-workflows-row" },
+            h("input", { value: switchCaseName, onChange: function (event) { setSwitchCaseName(event.target.value); }, placeholder: "Case name / branch, e.g. approved" }),
+            h("input", { value: switchCasePath, onChange: function (event) { setSwitchCasePath(event.target.value); }, placeholder: "Input path, e.g. $.input.status" }),
+            h("input", { value: switchCaseEquals, onChange: function (event) { setSwitchCaseEquals(event.target.value); }, placeholder: "Equals value" }),
+            h("button", { type: "button", onClick: addSwitchCaseFromUi }, "Add switch case")
+          )
+        ) : null,
+        selectedNode && selectedNode.specKind !== "trigger" && cellType === "parallel" ? h("p", { className: "hermes-workflows-muted" }, "Parallel branch edges use Connect cells with sources like cell.branch_name.") : null,
+        selectedNode && selectedNode.specKind !== "trigger" && cellType === "join" ? h("p", { className: "hermes-workflows-muted" }, "Join waits for incoming branches and needs only incoming/outgoing connections.") : null,
         selectedNode && selectedNode.specKind === "trigger" ? null : h("label", null,
           h("span", { className: "hermes-workflows-muted" }, "Notes or prompt"),
           h("textarea", { className: "hermes-workflows-prompt-editor", value: promptText, onChange: function (event) { setPromptText(event.target.value); }, placeholder: "Optional plain-language instructions for this cell." })
@@ -2024,7 +2459,8 @@
       return h("aside", { className: "hermes-workflows-inspector" },
         h("h3", null, "Node inspector"),
         selectedNode ? h("div", { className: "hermes-workflows-stack" },
-          selectedNode.type === "agent_task" ? renderAgentCellEditor() : renderBasicCellEditor(),
+          selectedNode.type === "agent_task" && cellType === "agent_task" ? renderAgentCellEditor() : renderBasicCellEditor(),
+          h("button", { type: "button", onClick: deleteSelectedCell }, "Delete selected cell"),
           advancedJsonOpen ? renderAdvancedNodeJson(spec) : null,
           nodeMessage ? h("p", { className: "hermes-workflows-muted" }, nodeMessage) : null
         ) : h("p", { className: "hermes-workflows-muted" }, "Select a node to edit its cell settings. Advanced JSON remains available after selecting a node.")
@@ -2080,6 +2516,7 @@
           h("h2", null, "Visual workflow editor"),
           h("p", { className: "hermes-workflows-muted" }, spec ? safeString(spec.name || spec.id || spec.workflow_id) : "Select or validate a workflow to render its nodes and edges.")
         ),
+        renderBuilderActions(spec),
         spec ? renderReactFlowGraph(spec) : h("p", { className: "hermes-workflows-muted" }, "No workflow graph available yet."),
         !ReactFlow ? h("p", { className: "hermes-workflows-muted" }, "React Flow SDK unavailable; showing the simple HTML graph fallback.") : null
       );

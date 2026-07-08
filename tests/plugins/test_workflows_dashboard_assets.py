@@ -57,3 +57,22 @@ def test_workflow_dashboard_summarizes_agent_routing() -> None:
     assert "Provider / model" in text
     assert "providerValue" in text
     assert "modelValue" in text
+
+
+def test_workflow_dashboard_exposes_ui_only_builder_controls() -> None:
+    text = BUNDLE.read_text(encoding="utf-8")
+    required_labels = [
+        "Start from blank workflow",
+        "Add workflow cell",
+        "Add trigger",
+        "Connect cells",
+        "Delete selected cell",
+        "Add switch case",
+        "Validate draft",
+        "Deploy draft",
+        "workflow-cell-type-options",
+        "Switch selected cell to: ",
+    ]
+    for label in required_labels:
+        assert label in text
+    assert "No JSON/YAML required" in text
