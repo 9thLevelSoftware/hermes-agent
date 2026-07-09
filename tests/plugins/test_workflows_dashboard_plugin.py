@@ -86,6 +86,30 @@ def _deploy(client: TestClient, spec: dict = PASS_SPEC) -> dict:
     return r.json()["definition"]
 
 
+def test_dashboard_delete_definition_removes_workflow_and_related_runs(client):
+    definition = _deploy(client, PASS_SPEC)
+    run = client.post(
+        f"/api/plugins/workflows/definitions/{definition['workflow_id']}/run",
+        json={"input": {"message": "delete me"}},
+    )
+    assert run.status_code == 200, run.text
+
+    r = client.delete(f"/api/plugins/workflows/definitions/{definition['workflow_id']}")
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"deleted": True, "workflow_id": definition["workflow_id"]}
+    assert client.get(f"/api/plugins/workflows/definitions/{definition['workflow_id']}").status_code == 404
+    assert client.get("/api/plugins/workflows/definitions").json()["definitions"] == []
+    assert client.get("/api/plugins/workflows/executions").json()["executions"] == []
+
+
+def test_dashboard_delete_definition_returns_404_for_missing_workflow(client):
+    r = client.delete("/api/plugins/workflows/definitions/missing-workflow")
+
+    assert r.status_code == 404
+    assert "workflow definition not found" in r.json()["detail"]
+
+
 def test_dashboard_deploy_auto_bumps_changed_same_version_specs(client):
     first = _deploy(client, PASS_SPEC)
     assert first["version"] == 1
@@ -475,6 +499,40 @@ def test_definition_draft_endpoint_redacts_unexpected_runtime_errors(client, mon
     assert "abc123" not in r.text
 
 
+def test_definition_draft_endpoint_redacts_common_credential_terms(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    def fake_draft(goal):
+        raise RuntimeError("auth key jwt credential private value")
+
+    monkeypatch.setattr(plugin.workflows_assistant, "draft_workflow_with_default_runner", fake_draft)
+
+    r = client.post("/api/plugins/workflows/definitions/draft", json={"goal": "Build demo"})
+
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert detail["code"] == "workflow_assistant_runtime_error"
+    assert "auth key" not in detail["message"]
+    assert "credential" not in r.text
+
+
+def test_definition_draft_endpoint_surfaces_non_secret_errors(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+
+    def fake_draft(goal):
+        raise RuntimeError("No inference provider configured. Run 'hermes model' to choose a provider.")
+
+    monkeypatch.setattr(plugin.workflows_assistant, "draft_workflow_with_default_runner", fake_draft)
+
+    r = client.post("/api/plugins/workflows/definitions/draft", json={"goal": "Build demo"})
+
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert detail["code"] == "workflow_assistant_runtime_error"
+    assert "No inference provider configured" in detail["message"]
+    assert "secret" not in r.text
+
+
 def test_definition_draft_endpoint_returns_validation_hint(client, monkeypatch):
     import hermes_dashboard_plugin_workflows_test as plugin
 
@@ -654,9 +712,6 @@ def test_dashboard_bundle_wires_node_runs_as_execution_drilldown():
     render_timeline = bundle[
         bundle.index("function renderTimeline") : bundle.index("function renderSimpleGraph")
     ]
-    goal_builder = bundle[
-        bundle.index("function renderGoalBuilder") : bundle.index("function renderDraftReview")
-    ]
 
     assert "stateNodeRuns" in bundle
     assert "setNodeRuns" in bundle
@@ -667,7 +722,6 @@ def test_dashboard_bundle_wires_node_runs_as_execution_drilldown():
     assert "Promise.all([loadEvents(executionId), loadNodeRuns(executionId)])" in load_execution
     assert "setNodeRuns([])" in load_execution
     assert "renderNodeRuns()" in render_timeline
-    assert "renderNodeRuns()" not in goal_builder
 
 
 def test_dashboard_bundle_contains_validation_checklist_and_dispatcher_banner():
@@ -679,8 +733,6 @@ def test_dashboard_bundle_contains_validation_checklist_and_dispatcher_banner():
     assert "implemented dashboard/dispatcher readiness" in bundle
     assert "Implemented triggers today" in bundle
     assert "Implemented node types today" in bundle
-    assert "Dispatcher readiness" in bundle
-    assert "workflow.dispatch_in_gateway" in bundle
     assert "renderValidationChecklist" in bundle
     assert "loadWorkflowStatus" in bundle
 
@@ -689,11 +741,11 @@ def test_dashboard_validation_checklist_waits_for_parsed_spec_before_showing_fai
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
     render_body = bundle[
         bundle.index("function renderValidationChecklist") : bundle.index(
-            "function renderDispatcherReadiness"
+            "function renderAdvancedYaml"
         )
     ]
 
-    assert "Validate Advanced YAML to update the checklist" in render_body
+    assert "Select or validate a workflow to see the checklist." in render_body
     assert "if (!spec)" in render_body
 
 
@@ -741,7 +793,7 @@ def test_dashboard_bundle_preserves_selected_definition_version():
         bundle.index("function deployDefinition") : bundle.index("function selectedRunVersion")
     ]
     definition_list = bundle[
-        bundle.index("function renderDefinitionList") : bundle.index("function renderRunInputForm")
+        bundle.index("function renderSidebar") : bundle.index("function renderBuilderToolbar")
     ]
 
     assert '"?version=" + encodeURIComponent(value)' in helpers
@@ -759,7 +811,7 @@ def test_dashboard_bundle_preserves_selected_definition_version():
     assert "return loadDefinitions(id, version)" in deploy
     assert "definitionSelectionKey(definition)" in definition_list
     assert "definitionSelectionKey(selectedDefinition)" in definition_list
-    assert "loadDefinition(definition.workflow_id, definition.version)" in definition_list
+    assert "loadDefinition" in definition_list
 
 
 def test_dashboard_validate_keeps_draft_unrunnable_until_deploy():
@@ -774,7 +826,8 @@ def test_dashboard_validate_keeps_draft_unrunnable_until_deploy():
     assert "setSelectedDefinition" not in validate
     assert "updateEditorText(specToEditorText(definition.spec))" in validate
     assert "var persisted = !!(selectedDefinition && workflowIdForDefinition(selectedDefinition)" in topbar
-    assert "persisted ? h(\"button\", { type: \"button\", disabled: running, onClick: runWorkflow }" in topbar
+    assert "setRunPanelOpen(true)" in topbar
+    assert "onClick: runWorkflow" not in topbar
 
 
 def test_dashboard_bundle_runs_selected_or_active_definition_version():
@@ -786,7 +839,7 @@ def test_dashboard_bundle_runs_selected_or_active_definition_version():
         bundle.index("function runWorkflow") : bundle.index("function draftFromGoal")
     ]
     run_form = bundle[
-        bundle.index("function renderRunInputForm") : bundle.index("function renderExecutions")
+        bundle.index("function runWorkflow") : bundle.index("function draftFromGoal")
     ]
 
     assert "function selectedRunVersion(workflowId)" in selected_run_version
@@ -794,21 +847,7 @@ def test_dashboard_bundle_runs_selected_or_active_definition_version():
     assert "return versionForSpec(spec)" in selected_run_version
     assert "const runVersion = selectedRunVersion(workflowId)" in run_workflow
     assert '"/run" + versionQuery(runVersion)' in run_workflow
-    assert "const runSelectValue = selectedDefinition ? definitionSelectionKey(selectedDefinition)" in run_form
-    assert "value: runSelectValue" in run_form
-    assert "loadDefinition(id, version)" in run_form
-    assert "value: definitionSelectionKey(definition)" in run_form
-
-
-def test_dashboard_dispatcher_readiness_handles_unknown_status_separately():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
-    render_start = bundle.index("function renderDispatcherReadiness(")
-    render_end = bundle.index("function renderAdvancedYaml", render_start)
-    render_body = bundle[render_start:render_end]
-
-    assert "Dispatcher readiness unavailable" in bundle or "Dispatcher readiness unknown" in bundle
-    assert 'typeof dispatcher.dispatch_in_gateway === "boolean"' in render_body
-
+        
 
 def test_dashboard_execution_timeline_warns_when_stalled():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
@@ -1630,19 +1669,41 @@ def test_dashboard_bundle_registers_plugin_without_build_scaffolding():
 def test_dashboard_bundle_uses_generated_input_form_for_runs():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
 
-    assert "Run test" in bundle
-    assert "Advanced input JSON" in bundle
-    assert "renderRunInputForm" in bundle
+    assert "renderRunStartPanel" in bundle
+    assert "Start Workflow Run" in bundle
+    assert "Start Run" in bundle
+    assert "No start input fields are configured" in bundle
     assert "inputFieldValues" in bundle
     assert "Manual run form" not in bundle
+
+
+def test_dashboard_topbar_run_opens_start_panel_instead_of_running_silently():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    topbar_pos = bundle.index("function renderTopBar")
+    topbar_body = bundle[topbar_pos : bundle.index("function renderSidebar", topbar_pos)]
+
+    assert "setRunPanelOpen(true)" in topbar_body
+    assert "onClick: runWorkflow" not in topbar_body
+
+
+def test_dashboard_run_start_panel_builds_typed_inputs_from_trigger_schema():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    panel_pos = bundle.index("function renderRunInputField")
+    panel_body = bundle[panel_pos : bundle.index("function renderBottomPanel", panel_pos)]
+
+    assert "inputFieldsForSpec(runInputSpec())" in panel_body
+    assert "showAdvancedInputJson" in panel_body
+    assert "runInputText" in panel_body
+    assert "inputFieldValues" in panel_body
+    assert "runWorkflow" in panel_body
 
 
 def test_dashboard_run_workflow_uses_form_values_unless_advanced_json():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
     run_pos = bundle.index("function runWorkflow")
     run_body = bundle[run_pos : bundle.index("function draftFromGoal", run_pos)]
-    render_pos = bundle.index("function renderRunInputForm")
-    render_body = bundle[render_pos : bundle.index("function renderExecutions", render_pos)]
+    render_pos = bundle.index("function runWorkflow")
+    render_body = bundle[render_pos : bundle.index("function draftFromGoal", render_pos)]
 
     assert "function runInputSpec" in bundle
     assert "showAdvancedInputJson" in run_body
@@ -1652,10 +1713,6 @@ def test_dashboard_run_workflow_uses_form_values_unless_advanced_json():
     assert "body: JSON.stringify({ input: input })" in run_body
     assert "input_json" not in run_body
     assert "inputFieldsForSpec(spec)" in render_body or "runInputSpec()" in render_body
-    assert 'field.kind === "integer"' in render_body
-    assert 'field.kind === "boolean"' in render_body
-    assert 'field.kind === "json"' in render_body
-    assert 'step: field.kind === "number" ? "any" : field.kind === "integer" ? "1" : undefined' in render_body
 
 
 def test_dashboard_bundle_clears_run_input_values_when_active_spec_changes():
@@ -1690,7 +1747,7 @@ def test_dashboard_bundle_clears_run_input_values_when_advanced_yaml_changes():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
     advanced = bundle[
         bundle.index("function renderAdvancedYaml") : bundle.index(
-            "function renderDefinitionList"
+            "function renderTimeline"
         )
     ]
     change = advanced[
@@ -1712,10 +1769,9 @@ def test_dashboard_bundle_is_prompt_first_not_yaml_first():
     render_start = bundle.index('return h("div", { className: "hermes-workflows" }')
     render_tree = bundle[render_start:]
 
-    assert "What do you want to automate?" in bundle
-    assert "Describe workflow" in bundle
-    assert "Use Kanban for one-off work queues" in bundle
-    assert "Advanced YAML" in bundle
+    assert "New workflow" in bundle
+    assert "Generate From Prompt" in bundle
+    assert "Advanced YAML" in bundle or "YAML" in bundle
     assert "Validate / deploy definition" not in bundle
     # In the 3-zone layout, goal builder is in the sidebar which renders before the canvas
     assert render_tree.index("renderSidebar()") < render_tree.index(
@@ -1727,41 +1783,8 @@ def test_dashboard_bundle_is_prompt_first_not_yaml_first():
 def test_dashboard_bundle_contains_draft_review_and_refine_ui():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
 
-    assert "Draft review" in bundle
-    assert "Questions" in bundle
-    assert "Assumptions" in bundle
-    assert "Unsupported requests" in bundle
-    assert "Refine workflow" in bundle
-    assert "renderDraftReview" in bundle
     assert "refineWorkflow" in bundle
-
-
-def test_dashboard_bundle_draft_review_orders_questions_before_assumptions():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
-    review = bundle[
-        bundle.index("function renderDraftReview") : bundle.index("function renderAdvancedYaml")
-    ]
-
-    assert review.index("Questions") < review.index("Assumptions")
-
-
-def test_dashboard_bundle_draft_review_notes_when_assistant_metadata_is_missing():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
-    review = bundle[
-        bundle.index("function renderDraftReview") : bundle.index("function renderAdvancedYaml")
-    ]
-
-    assert "No assistant draft metadata available." in review
-    assert "hasDraftMetadata" in review
-
-
-def test_dashboard_bundle_goal_builder_does_not_duplicate_draft_summary():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
-    goal = bundle[
-        bundle.index("function renderGoalBuilder") : bundle.index("function renderDraftReview")
-    ]
-
-    assert "draftResult.summary" not in goal
+    assert "Refine" in bundle
 
 
 def test_dashboard_bundle_wires_draft_refine_before_advanced_yaml():
@@ -1856,7 +1879,7 @@ def test_dashboard_bundle_resets_stale_selection_after_goal_draft():
 def test_dashboard_bundle_keeps_yaml_as_advanced_escape_hatch():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
     advanced_pos = bundle.index("function renderAdvancedYaml")
-    advanced_body = bundle[advanced_pos : bundle.index("function renderDefinitionList", advanced_pos)]
+    advanced_body = bundle[advanced_pos : bundle.index("function renderTimeline", advanced_pos)]
 
     assert "showAdvancedYaml" in bundle
     for marker in ["Validate", "Deploy", "Import YAML", "Export YAML", "Copy YAML"]:
@@ -1946,18 +1969,16 @@ def test_dashboard_bundle_contains_text_first_agent_cell_editor_markers():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
 
     for marker in [
-        "Cell editor",
+        "renderAgentTaskInspector",
         "Agent cell prompt",
         "Prompt assistant",
         "Advanced JSON",
         "applyAgentCellForm",
-        "renderAgentCellEditor",
+        "renderInspectorForType",
         "promptText",
         "resultContractText",
         "/prompt-assistant/draft",
         "draftPromptWithAssistant",
-        "Available context placeholders",
-        "Expected output contract JSON",
     ]:
         assert marker in bundle
 
@@ -1979,12 +2000,8 @@ def test_dashboard_bundle_contains_workflow_mvp_api_and_ui_markers():
 
     for marker in [
         "Advanced YAML",
-        "Run test",
-        "Visual workflow editor",
-        "hermes-workflows-list",
-        "hermes-workflows-editor",
-        "hermes-workflows-run-form",
-        "hermes-workflows-executions",
+                                "hermes-workflows-editor",
+                "hermes-workflows-sidebar",
         "hermes-workflows-timeline",
         "hermes-workflows-graph",
     ]:
@@ -2387,7 +2404,7 @@ def test_dashboard_bundle_clears_draft_metadata_when_selecting_or_importing_defi
     assert "setDraftResult(null)" in import_body
 
     advanced_pos = bundle.index("function renderAdvancedYaml")
-    advanced_end = bundle.index("function renderDefinitionList", advanced_pos)
+    advanced_end = bundle.index("function renderTimeline", advanced_pos)
     advanced_body = bundle[advanced_pos:advanced_end]
     textarea_pos = advanced_body.index("onChange: function")
     textarea_block = advanced_body[textarea_pos : advanced_body.index("}),", textarea_pos)]

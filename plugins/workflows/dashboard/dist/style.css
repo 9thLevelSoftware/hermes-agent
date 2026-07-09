@@ -175,12 +175,6 @@
   text-overflow: ellipsis;
 }
 
-.hermes-workflows .hermes-workflows-sidebar-item-meta {
-  font-size: 0.72rem;
-  color: var(--color-muted-foreground);
-  white-space: nowrap;
-}
-
 .hermes-workflows .hermes-workflows-sidebar-badge {
   font-size: 0.68rem;
   padding: 0.1rem 0.35rem;
@@ -269,6 +263,45 @@
   background: color-mix(in srgb, var(--color-border) 18%, transparent);
 }
 
+.hermes-workflows .hermes-workflows-palette-card[draggable="true"] {
+  cursor: grab;
+}
+
+.hermes-workflows .hermes-workflows-palette-card[draggable="true"]:active {
+  cursor: grabbing;
+}
+
+.hermes-workflows .hermes-workflows-canvas-drop-target {
+  outline: 2px dashed var(--color-primary, var(--color-foreground));
+  outline-offset: -4px;
+}
+
+.hermes-workflows .hermes-workflows-context-menu {
+  position: fixed;
+  z-index: 1000;
+  background: var(--color-card, #fff);
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  padding: 0.25rem 0;
+}
+
+.hermes-workflows .hermes-workflows-context-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  padding: 0.3rem 0.75rem;
+  font-size: 0.82rem;
+  cursor: pointer;
+  color: var(--color-foreground);
+}
+
+.hermes-workflows .hermes-workflows-context-menu button:hover {
+  background: color-mix(in srgb, var(--color-border) 15%, transparent);
+}
+
 .hermes-workflows .hermes-workflows-palette-icon {
   grid-row: 1 / span 2;
   opacity: 0.86;
@@ -332,6 +365,23 @@
   letter-spacing: 0.04em;
   color: var(--color-muted-foreground);
   margin-bottom: 0.5rem;
+}
+
+.hermes-workflows .hermes-workflows-inspector-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.hermes-workflows .hermes-workflows-type-badge {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.3rem;
+  background: color-mix(in srgb, var(--color-border) 20%, transparent);
+  color: var(--color-muted-foreground);
 }
 
 /* Bottom panel: collapsible tabs for checklist / timeline / dispatcher / draft review */
@@ -444,32 +494,112 @@
 }
 
 /* Goal builder compact (inside sidebar) */
-.hermes-workflows .hermes-workflows-goal-compact textarea {
+.hermes-workflows .hermes-workflows-goal-compact textarea,
+.hermes-workflows .hermes-workflows-goal-compact input {
   width: 100%;
   font-size: 0.82rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  padding: 0.35rem 0.45rem;
+  background: var(--color-input, var(--color-card));
+  color: var(--color-foreground);
+  transition: border-color 0.15s ease;
+}
+
+.hermes-workflows .hermes-workflows-goal-compact textarea {
   min-height: 60px;
   resize: vertical;
 }
 
-.hermes-workflows .hermes-workflows-ai-routing-note {
-  border: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
-  border-radius: 0.45rem;
-  color: var(--color-muted-foreground);
-  font-size: 0.72rem;
-  margin: 0.3rem 0 0.45rem;
-  padding: 0.28rem 0.4rem;
+.hermes-workflows .hermes-workflows-goal-compact textarea:focus,
+.hermes-workflows .hermes-workflows-goal-compact input:focus {
+  border-color: var(--color-primary, var(--color-foreground));
+  outline: none;
 }
 
-.hermes-workflows .hermes-workflows-goal-compact .hermes-workflows-template-grid {
+.hermes-workflows .hermes-workflows-link-btn {
+  border: none;
+  background: transparent;
+  color: var(--color-primary, var(--color-foreground));
+  cursor: pointer;
+  font-size: 0.78rem;
+  padding: 0.2rem 0;
+  text-decoration: underline;
+}
+
+.hermes-workflows .hermes-workflows-run-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-  margin-top: 0.4rem;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: color-mix(in srgb, var(--color-background) 70%, transparent);
 }
 
-.hermes-workflows .hermes-workflows-goal-compact .hermes-workflows-template-card {
-  font-size: 0.74rem;
-  padding: 0.2rem 0.4rem;
+.hermes-workflows .hermes-workflows-run-panel {
+  width: min(560px, 100%);
+  max-height: min(720px, calc(100vh - 2rem));
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius, 0.75rem);
+  background: var(--color-card);
+  box-shadow: 0 24px 80px color-mix(in srgb, black 45%, transparent);
+}
+
+.hermes-workflows .hermes-workflows-run-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.hermes-workflows .hermes-workflows-run-panel-header h3 {
+  margin: 0 0 0.25rem 0;
+}
+
+.hermes-workflows .hermes-workflows-run-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.hermes-workflows .hermes-workflows-run-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.84rem;
+}
+
+.hermes-workflows .hermes-workflows-run-field input,
+.hermes-workflows .hermes-workflows-run-field select,
+.hermes-workflows .hermes-workflows-run-field textarea,
+.hermes-workflows .hermes-workflows-run-panel > textarea {
+  width: 100%;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  padding: 0.35rem 0.45rem;
+  color: var(--color-foreground);
+  background: var(--color-input, var(--color-card));
+}
+
+.hermes-workflows .hermes-workflows-run-advanced-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+  color: var(--color-muted-foreground);
+}
+
+.hermes-workflows .hermes-workflows-run-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
 }
 
 /* Responsive: stack vertically on narrow screens */
@@ -500,21 +630,11 @@
   }
 }
 
-
-
-.hermes-workflows .hermes-workflows-header,
 .hermes-workflows .hermes-workflows-panel {
   border: 1px solid var(--color-border);
   border-radius: var(--radius, 0.75rem);
   background: color-mix(in srgb, var(--color-card) 88%, transparent);
   padding: 1rem;
-}
-
-.hermes-workflows .hermes-workflows-header {
-  display: flex;
-  justify-content: space-between;
-  gap: 1rem;
-  align-items: flex-start;
 }
 
 .hermes-workflows h1,
@@ -542,21 +662,6 @@
   font-size: 0.84rem;
 }
 
-.hermes-workflows .hermes-workflows-privacy-note {
-  color: var(--color-muted-foreground);
-  font-size: 0.85rem;
-  border-left: 2px solid rgba(255, 193, 7, 0.65);
-  padding-left: 0.75rem;
-  margin: 0.5rem 0 1rem;
-}
-
-.hermes-workflows .hermes-workflows-grid {
-  display: grid;
-  grid-template-columns: minmax(260px, 0.9fr) minmax(340px, 1.3fr);
-  gap: 1rem;
-  align-items: start;
-}
-
 .hermes-workflows .hermes-workflows-panel {
   display: flex;
   flex-direction: column;
@@ -576,38 +681,12 @@
   flex-wrap: wrap;
 }
 
-.hermes-workflows .hermes-workflows-list,
-.hermes-workflows .hermes-workflows-executions,
 .hermes-workflows .hermes-workflows-timeline,
 .hermes-workflows .hermes-workflows-node-runs,
 .hermes-workflows .hermes-workflows-node-run-group {
   display: flex;
   flex-direction: column;
   gap: 0.45rem;
-}
-
-.hermes-workflows .hermes-workflows-item {
-  width: 100%;
-  text-align: left;
-  border: 1px solid var(--color-border);
-  border-radius: calc(var(--radius, 0.75rem) * 0.75);
-  background: color-mix(in srgb, var(--color-card) 72%, transparent);
-  color: inherit;
-  padding: 0.65rem;
-  cursor: pointer;
-}
-
-.hermes-workflows .hermes-workflows-item:hover,
-.hermes-workflows .hermes-workflows-item.is-selected {
-  border-color: var(--color-primary);
-  background: color-mix(in srgb, var(--color-primary) 12%, var(--color-card));
-}
-
-.hermes-workflows .hermes-workflows-item-title {
-  display: flex;
-  justify-content: space-between;
-  gap: 0.75rem;
-  font-weight: 650;
 }
 
 .hermes-workflows .hermes-workflows-meta {
@@ -637,9 +716,6 @@
 }
 
 .hermes-workflows .hermes-workflows-editor,
-.hermes-workflows .hermes-workflows-goal-input,
-.hermes-workflows .hermes-workflows-run-input,
-.hermes-workflows .hermes-workflows-refine-input,
 .hermes-workflows input,
 .hermes-workflows select {
   width: 100%;
@@ -651,31 +727,6 @@
 }
 
 .hermes-workflows .hermes-workflows-editor,
-.hermes-workflows .hermes-workflows-run-input {
-  min-height: 12rem;
-  resize: vertical;
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-  font-size: 0.82rem;
-  line-height: 1.45;
-}
-
-.hermes-workflows .hermes-workflows-run-input {
-  min-height: 7rem;
-}
-
-.hermes-workflows .hermes-workflows-goal-input {
-  min-height: 9rem;
-  resize: vertical;
-  font: inherit;
-  line-height: 1.45;
-}
-
-.hermes-workflows .hermes-workflows-refine-input {
-  min-height: 6rem;
-  resize: vertical;
-  font: inherit;
-  line-height: 1.45;
-}
 
 .hermes-workflows .hermes-workflows-prompt-editor {
   min-height: 220px;
@@ -727,25 +778,6 @@
   background: color-mix(in srgb, var(--color-primary) 20%, var(--color-card));
 }
 
-.hermes-workflows .hermes-workflows-template-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 0.5rem;
-}
-
-.hermes-workflows .hermes-workflows-template-card {
-  text-align: left;
-}
-
-.hermes-workflows .hermes-workflows-draft-review {
-  gap: 0.75rem;
-}
-
-.hermes-workflows .hermes-workflows-draft-summary {
-  border-left: 3px solid var(--color-primary);
-  padding-left: 0.75rem;
-}
-
 .hermes-workflows .hermes-workflows-checklist {
   list-style: none;
   margin: 0;
@@ -764,56 +796,9 @@
 }
 
 .hermes-workflows .hermes-workflows-checklist-item.is-fail,
-.hermes-workflows .hermes-workflows-dispatcher-readiness.is-warning {
-  color: var(--color-destructive, var(--color-primary));
-}
-
-.hermes-workflows .hermes-workflows-dispatcher-readiness.is-unknown {
-  color: var(--color-muted-foreground);
-}
 
 .hermes-workflows .hermes-workflows-checklist-mark {
   font-weight: 700;
-}
-
-.hermes-workflows .hermes-workflows-draft-table-wrap {
-  overflow-x: auto;
-}
-
-.hermes-workflows .hermes-workflows-draft-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.84rem;
-}
-
-.hermes-workflows .hermes-workflows-draft-table th,
-.hermes-workflows .hermes-workflows-draft-table td {
-  border-bottom: 1px solid var(--color-border);
-  padding: 0.45rem 0.5rem;
-  text-align: left;
-  vertical-align: top;
-}
-
-.hermes-workflows .hermes-workflows-draft-table th {
-  color: var(--color-muted-foreground);
-  font-size: 0.72rem;
-  text-transform: uppercase;
-}
-
-.hermes-workflows .hermes-workflows-draft-sections {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 0.75rem;
-}
-
-.hermes-workflows .hermes-workflows-draft-section ul {
-  margin: 0.35rem 0 0;
-  padding-left: 1.1rem;
-}
-
-.hermes-workflows .hermes-workflows-refine-form {
-  border-top: 1px solid var(--color-border);
-  padding-top: 0.75rem;
 }
 
 .hermes-workflows .hermes-workflows-banner {
@@ -827,12 +812,6 @@
 .hermes-workflows .hermes-workflows-banner.is-error {
   border-color: var(--color-destructive, var(--color-primary));
   color: var(--color-destructive, var(--color-primary));
-}
-
-.hermes-workflows .hermes-workflows-graph {
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
 }
 
 .hermes-workflows .hermes-workflows-node-grid {
@@ -885,21 +864,6 @@
 
 .hermes-workflows .hermes-workflows-node-run-preview .hermes-workflows-pre {
   max-height: 12rem;
-}
-
-.hermes-workflows .hermes-workflows-editor-layout,
-.hermes-workflows .hermes-workflows-builder {
-  display: grid;
-  grid-template-columns: minmax(420px, 1fr) minmax(320px, 420px);
-  gap: 1rem;
-  align-items: start;
-  min-height: 28rem;
-}
-
-.hermes-workflows .hermes-workflows-editor-main,
-.hermes-workflows .hermes-workflows-cell-list {
-  display: grid;
-  gap: 0.75rem;
 }
 
 .hermes-workflows .hermes-workflows-cell-list {
@@ -1010,16 +974,4 @@
   inset: 0;
   opacity: 0;
   cursor: pointer;
-}
-
-@media (max-width: 980px) {
-  .hermes-workflows .hermes-workflows-grid,
-  .hermes-workflows .hermes-workflows-editor-layout,
-  .hermes-workflows .hermes-workflows-builder {
-    grid-template-columns: 1fr;
-  }
-
-  .hermes-workflows .hermes-workflows-header {
-    flex-direction: column;
-  }
 }

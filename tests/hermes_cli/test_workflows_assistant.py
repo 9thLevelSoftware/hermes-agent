@@ -143,6 +143,17 @@ def test_parse_assistant_payload_keeps_envelope_when_nested_output_has_spec_key(
     assert result.spec.nodes["done"].output == {"spec": {"note": "nested only"}}
 
 
+def test_build_draft_prompt_requires_runtime_input_fields_for_manual_workflows():
+    prompt = build_draft_prompt(
+        "Review a repo's readme file against current code and update it if needed."
+    )
+
+    assert "triggers[].input" in prompt
+    assert "repo_path" in prompt
+    assert "${ input.repo_path }" in prompt
+    assert "manual workflows that need user data" in prompt
+
+
 def test_draft_workflow_calls_runner_with_plain_goal_and_returns_valid_spec():
     calls = []
 
@@ -295,10 +306,11 @@ def test_draft_workflow_repair_attempts_zero_fails_after_one_call() -> None:
     assert calls == 1
 
 
-def test_draft_prompt_uses_valid_empty_edges_example():
+def test_draft_prompt_uses_valid_edge_object_example():
     prompt = build_draft_prompt("Build a valid workflow")
 
-    assert '"edges": []' in prompt
+    assert '"edges": [' in prompt
+    assert '{"from": "agent_node", "to": "done"}' in prompt
     assert "next_node_id" not in prompt
 
 

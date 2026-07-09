@@ -84,13 +84,28 @@ def _assistant_validation_http() -> HTTPException:
     )
 
 
-def _assistant_runtime_http() -> HTTPException:
+def _assistant_runtime_http(detail: str | None = None) -> HTTPException:
+    message = "Workflow assistant failed before returning a valid draft."
+    hint = "Check workflow assistant provider/model configuration, then retry or use Advanced YAML."
+    sensitive_keywords = {
+        "secret",
+        "token",
+        "api_key",
+        "password",
+        "key",
+        "auth",
+        "credential",
+        "private",
+        "jwt",
+    }
+    if detail and not any(kw in detail.lower() for kw in sensitive_keywords):
+        message = message + " (" + detail + ")"
     return HTTPException(
         status_code=502,
         detail={
             "code": "workflow_assistant_runtime_error",
-            "message": "Workflow assistant failed before returning a valid draft.",
-            "hint": "Check workflow assistant provider/model configuration, then retry or use Advanced YAML.",
+            "message": message,
+            "hint": hint,
         },
     )
 
@@ -414,7 +429,7 @@ async def draft_definition(request: Request) -> dict[str, Any]:
         raise _http_400(exc) from exc
     except Exception as exc:
         logger.exception("workflow draft runtime failed: %s", type(exc).__name__)
-        raise _assistant_runtime_http() from exc
+        raise _assistant_runtime_http(str(exc)[:200]) from exc
     return {"draft": result.to_dict()}
 
 
@@ -446,7 +461,7 @@ async def refine_definition(request: Request) -> dict[str, Any]:
         raise _http_400(exc) from exc
     except Exception as exc:
         logger.exception("workflow refine runtime failed: %s", type(exc).__name__)
-        raise _assistant_runtime_http() from exc
+        raise _assistant_runtime_http(str(exc)[:200]) from exc
     return {"draft": result.to_dict()}
 
 
@@ -497,6 +512,16 @@ def get_definition(
     except KeyError as exc:
         raise _http_404(exc) from exc
     return {"definition": _definition_to_dict(record, include_spec=True)}
+
+
+@router.delete("/definitions/{workflow_id}")
+def delete_definition(workflow_id: str) -> dict[str, Any]:
+    try:
+        with _connect_initialized() as conn:
+            wfdb.delete_definition(conn, workflow_id)
+    except KeyError as exc:
+        raise _http_404(exc) from exc
+    return {"deleted": True, "workflow_id": workflow_id}
 
 
 @router.post("/definitions/{workflow_id}/run")
