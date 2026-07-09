@@ -1078,6 +1078,9 @@
     const stateShowAdvancedInputJson = useState(false);
     const showAdvancedInputJson = stateShowAdvancedInputJson[0];
     const setShowAdvancedInputJson = stateShowAdvancedInputJson[1];
+    const stateRunPanelOpen = useState(false);
+    const runPanelOpen = stateRunPanelOpen[0];
+    const setRunPanelOpen = stateRunPanelOpen[1];
     const stateEvents = useState([]);
     const events = stateEvents[0];
     const setEvents = stateEvents[1];
@@ -1376,7 +1379,7 @@
         const id = definition.workflow_id || definition.id || "";
         const version = definition.version;
         setDraftSpec(definition.spec || null);
-        setStatus("Deployed " + safeString(id));
+        setStatus("Deployed " + safeString(id) + ". Use Run to provide start input and launch an execution.");
         return loadDefinitions(id, version);
       }).catch(fail).finally(function () { setDeploying(false); });
     }
@@ -1444,6 +1447,7 @@
       }).then(function (res) {
         const execution = res.execution || {};
         const executionId = execution.execution_id;
+        setRunPanelOpen(false);
         setStatus("Started execution " + safeString(executionId));
         return loadExecutions(executionId);
       }).catch(fail).finally(function () { setRunning(false); });
@@ -2344,7 +2348,7 @@
           h("button", { type: "button", disabled: validating || !hasDraft, onClick: validateDefinition }, validating ? "Validating…" : "Validate"),
           h("button", { type: "button", disabled: deploying || !hasDraft, onClick: deployDefinition, className: "hermes-workflows-primary" }, deploying ? "Deploying…" : "Deploy"),
           persisted ? h("button", { type: "button", disabled: deleting, onClick: deleteWorkflow, "aria-label": "Delete workflow" }, deleting ? "Deleting…" : "Delete") : null,
-          persisted ? h("button", { type: "button", disabled: running, onClick: runWorkflow }, running ? "Running…" : "Run") : null,
+          persisted ? h("button", { type: "button", disabled: running, onClick: function () { setRunWorkflowId(workflowIdForDefinition(selectedDefinition)); setRunPanelOpen(true); } }, running ? "Running…" : "Run") : null,
           h("button", { type: "button", disabled: loading, onClick: function () { refresh(); } }, loading ? "Refreshing…" : "Refresh"),
           h("button", { type: "button", onClick: function() { setShowAdvancedYaml(!showAdvancedYaml); } }, showAdvancedYaml ? "Hide YAML" : "YAML")
         )
@@ -2482,6 +2486,67 @@
       );
     }
 
+    function renderRunInputField(field) {
+      var name = safeString(field && field.name);
+      var kind = safeString((field && field.kind) || "text");
+      var value = inputFieldValues[name] === undefined || inputFieldValues[name] === null ? "" : inputFieldValues[name];
+      function updateValue(event) {
+        var next = Object.assign({}, inputFieldValues);
+        next[name] = event.target.value;
+        setInputFieldValues(next);
+      }
+      return h("label", { key: name, className: "hermes-workflows-run-field" },
+        h("span", null, name),
+        kind === "boolean" ? h("select", { value: value, onChange: updateValue },
+          h("option", { value: "" }, "Not set"),
+          h("option", { value: "true" }, "true"),
+          h("option", { value: "false" }, "false")
+        ) : kind === "json" ? h("textarea", {
+          value: value,
+          onChange: updateValue,
+          placeholder: "JSON value",
+          rows: 3,
+        }) : h("input", {
+          type: kind === "number" || kind === "integer" ? "number" : "text",
+          step: kind === "integer" ? "1" : "any",
+          value: value,
+          onChange: updateValue,
+          placeholder: kind,
+        })
+      );
+    }
+
+    function renderRunStartPanel() {
+      if (!runPanelOpen) return null;
+      var fields = inputFieldsForSpec(runInputSpec());
+      return h("div", { className: "hermes-workflows-run-overlay", role: "dialog", "aria-modal": "true", "aria-label": "Start workflow run" },
+        h("form", { className: "hermes-workflows-run-panel", onSubmit: runWorkflow },
+          h("div", { className: "hermes-workflows-run-panel-header" },
+            h("div", null,
+              h("h3", null, "Start Workflow Run"),
+              h("p", { className: "hermes-workflows-muted" }, fields.length ? "Provide the manual trigger input for this execution." : "No start input fields are configured for this workflow. Running will use empty input.")
+            ),
+            h("button", { type: "button", className: "hermes-workflows-link-button", onClick: function () { setRunPanelOpen(false); } }, "Close")
+          ),
+          fields.length && !showAdvancedInputJson ? h("div", { className: "hermes-workflows-run-fields" }, fields.map(renderRunInputField)) : null,
+          h("label", { className: "hermes-workflows-run-advanced-toggle" },
+            h("input", { type: "checkbox", checked: showAdvancedInputJson, onChange: function (event) { setShowAdvancedInputJson(event.target.checked); } }),
+            h("span", null, "Use advanced JSON input")
+          ),
+          showAdvancedInputJson ? h("textarea", {
+            value: runInputText,
+            onChange: function (event) { setRunInputText(event.target.value); },
+            rows: 8,
+            "aria-label": "Workflow input JSON",
+          }) : null,
+          h("div", { className: "hermes-workflows-run-actions" },
+            h("button", { type: "button", onClick: function () { setRunPanelOpen(false); } }, "Cancel"),
+            h("button", { type: "submit", className: "hermes-workflows-primary", disabled: running }, running ? "Running…" : "Start Run")
+          )
+        )
+      );
+    }
+
     function renderBottomPanel() {
       var tabs = [
         ["checklist", "Validation"],
@@ -2536,6 +2601,7 @@
             )
           )
         ),
+        renderRunStartPanel(),
         renderBottomPanel(),
         showAdvancedYaml ? renderAdvancedYaml() : null
       )

@@ -172,6 +172,7 @@ def _json_schema_instruction() -> str:
   }
 }
 IMPORTANT: Each edge MUST be a JSON object with "from" and "to" keys, NOT a string. For switch/parallel branches use dot notation in the "from" field: {"from": "switch_id.case_name", "to": "target_node"}.
+For manual workflows that need user data at start, declare fields in triggers[].input and reference them in agent prompts with ${ input.field_name }. Example for repository workflows: {"type": "manual", "id": "manual", "input": {"repo_path": {"type": "string", "description": "Path to the repository to inspect"}}}; then prompts should reference ${ input.repo_path }.
 Optional agent_task routing fields, only when the user explicitly asks for provider/model routing: "provider": "provider-slug", "model": "model-name".
 Do not include Markdown fences or prose outside the JSON object."""
 
@@ -190,7 +191,9 @@ def _workflow_patterns() -> str:
    Pattern:
      nodes: { "review": {type: agent_task, ...}, "decide": {type: switch, cases: [{name: "approved"}, {name: "rejected"}], default: "report"}, "deploy": {type: agent_task, ...}, "report": {type: agent_task, ...}, "done": {type: pass} }
      edges: [{"from": "review", "to": "decide"}, {"from": "decide.approved", "to": "deploy"}, {"from": "decide.rejected", "to": "report"}, {"from": "deploy", "to": "done"}, {"from": "report", "to": "done"}]
-   Key: the switch node evaluates its cases and routes to exactly one branch. The "default" field is the fallback target node id.
+   Key: the switch node evaluates its cases and routes to exactly one branch. The "default" field is the fallback target node id. Every case target and default target must be an existing node id.
+
+   README parity example: manual trigger input should include repo_path; review reads ${ input.repo_path }; decide has cases [{name: "needs_update"}, {name: "no_update"}] and default "no_changes"; nodes must include review, decide, update_readme, no_changes, done; edges must include review -> decide, decide.needs_update -> update_readme, decide.no_update -> no_changes, update_readme -> done, no_changes -> done.
 
 3. PARALLEL FAN-OUT + JOIN: Use parallel + join when the goal has "and also", "in parallel", "simultaneously", or independent workstreams that converge.
    The parallel node requires branch-suffixed edges: {"from": "parallel_id.branch_name", "to": "target"}.
@@ -221,10 +224,11 @@ def _assistant_rules() -> str:
 - Do not emit webhook, kanban_event, send_message, or subworkflow.
 - Every agent_task must include profile, title, text prompt, and result_contract with required downstream keys.
 - Every agent_task prompt must ask for JSON-only output matching its result_contract.
+- Manual workflows that require user-specific data (repo path, file path, URL, issue id, branch name, prompt text, destination, etc.) must declare those fields in the manual trigger's input object and reference them in prompts as ${ input.field_name }. Do not hide required run-start data inside assumptions.
 - Use provider/model only when requested: only include provider and model fields when the user explicitly asks for provider/model routing; otherwise omit them so the profile defaults apply.
 - If provider/model routing is requested, set provider and model on each affected agent_task cell independently.
 - Use the workflow logic patterns above. Match the pattern to the user's goal structure, not always a linear chain.
-- When the goal has a decision point ("if X then Y else Z"), use a switch node with named cases and edges using "switch_id.case_name -> target".
+- When the goal has a decision point ("if X then Y else Z"), use a switch node with named cases and edges using "switch_id.case_name -> target". The switch default and every case edge target must name an existing node.
 - When the goal has independent parallel work, use parallel + join nodes with "parallel_id.branch_name -> target" edges.
 - Prefer complete end-to-end flows: every branch must reach a terminal node (pass or fail). Do not leave dangling branches.
 - Use lowercase snake_case node ids."""

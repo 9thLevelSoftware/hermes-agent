@@ -773,7 +773,8 @@ def test_dashboard_validate_keeps_draft_unrunnable_until_deploy():
     assert "setSelectedDefinition" not in validate
     assert "updateEditorText(specToEditorText(definition.spec))" in validate
     assert "var persisted = !!(selectedDefinition && workflowIdForDefinition(selectedDefinition)" in topbar
-    assert "persisted ? h(\"button\", { type: \"button\", disabled: running, onClick: runWorkflow }" in topbar
+    assert "setRunPanelOpen(true)" in topbar
+    assert "onClick: runWorkflow" not in topbar
 
 
 def test_dashboard_bundle_runs_selected_or_active_definition_version():
@@ -1574,10 +1575,33 @@ def test_dashboard_bundle_registers_plugin_without_build_scaffolding():
 def test_dashboard_bundle_uses_generated_input_form_for_runs():
     bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
 
-    assert "runWorkflow" in bundle
-    assert "inputFieldValues" in bundle
+    assert "renderRunStartPanel" in bundle
+    assert "Start Workflow Run" in bundle
+    assert "Start Run" in bundle
+    assert "No start input fields are configured" in bundle
     assert "inputFieldValues" in bundle
     assert "Manual run form" not in bundle
+
+
+def test_dashboard_topbar_run_opens_start_panel_instead_of_running_silently():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    topbar_pos = bundle.index("function renderTopBar")
+    topbar_body = bundle[topbar_pos : bundle.index("function renderSidebar", topbar_pos)]
+
+    assert "setRunPanelOpen(true)" in topbar_body
+    assert "onClick: runWorkflow" not in topbar_body
+
+
+def test_dashboard_run_start_panel_builds_typed_inputs_from_trigger_schema():
+    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    panel_pos = bundle.index("function renderRunInputField")
+    panel_body = bundle[panel_pos : bundle.index("function renderBottomPanel", panel_pos)]
+
+    assert "inputFieldsForSpec(runInputSpec())" in panel_body
+    assert "showAdvancedInputJson" in panel_body
+    assert "runInputText" in panel_body
+    assert "inputFieldValues" in panel_body
+    assert "runWorkflow" in panel_body
 
 
 def test_dashboard_run_workflow_uses_form_values_unless_advanced_json():

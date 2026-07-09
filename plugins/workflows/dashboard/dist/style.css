@@ -527,6 +527,81 @@
   text-decoration: underline;
 }
 
+.hermes-workflows .hermes-workflows-run-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: color-mix(in srgb, var(--color-background) 70%, transparent);
+}
+
+.hermes-workflows .hermes-workflows-run-panel {
+  width: min(560px, 100%);
+  max-height: min(720px, calc(100vh - 2rem));
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius, 0.75rem);
+  background: var(--color-card);
+  box-shadow: 0 24px 80px color-mix(in srgb, black 45%, transparent);
+}
+
+.hermes-workflows .hermes-workflows-run-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.hermes-workflows .hermes-workflows-run-panel-header h3 {
+  margin: 0 0 0.25rem 0;
+}
+
+.hermes-workflows .hermes-workflows-run-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.hermes-workflows .hermes-workflows-run-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.84rem;
+}
+
+.hermes-workflows .hermes-workflows-run-field input,
+.hermes-workflows .hermes-workflows-run-field select,
+.hermes-workflows .hermes-workflows-run-field textarea,
+.hermes-workflows .hermes-workflows-run-panel > textarea {
+  width: 100%;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  padding: 0.35rem 0.45rem;
+  color: var(--color-foreground);
+  background: var(--color-input, var(--color-card));
+}
+
+.hermes-workflows .hermes-workflows-run-advanced-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+  color: var(--color-muted-foreground);
+}
+
+.hermes-workflows .hermes-workflows-run-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
 /* Responsive: stack vertically on narrow screens */
 @media (max-width: 900px) {
   .hermes-workflows .hermes-workflows-app {
