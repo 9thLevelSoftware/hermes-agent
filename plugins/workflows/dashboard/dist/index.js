@@ -1271,8 +1271,16 @@
         const currentId = workflowIdForDefinition(selectedDefinition);
         const currentVersion = selectedDefinition && selectedDefinition.version;
         const first = rows[0] || null;
-        const nextId = preferId || currentId || runWorkflowId || workflowIdForDefinition(first) || "";
-        let nextVersion = preferId ? preferVersion : (currentId ? currentVersion : undefined);
+        function hasDefinition(id) {
+          return !!id && rows.some(function (definition) {
+            return workflowIdForDefinition(definition) === String(id);
+          });
+        }
+        const preferredId = hasDefinition(preferId) ? preferId : "";
+        const selectedId = hasDefinition(currentId) ? currentId : "";
+        const runId = hasDefinition(runWorkflowId) ? runWorkflowId : "";
+        const nextId = preferredId || selectedId || runId || workflowIdForDefinition(first) || "";
+        let nextVersion = preferredId ? preferVersion : (selectedId ? currentVersion : undefined);
         if ((nextVersion === undefined || nextVersion === null || nextVersion === "") && nextId) {
           const matches = rows.filter(function (definition) {
             return workflowIdForDefinition(definition) === String(nextId);
@@ -1294,7 +1302,12 @@
       return api("/executions").then(function (res) {
         const rows = asArray(res.executions);
         const currentId = selectedExecution && selectedExecution.execution_id;
-        const nextId = preferId || currentId || (rows[0] && rows[0].execution_id) || "";
+        function hasExecution(id) {
+          return !!id && rows.some(function (execution) {
+            return String(execution.execution_id || execution.id || "") === String(id);
+          });
+        }
+        const nextId = (hasExecution(preferId) ? preferId : "") || (hasExecution(currentId) ? currentId : "") || (rows[0] && rows[0].execution_id) || "";
         setExecutions(rows);
         if (nextId) return loadExecution(nextId);
         setSelectedExecution(null);
@@ -1415,9 +1428,10 @@
         setSelectedExecution(null);
         setEvents([]);
         setNodeRuns([]);
+        setNodePositions({});
         updateEditorText(specToEditorText(newWorkflowSpec("Untitled Workflow")));
         setStatus("Deleted workflow " + safeString(workflowId));
-        return Promise.all([loadDefinitions(), loadExecutions()]);
+        return Promise.all([loadDefinitions("__deleted_workflow__"), loadExecutions("__deleted_execution__")]);
       }).catch(fail).finally(function () { setDeleting(false); });
     }
 
@@ -2356,12 +2370,19 @@
               Controls ? h(Controls, null) : null
             )
           ),
-          contextMenu.visible ? h("div", {
-            className: "hermes-workflows-context-menu",
-            style: { left: contextMenu.x + "px", top: contextMenu.y + "px" },
-            onClick: function () { setContextMenu({ x: 0, y: 0, visible: false }); },
-          },
-            h("button", { type: "button", onClick: function () { deleteSelectedCell(); setContextMenu({ x: 0, y: 0, visible: false }); } }, "Delete cell")
+          contextMenu.visible ? h(React.Fragment, null,
+            h("div", {
+              className: "hermes-workflows-context-menu-overlay",
+              style: { position: "fixed", inset: 0, zIndex: 999 },
+              onClick: function () { setContextMenu({ x: 0, y: 0, visible: false }); }
+            }),
+            h("div", {
+              className: "hermes-workflows-context-menu",
+              style: { left: contextMenu.x + "px", top: contextMenu.y + "px", zIndex: 1000 },
+              onClick: function () { setContextMenu({ x: 0, y: 0, visible: false }); },
+            },
+              h("button", { type: "button", onClick: function () { deleteSelectedCell(); setContextMenu({ x: 0, y: 0, visible: false }); } }, "Delete cell")
+            )
           ) : null
         )
       );
@@ -2465,8 +2486,7 @@
                 className: "hermes-workflows-sidebar-item",
                 onClick: function (event) {
                   event.stopPropagation();
-                  loadEvents(eid);
-                  loadNodeRuns(eid);
+                  loadExecution(eid).catch(fail);
                 },
               },
                 h("span", { className: "hermes-workflows-sidebar-item-title" }, eid.slice(0, 16)),

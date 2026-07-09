@@ -124,7 +124,27 @@ def test_workflow_dashboard_supports_keyboard_delete_and_context_menu() -> None:
     assert "onNodeContextMenu" in text
     assert "contextMenu" in text
     assert "hermes-workflows-context-menu" in text
+    assert "hermes-workflows-context-menu-overlay" in text
+    assert 'style: { position: "fixed", inset: 0, zIndex: 999 }' in text
     assert "Delete cell" in text
+
+
+def test_workflow_dashboard_delete_clears_stale_local_state() -> None:
+    text = BUNDLE.read_text(encoding="utf-8")
+    delete_body = text[text.index("function deleteWorkflow") : text.index("function selectedRunVersion")]
+    assert "setNodePositions({})" in delete_body
+    assert 'loadDefinitions("__deleted_workflow__")' in delete_body
+    assert 'loadExecutions("__deleted_execution__")' in delete_body
+    assert "function hasDefinition(id)" in text
+    assert "function hasExecution(id)" in text
+
+
+def test_workflow_dashboard_sidebar_execution_loads_selected_execution() -> None:
+    text = BUNDLE.read_text(encoding="utf-8")
+    sidebar_body = text[text.index("function renderSidebar") : text.index("function renderBuilderToolbar")]
+    assert "loadExecution(eid).catch(fail)" in sidebar_body
+    assert "loadEvents(eid);" not in sidebar_body
+    assert "loadNodeRuns(eid);" not in sidebar_body
 
 
 def test_workflow_dashboard_prompt_assistant_is_collapsible() -> None:

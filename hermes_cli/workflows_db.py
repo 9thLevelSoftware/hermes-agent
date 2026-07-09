@@ -416,12 +416,12 @@ def list_definitions(conn: sqlite3.Connection) -> list[WorkflowDefinitionRecord]
 
 
 def delete_definition(conn: sqlite3.Connection, workflow_id: str) -> bool:
-    if not conn.execute(
-        "SELECT 1 FROM workflow_definitions WHERE workflow_id = ? LIMIT 1",
-        (workflow_id,),
-    ).fetchone():
-        raise KeyError(f"workflow definition not found: {workflow_id}")
     with write_txn(conn):
+        if not conn.execute(
+            "SELECT 1 FROM workflow_definitions WHERE workflow_id = ? LIMIT 1",
+            (workflow_id,),
+        ).fetchone():
+            raise KeyError(f"workflow definition not found: {workflow_id}")
         conn.execute(
             """
             DELETE FROM workflow_events

@@ -87,7 +87,18 @@ def _assistant_validation_http() -> HTTPException:
 def _assistant_runtime_http(detail: str | None = None) -> HTTPException:
     message = "Workflow assistant failed before returning a valid draft."
     hint = "Check workflow assistant provider/model configuration, then retry or use Advanced YAML."
-    if detail and "secret" not in detail.lower() and "token" not in detail.lower() and "api_key" not in detail.lower() and "password" not in detail.lower():
+    sensitive_keywords = {
+        "secret",
+        "token",
+        "api_key",
+        "password",
+        "key",
+        "auth",
+        "credential",
+        "private",
+        "jwt",
+    }
+    if detail and not any(kw in detail.lower() for kw in sensitive_keywords):
         message = message + " (" + detail + ")"
     return HTTPException(
         status_code=502,
