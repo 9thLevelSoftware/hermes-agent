@@ -219,19 +219,19 @@ def test_dashboard_input_feed_api_rejects_non_continuous_trigger(client):
 
 
 def test_dashboard_tick_endpoint_advances_workflows(client, monkeypatch):
-    calls: list[int] = []
+    from hermes_cli.workflows_dispatcher import TickReport
 
-    def fake_tick(*, limit: int = 1) -> int:
-        calls.append(limit)
-        return 3
+    def fake_tick_detailed(*, limit: int = 1) -> TickReport:
+        return TickReport(processed=3, executions_advanced=3)
 
-    monkeypatch.setattr(workflows_dispatcher, "tick", fake_tick)
+    monkeypatch.setattr(workflows_dispatcher, "tick_detailed", fake_tick_detailed)
 
     r = client.post("/api/plugins/workflows/tick", json={"limit": 2})
 
     assert r.status_code == 200, r.text
-    assert r.json() == {"processed": 3}
-    assert calls == [2]
+    body = r.json()
+    assert body["processed"] == 3
+    assert body["executions_advanced"] == 3
 
 
 def test_dashboard_input_feed_api_can_pause_resume_and_start_execution(client):
@@ -1212,6 +1212,7 @@ def test_dashboard_event_status_maps_only_emitted_kinds():
 
 def _dashboard_helper_js() -> str:
     bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
+    editor = (PLUGIN_DIR / "src" / "editor-model.js").read_text(encoding="utf-8")
     kind_start = bundle.index("const NODE_KIND_LIST")
     kind_end = bundle.index("const EXAMPLE_DEFINITION", kind_start)
     start = bundle.index("function asArray")
@@ -1219,10 +1220,14 @@ def _dashboard_helper_js() -> str:
     # Include editor helper functions used by UI-only builder tests.
     editor_start = bundle.index("function cleanedNodeForSpec")
     editor_end = bundle.index("function WorkflowsPage", editor_start)
+    # Strip ES export keywords so node -e can eval the functions.
+    editor_src = editor.replace("export function", "function").replace("export const", "const")
     return (
         bundle[kind_start:kind_end]
         + "\n"
         + bundle[start:end]
+        + "\n"
+        + editor_src
         + "\n"
         + bundle[editor_start:editor_end]
     )
@@ -3083,3 +3088,32 @@ def test_definition_draft_endpoint_returns_typed_assistant_validation_error(clie
     assert r.status_code == 400, r.text
     detail = r.json()["detail"]
     assert detail["code"] == "workflow_assistant_validation_error"
+
+
+def test_dashboard_tick_endpoint_returns_detailed_report(client, monkeypatch):
+    from hermes_cli.workflows_dispatcher import TickReport
+
+    def fake_tick_detailed(*, limit: int = 1) -> TickReport:
+        return TickReport(
+            schedules_admitted=0,
+            feed_items_admitted=1,
+            executions_advanced=1,
+            remaining_queued=0,
+            remaining_running_or_waiting=0,
+            processed=2,
+        )
+
+    monkeypatch.setattr(workflows_dispatcher, "tick_detailed", fake_tick_detailed)
+
+    r = client.post("/api/plugins/workflows/tick", json={"limit": 2})
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body == {
+        "schedules_admitted": 0,
+        "feed_items_admitted": 1,
+        "executions_advanced": 1,
+        "remaining_queued": 0,
+        "remaining_running_or_waiting": 0,
+        "processed": 2,
+    }

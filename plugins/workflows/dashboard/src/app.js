@@ -1,6 +1,7 @@
 import { graphItems as buildGraphItems, decorateGraphItems as decorateGraph } from "./graph.js";
 import { formatApiError as importedFormatApiError, createApi as buildApi } from "./api.js";
 import { semanticWorkflowDiff, isDraftDirty, buildApiHelpers } from "./build.js";
+import { feedActions, shouldPollFeed, fieldErrors } from "./run.js";
 import {
   WORKSPACE_MODES,
   locationForMode,
@@ -1165,6 +1166,7 @@ import {
     const stateRunPanelOpen = useState(false);
     const runPanelOpen = stateRunPanelOpen[0];
     const setRunPanelOpen = stateRunPanelOpen[1];
+    const [runFieldErrors, setRunFieldErrors] = useState({});
     const stateInputFeeds = useState([]);
     const inputFeeds = stateInputFeeds[0];
     const setInputFeeds = stateInputFeeds[1];
@@ -1366,7 +1368,12 @@ import {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ limit: 1 }),
       }).then(function (res) {
-        setStatus("Manual tick processed " + safeString(res.processed || 0) + " workflow(s).");
+        var parts = [];
+        if (res.schedules_admitted) parts.push(res.schedules_admitted + " schedule(s)");
+        if (res.feed_items_admitted) parts.push(res.feed_items_admitted + " feed item(s)");
+        if (res.executions_advanced) parts.push(res.executions_advanced + " execution(s)");
+        var detail = parts.length ? " (" + parts.join(", ") + ")" : "";
+        setStatus("Manual tick processed " + safeString(res.processed || 0) + " workflow(s)" + detail + ".");
         return Promise.all([loadExecutions(), loadInputFeeds()]);
       }).catch(fail).finally(function () { setTicking(false); });
     }
@@ -1701,6 +1708,28 @@ import {
       return function () { clearInterval(timer); };
     }, [selectedExecution && selectedExecution.execution_id, selectedExecution && selectedExecution.status]);
 
+    // ponytail: bounded feed polling — setTimeout loop, 2s delay, stops when
+    // all items are terminal or selection changes. Avoids overlapping requests
+    // by scheduling the next poll after the current one completes.
+    useEffect(function () {
+      const feedId = selectedFeedId || (inputFeeds[0] && inputFeeds[0].feed_id);
+      if (!feedId) return undefined;
+      if (!shouldPollFeed(inputFeedItems)) return undefined;
+      var cancelled = false;
+      function poll() {
+        if (cancelled) return;
+        loadInputFeedItems(feedId).then(function () {
+          if (cancelled) return;
+          setTimeout(poll, 2000);
+        }).catch(function () {
+          if (cancelled) return;
+          setTimeout(poll, 2000);
+        });
+      }
+      var timer = setTimeout(poll, 2000);
+      return function () { cancelled = true; clearTimeout(timer); };
+    }, [selectedFeedId, inputFeeds[0] && inputFeeds[0].feed_id, inputFeedItems.length, inputFeedItems.map(function (i) { return i.status; }).join(",")]);
+
     function validateDefinition() {
       setValidating(true);
       setError("");
@@ -1789,6 +1818,7 @@ import {
       }
       setRunning(true);
       setError("");
+      setRunFieldErrors({});
       const runVersion = selectedRunVersion(workflowId);
       api("/definitions/" + encodeURIComponent(workflowId) + "/run" + versionQuery(runVersion), {
         method: "POST",
@@ -1798,9 +1828,18 @@ import {
         const execution = res.execution || {};
         const executionId = execution.execution_id;
         setRunPanelOpen(false);
+        setRunFieldErrors({});
         setStatus("Started execution " + safeString(executionId));
         return loadExecutions(executionId);
-      }).catch(fail).finally(function () { setRunning(false); });
+      }).catch(function (err) {
+        const fe = fieldErrors(err);
+        if (Object.keys(fe).length) {
+          setRunFieldErrors(fe);
+          setError(formatApiError(err));
+        } else {
+          fail(err);
+        }
+      }).finally(function () { setRunning(false); });
     }
 
     function cancelSelectedExecution() {
@@ -3162,6 +3201,11 @@ import {
       var selectedFeed = inputFeeds.find(function (feed) { return feed.feed_id === selectedFeedId; }) || inputFeeds[0] || null;
       var feedId = selectedFeed && selectedFeed.feed_id;
       var feedOpen = selectedFeed && selectedFeed.status === "open";
+      var actions = selectedFeed ? feedActions(selectedFeed.status) : [];
+      function handleAction(action) {
+        if (action === "start-new") { openContinuousFeed(); }
+        else { setSelectedFeedStatus(action === "pause" ? "paused" : action === "resume" ? "open" : action === "close" ? "closed" : action); }
+      }
       return h("div", { className: "hermes-workflows-input-feed-panel" },
         h("div", { className: "hermes-workflows-item-title" },
           h("strong", null, "Continuous input feed"),
@@ -3169,14 +3213,16 @@ import {
         ),
         h("p", { className: "hermes-workflows-muted" }, "Open a feed, then add scalar repo paths, prompts, or criteria. Ready items launch normal executions as the dispatcher ticks."),
         h("p", { className: "hermes-workflows-muted" }, INTAKE_SCOPE_NOTE),
+        selectedFeed ? h("div", { className: "hermes-workflows-muted", style: {fontSize: "0.76rem"} }, "Version: " + safeString(selectedFeed.version) + " · Updated: " + safeString(selectedFeed.updated_at)) : null,
         h("div", { className: "hermes-workflows-row" },
-          h("button", { type: "button", disabled: feedBusy || !workflowId, onClick: openContinuousFeed, className: "hermes-workflows-primary" }, feedBusy ? "Opening…" : "Open Continuous Feed"),
+          !selectedFeed ? h("button", { type: "button", disabled: feedBusy || !workflowId, onClick: openContinuousFeed, className: "hermes-workflows-primary" }, feedBusy ? "Opening…" : "Open Continuous Feed") : null,
           inputFeeds.length ? h("select", { value: selectedFeedId, onChange: function (event) { const id = event.target.value; setSelectedFeedId(id); loadInputFeedItems(id); } }, inputFeeds.map(function (feed) {
             return h("option", { key: feed.feed_id, value: feed.feed_id }, safeString(feed.status) + " · " + safeString(feed.feed_id).slice(0, 12));
           })) : null,
-          feedId ? h("button", { type: "button", disabled: feedBusy, onClick: function () { setSelectedFeedStatus("open"); } }, "Resume Feed") : null,
-          feedId ? h("button", { type: "button", disabled: feedBusy, onClick: function () { setSelectedFeedStatus("paused"); } }, "Pause Feed") : null,
-          feedId ? h("button", { type: "button", disabled: feedBusy, onClick: function () { setSelectedFeedStatus("closed"); } }, "Close Feed") : null,
+          actions.map(function (action) {
+            var label = action === "start-new" ? "Start New Feed" : action === "pause" ? "Pause" : action === "resume" ? "Resume" : action === "close" ? "Close" : action;
+            return h("button", { key: action, type: "button", disabled: feedBusy, onClick: function () { handleAction(action); } }, label);
+          }),
           feedId ? h("button", { type: "button", disabled: feedBusy, onClick: function () { loadInputFeedItems(feedId); } }, "Refresh Feed Items") : null
         ),
         feedId ? h("section", { className: "hermes-workflows-feed-items", "aria-label": "Input feed items" },
@@ -3214,6 +3260,7 @@ import {
       var name = safeString(field && field.name);
       var kind = safeString((field && field.kind) || "text");
       var value = inputFieldValues[name] === undefined || inputFieldValues[name] === null ? "" : inputFieldValues[name];
+      var fieldError = runFieldErrors[name] || "";
       function updateValue(event) {
         var next = Object.assign({}, inputFieldValues);
         next[name] = event.target.value;
@@ -3236,13 +3283,16 @@ import {
           value: value,
           onChange: updateValue,
           placeholder: kind,
-        })
+        }),
+        fieldError ? h("span", { className: "hermes-workflows-field-error", role: "alert" }, fieldError) : null
       );
     }
 
     function renderRunStartPanel() {
       if (!runPanelOpen) return null;
       var fields = inputFieldsForSpec(runInputSpec());
+      var workflowId = (runWorkflowId || "").trim();
+      var publishedVersions = definitions.filter(function (d) { return workflowIdForDefinition(d) === workflowId && versionForDefinition(d); });
       return h("div", { className: "hermes-workflows-run-overlay", role: "dialog", "aria-modal": "true", "aria-label": "Start workflow run" },
         h("form", { className: "hermes-workflows-run-panel", onSubmit: runWorkflow },
           h("div", { className: "hermes-workflows-run-panel-header" },
@@ -3252,6 +3302,18 @@ import {
             ),
             h("button", { type: "button", className: "hermes-workflows-link-button", onClick: function () { setRunPanelOpen(false); } }, "Close")
           ),
+          publishedVersions.length > 1 ? h("label", { className: "hermes-workflows-run-field" },
+            h("span", null, "Version"),
+            h("select", {
+              value: selectedRunVersion(workflowId) || "",
+              onChange: function (event) {
+                var v = parseInt(event.target.value, 10);
+                if (!isNaN(v)) loadDefinition(workflowId, v).catch(fail);
+              },
+            }, publishedVersions.map(function (d) {
+              return h("option", { key: d.version, value: d.version }, "v" + safeString(d.version));
+            }))
+          ) : null,
           fields.length && !showAdvancedInputJson ? h("div", { className: "hermes-workflows-run-fields" }, fields.map(renderRunInputField)) : null,
           h("label", { className: "hermes-workflows-run-advanced-toggle" },
             h("input", { type: "checkbox", checked: showAdvancedInputJson, onChange: function (event) { setShowAdvancedInputJson(event.target.checked); } }),

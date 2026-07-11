@@ -907,10 +907,17 @@ async def tick_workflows(request: Request) -> dict[str, Any]:
             raise ValueError("limit must be an integer") from exc
         if limit < 1 or limit > 100:
             raise ValueError("limit must be between 1 and 100")
-        processed = await asyncio.to_thread(workflows_dispatcher.tick, limit=limit)
+        report = await asyncio.to_thread(workflows_dispatcher.tick_detailed, limit=limit)
     except (json.JSONDecodeError, yaml.YAMLError, ValueError) as exc:
         raise _http_400(exc) from exc
-    return {"processed": processed}
+    return {
+        "schedules_admitted": report.schedules_admitted,
+        "feed_items_admitted": report.feed_items_admitted,
+        "executions_advanced": report.executions_advanced,
+        "remaining_queued": report.remaining_queued,
+        "remaining_running_or_waiting": report.remaining_running_or_waiting,
+        "processed": report.processed,
+    }
 
 
 @router.post("/definitions/{workflow_id}/run")

@@ -1863,3 +1863,44 @@ def test_repeated_tick_after_final_status_does_not_duplicate_events(tmp_path, mo
         "execution_succeeded",
     ]
     assert len(calls) == 1
+
+
+def test_tick_detailed_returns_structured_report(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    wfdb.init_db()
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, _switch_spec(), created_by="test")
+        wfdb.start_execution(conn, "demo", input_data={"score": 0.9}, trigger_type="manual")
+
+    report = workflows_dispatcher.tick_detailed(limit=1)
+    assert report.processed == 1
+    assert report.executions_advanced == 1
+    assert report.schedules_admitted == 0
+    assert report.feed_items_admitted == 0
+    assert report.remaining_queued == 0
+    assert report.remaining_running_or_waiting == 0
+
+
+def test_tick_detailed_separates_feed_admission_from_execution(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    wfdb.init_db()
+    spec = WorkflowSpec.model_validate({
+        "id": "intake_demo",
+        "name": "Intake Demo",
+        "version": 1,
+        "triggers": [{
+            "type": "manual",
+            "id": "kickoff",
+            "intake": {"mode": "continuous"},
+        }],
+        "nodes": {"start": {"type": "pass", "output": {"done": True}}},
+    })
+    with wfdb.connect() as conn:
+        wfdb.deploy_definition(conn, spec, created_by="test")
+        feed = wfdb.open_input_feed(conn, spec.id, trigger_id="kickoff")
+        wfdb.enqueue_input_item(conn, feed.feed_id, {})
+
+    report = workflows_dispatcher.tick_detailed(limit=2)
+    assert report.feed_items_admitted == 1
+    assert report.executions_advanced == 1
+    assert report.processed == 2

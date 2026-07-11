@@ -227,6 +227,34 @@
 		};
 	}
 	//#endregion
+	//#region ../plugins/workflows/dashboard/src/run.js
+	var ACTIONS_BY_STATUS = {
+		open: ["pause", "close"],
+		paused: ["resume", "close"],
+		closed: ["start-new"]
+	};
+	var ACTIVE_STATUSES = /* @__PURE__ */ new Set([
+		"queued",
+		"running",
+		"needs_input"
+	]);
+	function feedActions(status) {
+		return ACTIONS_BY_STATUS[status] || [];
+	}
+	function shouldPollFeed(items) {
+		if (!Array.isArray(items) || !items.length) return false;
+		return items.some(function(item) {
+			return ACTIVE_STATUSES.has(item.status);
+		});
+	}
+	function fieldErrors(error) {
+		if (error && typeof error === "object" && !Array.isArray(error)) {
+			const detail = error.detail;
+			if (detail && typeof detail === "object" && !Array.isArray(detail) && detail.field_errors && typeof detail.field_errors === "object") return detail.field_errors;
+		}
+		return {};
+	}
+	//#endregion
 	//#region ../plugins/workflows/dashboard/src/workspace.js
 	var WORKSPACE_MODES = [
 		"build",
@@ -474,6 +502,7 @@
 			"edges: []"
 		].join("\n");
 		const api = createApi(SDK.fetchJSON, API);
+		const formatApiError$1 = formatApiError;
 		function errorMessage(err) {
 			return formatApiError(err);
 		}
@@ -1575,6 +1604,7 @@
 			const stateRunPanelOpen = useState(false);
 			const runPanelOpen = stateRunPanelOpen[0];
 			const setRunPanelOpen = stateRunPanelOpen[1];
+			const [runFieldErrors, setRunFieldErrors] = useState({});
 			const stateInputFeeds = useState([]);
 			const inputFeeds = stateInputFeeds[0];
 			const setInputFeeds = stateInputFeeds[1];
@@ -1765,7 +1795,12 @@
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({ limit: 1 })
 				}).then(function(res) {
-					setStatus("Manual tick processed " + safeString(res.processed || 0) + " workflow(s).");
+					var parts = [];
+					if (res.schedules_admitted) parts.push(res.schedules_admitted + " schedule(s)");
+					if (res.feed_items_admitted) parts.push(res.feed_items_admitted + " feed item(s)");
+					if (res.executions_advanced) parts.push(res.executions_advanced + " execution(s)");
+					var detail = parts.length ? " (" + parts.join(", ") + ")" : "";
+					setStatus("Manual tick processed " + safeString(res.processed || 0) + " workflow(s)" + detail + ".");
 					return Promise.all([loadExecutions(), loadInputFeeds()]);
 				}).catch(fail).finally(function() {
 					setTicking(false);
@@ -2101,6 +2136,34 @@
 					clearInterval(timer);
 				};
 			}, [selectedExecution && selectedExecution.execution_id, selectedExecution && selectedExecution.status]);
+			useEffect(function() {
+				const feedId = selectedFeedId || inputFeeds[0] && inputFeeds[0].feed_id;
+				if (!feedId) return void 0;
+				if (!shouldPollFeed(inputFeedItems)) return void 0;
+				var cancelled = false;
+				function poll() {
+					if (cancelled) return;
+					loadInputFeedItems(feedId).then(function() {
+						if (cancelled) return;
+						setTimeout(poll, 2e3);
+					}).catch(function() {
+						if (cancelled) return;
+						setTimeout(poll, 2e3);
+					});
+				}
+				var timer = setTimeout(poll, 2e3);
+				return function() {
+					cancelled = true;
+					clearTimeout(timer);
+				};
+			}, [
+				selectedFeedId,
+				inputFeeds[0] && inputFeeds[0].feed_id,
+				inputFeedItems.length,
+				inputFeedItems.map(function(i) {
+					return i.status;
+				}).join(",")
+			]);
 			function validateDefinition() {
 				setValidating(true);
 				setError("");
@@ -2184,6 +2247,7 @@
 				}
 				setRunning(true);
 				setError("");
+				setRunFieldErrors({});
 				const runVersion = selectedRunVersion(workflowId);
 				api("/definitions/" + encodeURIComponent(workflowId) + "/run" + versionQuery(runVersion), {
 					method: "POST",
@@ -2192,9 +2256,16 @@
 				}).then(function(res) {
 					const executionId = (res.execution || {}).execution_id;
 					setRunPanelOpen(false);
+					setRunFieldErrors({});
 					setStatus("Started execution " + safeString(executionId));
 					return loadExecutions(executionId);
-				}).catch(fail).finally(function() {
+				}).catch(function(err) {
+					const fe = fieldErrors(err);
+					if (Object.keys(fe).length) {
+						setRunFieldErrors(fe);
+						setError(formatApiError$1(err));
+					} else fail(err);
+				}).finally(function() {
 					setRunning(false);
 				});
 			}
@@ -3714,12 +3785,20 @@
 				}) || inputFeeds[0] || null;
 				var feedId = selectedFeed && selectedFeed.feed_id;
 				var feedOpen = selectedFeed && selectedFeed.status === "open";
-				return h("div", { className: "hermes-workflows-input-feed-panel" }, h("div", { className: "hermes-workflows-item-title" }, h("strong", null, "Continuous input feed"), selectedFeed ? h("span", { className: "hermes-workflows-badge" }, safeString(selectedFeed.status)) : h("span", { className: "hermes-workflows-badge" }, "not open")), h("p", { className: "hermes-workflows-muted" }, "Open a feed, then add scalar repo paths, prompts, or criteria. Ready items launch normal executions as the dispatcher ticks."), h("p", { className: "hermes-workflows-muted" }, INTAKE_SCOPE_NOTE), h("div", { className: "hermes-workflows-row" }, h("button", {
+				var actions = selectedFeed ? feedActions(selectedFeed.status) : [];
+				function handleAction(action) {
+					if (action === "start-new") openContinuousFeed();
+					else setSelectedFeedStatus(action === "pause" ? "paused" : action === "resume" ? "open" : action === "close" ? "closed" : action);
+				}
+				return h("div", { className: "hermes-workflows-input-feed-panel" }, h("div", { className: "hermes-workflows-item-title" }, h("strong", null, "Continuous input feed"), selectedFeed ? h("span", { className: "hermes-workflows-badge" }, safeString(selectedFeed.status)) : h("span", { className: "hermes-workflows-badge" }, "not open")), h("p", { className: "hermes-workflows-muted" }, "Open a feed, then add scalar repo paths, prompts, or criteria. Ready items launch normal executions as the dispatcher ticks."), h("p", { className: "hermes-workflows-muted" }, INTAKE_SCOPE_NOTE), selectedFeed ? h("div", {
+					className: "hermes-workflows-muted",
+					style: { fontSize: "0.76rem" }
+				}, "Version: " + safeString(selectedFeed.version) + " · Updated: " + safeString(selectedFeed.updated_at)) : null, h("div", { className: "hermes-workflows-row" }, !selectedFeed ? h("button", {
 					type: "button",
 					disabled: feedBusy || !workflowId,
 					onClick: openContinuousFeed,
 					className: "hermes-workflows-primary"
-				}, feedBusy ? "Opening…" : "Open Continuous Feed"), inputFeeds.length ? h("select", {
+				}, feedBusy ? "Opening…" : "Open Continuous Feed") : null, inputFeeds.length ? h("select", {
 					value: selectedFeedId,
 					onChange: function(event) {
 						const id = event.target.value;
@@ -3731,25 +3810,16 @@
 						key: feed.feed_id,
 						value: feed.feed_id
 					}, safeString(feed.status) + " · " + safeString(feed.feed_id).slice(0, 12));
-				})) : null, feedId ? h("button", {
-					type: "button",
-					disabled: feedBusy,
-					onClick: function() {
-						setSelectedFeedStatus("open");
-					}
-				}, "Resume Feed") : null, feedId ? h("button", {
-					type: "button",
-					disabled: feedBusy,
-					onClick: function() {
-						setSelectedFeedStatus("paused");
-					}
-				}, "Pause Feed") : null, feedId ? h("button", {
-					type: "button",
-					disabled: feedBusy,
-					onClick: function() {
-						setSelectedFeedStatus("closed");
-					}
-				}, "Close Feed") : null, feedId ? h("button", {
+				})) : null, actions.map(function(action) {
+					return h("button", {
+						key: action,
+						type: "button",
+						disabled: feedBusy,
+						onClick: function() {
+							handleAction(action);
+						}
+					}, action === "start-new" ? "Start New Feed" : action === "pause" ? "Pause" : action === "resume" ? "Resume" : action === "close" ? "Close" : action);
+				}), feedId ? h("button", {
 					type: "button",
 					disabled: feedBusy,
 					onClick: function() {
@@ -3801,6 +3871,7 @@
 				var name = safeString(field && field.name);
 				var kind = safeString(field && field.kind || "text");
 				var value = inputFieldValues[name] === void 0 || inputFieldValues[name] === null ? "" : inputFieldValues[name];
+				var fieldError = runFieldErrors[name] || "";
 				function updateValue(event) {
 					var next = Object.assign({}, inputFieldValues);
 					next[name] = event.target.value;
@@ -3823,11 +3894,18 @@
 					value,
 					onChange: updateValue,
 					placeholder: kind
-				}));
+				}), fieldError ? h("span", {
+					className: "hermes-workflows-field-error",
+					role: "alert"
+				}, fieldError) : null);
 			}
 			function renderRunStartPanel() {
 				if (!runPanelOpen) return null;
 				var fields = inputFieldsForSpec(runInputSpec());
+				var workflowId = (runWorkflowId || "").trim();
+				var publishedVersions = definitions.filter(function(d) {
+					return workflowIdForDefinition(d) === workflowId && versionForDefinition(d);
+				});
 				return h("div", {
 					className: "hermes-workflows-run-overlay",
 					role: "dialog",
@@ -3842,7 +3920,18 @@
 					onClick: function() {
 						setRunPanelOpen(false);
 					}
-				}, "Close")), fields.length && !showAdvancedInputJson ? h("div", { className: "hermes-workflows-run-fields" }, fields.map(renderRunInputField)) : null, h("label", { className: "hermes-workflows-run-advanced-toggle" }, h("input", {
+				}, "Close")), publishedVersions.length > 1 ? h("label", { className: "hermes-workflows-run-field" }, h("span", null, "Version"), h("select", {
+					value: selectedRunVersion(workflowId) || "",
+					onChange: function(event) {
+						var v = parseInt(event.target.value, 10);
+						if (!isNaN(v)) loadDefinition(workflowId, v).catch(fail);
+					}
+				}, publishedVersions.map(function(d) {
+					return h("option", {
+						key: d.version,
+						value: d.version
+					}, "v" + safeString(d.version));
+				}))) : null, fields.length && !showAdvancedInputJson ? h("div", { className: "hermes-workflows-run-fields" }, fields.map(renderRunInputField)) : null, h("label", { className: "hermes-workflows-run-advanced-toggle" }, h("input", {
 					type: "checkbox",
 					checked: showAdvancedInputJson,
 					onChange: function(event) {
