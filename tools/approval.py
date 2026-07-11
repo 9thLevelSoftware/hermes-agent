@@ -1487,6 +1487,45 @@ def _approval_argument_hash(approval: dict) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+_APPROVAL_IDENTITY_FIELDS = (
+    "operation", "tool_name", "policy_key", "requester", "channel",
+)
+
+
+def _approval_identity(approval: dict) -> dict:
+    """Return the canonical immutable identity fields for a fallback request."""
+    return {
+        "operation": approval.get("operation") or approval.get("tool_name") or "",
+        "tool_name": approval.get("tool_name") or approval.get("operation") or "",
+        "policy_key": approval.get("policy_key") or approval.get("pattern_key") or "",
+        "requester": approval.get("requester") or approval.get("user_id") or "",
+        "channel": approval.get("channel") or approval.get("platform") or "",
+    }
+
+
+def _approval_identity_matches(request: dict, expected_identity: Optional[dict]) -> bool:
+    """Match every identity field supplied by the current execution path."""
+    if expected_identity is None:
+        return True
+    actual = _approval_identity(request)
+    for field in _APPROVAL_IDENTITY_FIELDS:
+        if field not in expected_identity:
+            if actual[field]:
+                return False
+            continue
+        expected = expected_identity[field]
+        if expected is None:
+            if actual[field]:
+                return False
+            continue
+        if isinstance(expected, (list, tuple, set, frozenset)):
+            if actual[field] not in expected:
+                return False
+        elif actual[field] != (expected or ""):
+            return False
+    return True
+
+
 def _prune_pending_locked() -> None:
     """Drop terminal fallback records and repair the session index.
 
@@ -1706,7 +1745,7 @@ def consume_pending_approval(
         return consumed
 
 
-def submit_pending(session_key: str, approval: dict) -> dict:
+def submit_pending(session_key: str, approval: dict) -> Optional[dict]:
     """Store and return an identity-bound, in-memory fallback approval request."""
     request = copy.deepcopy(approval)
     request_id = str(request.get("request_id") or uuid.uuid4().hex)
@@ -1714,13 +1753,18 @@ def submit_pending(session_key: str, approval: dict) -> dict:
         _prune_pending_locked()
         existing = _pending.get(request_id)
         if existing is not None:
-            if _approval_argument_hash(request) != existing.get("argument_hash"):
-                existing["status"] = "stale"
+            same_identity = (
+                existing.get("session_key") == session_key
+                and _approval_identity(existing) == _approval_identity(request)
+                and existing.get("argument_hash") == _approval_argument_hash(request)
+            )
+            if not same_identity:
                 logger.warning(
                     "approval_resolution outcome=changed resolution_mode=submit "
                     "request_id=%s session_key=%s",
                     request_id, session_key,
                 )
+                return None
             return copy.deepcopy(existing)
         created_at = float(request.get("created_at") or time.time())
         expires_at = request.get("expires_at")
@@ -1751,12 +1795,13 @@ def _consume_matching_pending_approval(
     session_key: str,
     operation: str,
     arguments,
+    *,
+    expected_identity: Optional[dict] = None,
 ) -> tuple[Optional[dict], bool]:
-    """Consume the resolved request for this exact operation, if any.
+    """Consume the resolved request for this exact execution identity, if any.
 
-    The bool reports a resolved same-operation request whose hash did not
-    match. That is a stale retry and must fail closed instead of opening a new
-    approval request for changed arguments.
+    The bool reports a resolved same-identity request whose hash did not
+    match. Identity-mismatched requests remain pending for their own retry.
     """
     current_hash = _approval_argument_hash({"arguments": arguments})
     with _lock:
@@ -1768,6 +1813,7 @@ def _consume_matching_pending_approval(
                 request is not None
                 and request.get("status") == "resolved"
                 and request.get("operation") == operation
+                and _approval_identity_matches(request, expected_identity)
             ):
                 candidates.append(request)
         matching = next(
@@ -2407,8 +2453,19 @@ def _run_approval_gate(
     pending_arguments = pending_metadata.get("arguments")
     if pending_arguments is None:
         pending_arguments = {"command": display_target}
+    expected_identity = {
+        "operation": pending_operation,
+        "tool_name": pending_metadata.get("tool_name") or pending_operation,
+        "policy_key": pending_metadata.get("policy_key")
+        or pending_metadata.get("pattern_key")
+        or pattern_key,
+    }
+    for field in ("requester", "channel"):
+        if field in pending_metadata:
+            expected_identity[field] = pending_metadata[field]
     consumed, stale = _consume_matching_pending_approval(
         session_key, pending_operation, pending_arguments,
+        expected_identity=expected_identity,
     )
     if consumed is not None:
         _apply_consumed_approval_scope(session_key, consumed)
@@ -2546,6 +2603,10 @@ def _run_approval_gate(
             "description": description,
         })
         pending_request = submit_pending(session_key, pending)
+        if pending_request is None:
+            if pending.get("request_id"):
+                return _stale_pending_approval_result(pending_operation, description)
+            pending_request = pending
         pending_fields = {
             key: pending_request[key]
             for key in ("request_id", "argument_hash", "operation", "tool_name", "created_at", "expires_at")
@@ -3125,7 +3186,14 @@ def check_all_command_guards(command: str, env_type: str,
         return {"approved": True, "message": None}
 
     consumed, stale = _consume_matching_pending_approval(
-        session_key, "terminal", {"command": command},
+        session_key,
+        "terminal",
+        {"command": command},
+        expected_identity={
+            "operation": "terminal",
+            "tool_name": "terminal",
+            "policy_key": [key for key, _, _ in warnings],
+        },
     )
     if consumed is not None:
         _apply_consumed_approval_scope(session_key, consumed)
@@ -3285,6 +3353,8 @@ def check_all_command_guards(command: str, env_type: str,
             "allow_permanent": not has_tirith,
             "description": _disp_combined_desc,
         })
+        if pending_request is None:
+            return _stale_pending_approval_result("terminal", _disp_combined_desc)
         pending_fields = {
             key: pending_request[key]
             for key in ("request_id", "argument_hash", "operation", "tool_name", "created_at", "expires_at")
@@ -3454,6 +3524,11 @@ def check_execute_code_guard(code: str, env_type: str,
         session_key,
         "execute_code",
         {"command": command, "code": code},
+        expected_identity={
+            "operation": "execute_code",
+            "tool_name": "execute_code",
+            "policy_key": pattern_key,
+        },
     )
     if consumed is not None:
         _apply_consumed_approval_scope(session_key, consumed)
@@ -3506,6 +3581,8 @@ def check_execute_code_guard(code: str, env_type: str,
             "allow_permanent": True,
             "description": display_description,
         })
+        if pending_request is None:
+            return _stale_pending_approval_result("execute_code", description)
         pending_fields = {
             key: pending_request[key]
             for key in ("request_id", "argument_hash", "operation", "tool_name", "created_at", "expires_at")

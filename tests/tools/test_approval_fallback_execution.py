@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 import tools.approval as approval
 
 
@@ -86,6 +88,113 @@ def test_execute_code_fallback_retry_consumes_exact_approval(monkeypatch):
         _finish_session(token)
 
 
+def test_terminal_fallback_does_not_consume_a_different_tool_identity(monkeypatch):
+    token = _gateway_session(monkeypatch)
+    try:
+        command = "rm -rf /tmp/tool-identity"
+        request = approval.submit_pending(
+            SESSION,
+            {
+                "operation": "terminal",
+                "tool_name": "execute_code",
+                "arguments": {"command": command},
+                "command": command,
+                "pattern_key": "recursive delete",
+            },
+        )
+        assert approval.resolve_gateway_approval(
+            SESSION,
+            "once",
+            request_id=request["request_id"],
+            request_hash=request["argument_hash"],
+        ) == 1
+
+        result = approval.check_all_command_guards(command, "local")
+
+        assert result["approved"] is False
+        assert approval.get_pending_approval(request["request_id"])["status"] == "resolved"
+    finally:
+        _finish_session(token)
+
+
+def test_execute_code_fallback_does_not_consume_a_terminal_identity(monkeypatch):
+    token = _gateway_session(monkeypatch)
+    try:
+        code = "import os\nprint(1)"
+        command = f"execute_code <<'PY'\n{code}\nPY"
+        request = approval.submit_pending(
+            SESSION,
+            {
+                "operation": "execute_code",
+                "tool_name": "terminal",
+                "arguments": {"command": command, "code": code},
+                "pattern_key": "execute_code",
+            },
+        )
+        assert approval.resolve_gateway_approval(
+            SESSION,
+            "once",
+            request_id=request["request_id"],
+            request_hash=request["argument_hash"],
+        ) == 1
+
+        result = approval.check_execute_code_guard(code, "local")
+
+        assert result["approved"] is False
+        assert approval.get_pending_approval(request["request_id"])["status"] == "resolved"
+    finally:
+        _finish_session(token)
+
+
+@pytest.mark.parametrize(
+    "identity_field, stored_value, expected_value",
+    [
+        ("policy_key", "plugin_rule:other", "plugin_rule:expected"),
+        ("requester", "user-one", "user-two"),
+        ("channel", "channel-one", "channel-two"),
+    ],
+)
+def test_plugin_fallback_requires_complete_execution_identity(
+    monkeypatch, identity_field, stored_value, expected_value
+):
+    token = _gateway_session(monkeypatch)
+    try:
+        arguments = {"path": "one"}
+        request = approval.submit_pending(
+            SESSION,
+            {
+                "operation": "write_file",
+                "tool_name": "write_file",
+                "arguments": arguments,
+                "pattern_key": stored_value if identity_field == "policy_key" else "plugin_rule:expected",
+                "requester": stored_value if identity_field == "requester" else "user-one",
+                "channel": stored_value if identity_field == "channel" else "channel-one",
+            },
+        )
+        assert approval.resolve_gateway_approval(
+            SESSION,
+            "once",
+            request_id=request["request_id"],
+            request_hash=request["argument_hash"],
+        ) == 1
+
+        from tools.approval import request_tool_approval
+
+        result = request_tool_approval(
+            "write_file",
+            "why",
+            rule_key="expected",
+            arguments=arguments,
+            requester=expected_value if identity_field == "requester" else "user-one",
+            channel=expected_value if identity_field == "channel" else "channel-one",
+        )
+
+        assert result["approved"] is False
+        assert approval.get_pending_approval(request["request_id"])["status"] == "resolved"
+    finally:
+        _finish_session(token)
+
+
 def test_changed_terminal_retry_does_not_invalidate_other_resolved_approvals(monkeypatch):
     token = _gateway_session(monkeypatch)
     try:
@@ -97,7 +206,7 @@ def test_changed_terminal_retry_does_not_invalidate_other_resolved_approvals(mon
                     "tool_name": "terminal",
                     "arguments": {"command": command},
                     "command": command,
-                    "pattern_key": "recursive delete",
+                    "pattern_key": "delete in root path",
                 },
             )
             for command in (

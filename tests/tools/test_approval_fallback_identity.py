@@ -73,6 +73,32 @@ class TestFallbackApprovalIdentity:
         ) == 0
         assert approval._pending[request["request_id"]]["resolution"] is None
 
+    def test_request_id_collision_is_session_bound_and_does_not_mutate_original(self):
+        request = _submit(request_id="shared-request")
+        original = approval.get_pending_approval(request["request_id"])
+
+        collision = approval.submit_pending(
+            "other-session",
+            {
+                "request_id": request["request_id"],
+                "operation": "terminal",
+                "tool_name": "terminal",
+                "arguments": {"command": "rm -rf /tmp/other"},
+                "pattern_key": "recursive delete",
+                "requester": "other-user",
+                "channel": "other-api",
+            },
+        )
+
+        assert collision is None
+        assert approval.get_pending_approval(request["request_id"]) == original
+
+    def test_same_request_id_and_identity_is_idempotent(self):
+        first = _submit(request_id="same-request")
+        second = _submit(request_id=first["request_id"])
+
+        assert second == first
+
     def test_expired_request_fails_closed(self):
         request = _submit(expires_at=time.time() - 1)
 
