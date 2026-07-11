@@ -22,6 +22,8 @@ import time
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
+from agent.turn_outcome import classify_turn_outcome
+
 logger = logging.getLogger(__name__)
 
 
@@ -113,6 +115,15 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 
     usage = getattr(turn, "token_usage_last", None)
     if not isinstance(usage, dict) or not usage:
+        compressor = getattr(agent, "context_compressor", None)
+        if (
+            compressor is not None
+            and getattr(compressor, "awaiting_real_usage_after_compression", False)
+        ):
+            # No usage means this turn cannot adjudicate the pending compaction.
+            # Consume the marker so a later unrelated reading is not charged to
+            # it and preflight deferral cannot stay latched indefinitely.
+            compressor.update_from_response({})
         if agent._session_db and agent.session_id:
             try:
                 if not agent._session_db_created:
@@ -120,6 +131,9 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                 agent._session_db.update_token_counts(
                     agent.session_id,
                     model=agent.model,
+                    billing_provider=agent.provider,
+                    billing_base_url=agent.base_url,
+                    billing_mode="subscription_included",
                     api_call_count=1,
                 )
             except Exception as exc:
@@ -267,6 +281,11 @@ def _record_codex_app_server_compaction(
             compressor, "compression_count", 0
         ) + 1
         compressor.last_compression_rough_tokens = approx_tokens or 0
+        # The app server has already completed a real compaction boundary. Its
+        # usage update (when supplied) is therefore the same real-vs-real
+        # effectiveness verdict used by the normal compression path.
+        if hasattr(compressor, "_verify_compaction_cleared_threshold"):
+            compressor._verify_compaction_cleared_threshold = True
         if not getattr(turn, "token_usage_last", None):
             compressor.last_prompt_tokens = -1
             compressor.last_completion_tokens = 0
@@ -478,24 +497,35 @@ def run_codex_app_server_turn(
         should_review_skills = True
         agent._iters_since_skill = 0
 
-    # External memory provider sync (mirrors line ~15439). Skipped on
-    # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    # External memory provider sync. The helper applies the explicit policy:
+    # verified always syncs; completed_unverified syncs only when Codex reports
+    # no tool activity and the projected messages contain no tool effects.
+    turn_outcome = classify_turn_outcome(
+        final_response=turn.final_text,
+        failed=turn.error is not None,
+        interrupted=turn.interrupted,
+        unresolved=getattr(turn, "should_retire", False) and turn.error is None,
+        verification_status=getattr(agent, "_turn_verification_status", None),
+    )
+    if turn_outcome["outcome"] in {"verified", "completed_unverified"}:
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,
                 final_response=turn.final_text,
-                interrupted=False,
+                interrupted=turn.interrupted,
                 messages=messages,
+                turn_outcome=turn_outcome["outcome"],
+                turn_had_tool_activity=turn.tool_iterations > 0,
             )
         except Exception:
             logger.debug("external memory sync raised", exc_info=True)
 
     # Background review fork — same cadence + signature as the default
     # path (line ~15449). Only fires when a trigger actually tripped AND
-    # we have a real final response.
+    # we have a verified final response.
     if (
-        turn.final_text
+        turn_outcome["outcome"] == "verified"
+        and turn.final_text
         and not turn.interrupted
         and (should_review_memory or should_review_skills)
     ):

@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.turn_outcome import classify_turn_outcome
 
 
 def finalize_turn(
@@ -42,6 +43,7 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    _pending_verification_response=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -50,10 +52,35 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
-    if final_response is None and (
+    budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
-    ):
+    )
+    budget_fallback_eligible = (
+        budget_exhausted
+        and not interrupted
+        and not failed
+        and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
+    )
+    continuation_budget_exhausted = (
+        final_response is None
+        and bool(_pending_verification_response)
+        and budget_fallback_eligible
+    )
+
+    iteration_limit_fallback = False
+    preserved_verification_fallback = False
+    if continuation_budget_exhausted:
+        # A verification/continuation gate deliberately withheld a composed
+        # answer, then consumed the remaining budget before producing a newer
+        # one. Preserve that exact answer instead of replacing it with another
+        # fallible model call. The explicit pending value is the provenance
+        # guard: unrelated error/recovery exits can never enter this branch.
+        final_response = _pending_verification_response
+        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        iteration_limit_fallback = True
+        preserved_verification_fallback = True
+    elif final_response is None and budget_fallback_eligible:
         # Budget exhausted — ask the model for a summary via one extra
         # API call with tools stripped.  _handle_max_iterations injects a
         # user message and makes a single toolless request.
@@ -68,20 +95,18 @@ def finalize_turn(
                 "— requesting summary..."
             )
         final_response = agent._handle_max_iterations(messages, api_call_count)
+        iteration_limit_fallback = True
 
+    if iteration_limit_fallback:
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
-        # protocol violation).  The agent loop strips tools before calling
-        # _handle_max_iterations, so the model cannot call kanban_block
-        # itself — we must do it on its behalf.
+        # protocol violation). This applies whether the user-facing fallback
+        # came from the summary call or an explicitly pending continuation;
+        # both exhausted the task budget and must advance the failure circuit.
         #
         # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the
-        # ``consecutive_failures`` counter and the dispatcher's
-        # ``failure_limit`` circuit breaker (#29747 gap 2).  Without this,
-        # a task whose worker keeps exhausting its budget would block
-        # silently each run, get auto-promoted by the operator (or never
-        # surface), and re-block in an endless loop with no signal.
+        # rather than ``kanban_block`` so this counts toward the dispatcher's
+        # consecutive-failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             try:
@@ -121,16 +146,17 @@ def finalize_turn(
                     exc_info=True,
                 )
 
-    # Determine if conversation completed successfully
-    normal_text_response = str(_turn_exit_reason).startswith("text_response(")
-    completed = (
-        final_response is not None
-        and not failed
-        and (
-            api_call_count < agent.max_iterations
-            or normal_text_response
-        )
+    # Determine completion from the canonical terminal outcome, not response
+    # presence. A failed/interrupted/partial/blocked/unresolved/cancelled exit
+    # can still carry assistant text, but that text is not a completed turn.
+    _turn_outcome = classify_turn_outcome(
+        final_response=final_response,
+        failed=failed,
+        interrupted=interrupted,
+        _turn_exit_reason=_turn_exit_reason,
+        verification_status=getattr(agent, "_turn_verification_status", None),
     )
+    completed = _turn_outcome["outcome"] in {"verified", "completed_unverified"}
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
@@ -304,6 +330,7 @@ def finalize_turn(
                 # truncated partial (the "The" case from #34452).
                 _is_partial_fragment = (
                     not _is_empty_terminal
+                    and not preserved_verification_fallback
                     and not str(_turn_exit_reason).startswith("text_response")
                     and len(_stripped) <= 24
                     and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
@@ -396,6 +423,9 @@ def finalize_turn(
             last_reasoning = msg["reasoning"]
             break
 
+    # ``_turn_outcome`` was computed before cleanup so trajectory persistence
+    # receives the same canonical completion decision as the returned result.
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,
@@ -403,6 +433,8 @@ def finalize_turn(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
+        "outcome": _turn_outcome["outcome"],
+        "outcome_reason": _turn_outcome["reason"],
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
@@ -459,17 +491,23 @@ def finalize_turn(
         _should_review_skills = True
         agent._iters_since_skill = 0
 
-    # External memory provider: sync the completed turn + queue next prefetch.
+    # External memory provider: sync only a verified turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message,
         final_response=final_response,
         interrupted=interrupted,
         messages=messages,
+        turn_outcome=_turn_outcome["outcome"],
     )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    if (
+        _turn_outcome["outcome"] == "verified"
+        and final_response
+        and not interrupted
+        and (_should_review_memory or _should_review_skills)
+    ):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),

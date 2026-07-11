@@ -243,6 +243,25 @@ def _is_ephemeral_scaffolding(msg: Any) -> bool:
     )
 
 
+def _turn_has_tool_activity(messages: Optional[List[Dict[str, Any]]]) -> bool:
+    """Conservatively detect tool calls/effects in the current user turn."""
+    if not messages:
+        return True
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "user":
+            return False
+        if (
+            message.get("role") in {"tool", "function"}
+            or message.get("tool_calls")
+            or message.get("function_call")
+            or message.get("tool_call_id")
+        ):
+            return True
+    return True
+
+
 _MAX_TOOL_WORKERS = 8
 
 # Intrinsic marker stamped on a message dict once it has been written to the
@@ -458,6 +477,7 @@ class AIAgent:
         notice_callback: callable = None,
         notice_clear_callback: callable = None,
         event_callback: Optional[Callable[[str, dict], None]] = None,
+        reaction_callback: Optional[Callable[[str], None]] = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
@@ -534,6 +554,7 @@ class AIAgent:
             notice_callback=notice_callback,
             notice_clear_callback=notice_clear_callback,
             event_callback=event_callback,
+            reaction_callback=reaction_callback,
             max_tokens=max_tokens,
             reasoning_config=reasoning_config,
             service_tier=service_tier,
@@ -1902,6 +1923,7 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    effect_disposition=msg.get("effect_disposition"),
                     timestamp=_row_timestamp,
                 )
                 msg[_DB_PERSISTED_MARKER] = True
@@ -2674,6 +2696,16 @@ class AIAgent:
         """
         self._interrupt_requested = True
         self._interrupt_message = message
+        # A cron turn performs its API request on the conversation thread to
+        # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
+        # path, its client is registered here so this cross-thread interrupt can
+        # still shut down the active sockets promptly.
+        _abort_active_request = getattr(self, "_active_request_abort", None)
+        if callable(_abort_active_request):
+            try:
+                _abort_active_request("interrupt_abort")
+            except Exception:
+                logger.debug("Failed to abort active inline request", exc_info=True)
         # Signal all tools to abort any in-flight operations immediately.
         # Scope the interrupt to this agent's execution thread so other
         # agents running in the same process (gateway) are not affected.
@@ -2816,6 +2848,20 @@ class AIAgent:
         state dict hasn't been initialised yet (e.g. a tool dispatched
         outside ``run_conversation``).
         """
+        try:
+            parsed_result = json.loads(result) if isinstance(result, str) else result
+            evidence = (
+                parsed_result.get("verification_evidence")
+                if isinstance(parsed_result, dict)
+                else None
+            )
+            if isinstance(evidence, dict):
+                self._turn_verification_status = (
+                    evidence if evidence.get("status") == "passed" else None
+                )
+        except (TypeError, ValueError):
+            pass
+
         if tool_name not in _FILE_MUTATING_TOOLS:
             return
         state = getattr(self, "_turn_failed_file_mutations", None)
@@ -2826,6 +2872,7 @@ class AIAgent:
             return
         landed = file_mutation_result_landed(tool_name, result)
         if landed:
+            self._turn_verification_status = None
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
                 changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
@@ -3361,6 +3408,8 @@ class AIAgent:
         final_response: Any,
         interrupted: bool,
         messages: list | None = None,
+        turn_outcome: str | None = None,
+        turn_had_tool_activity: Optional[bool] = None,
     ) -> None:
         """Mirror a completed turn into external memory providers.
 
@@ -3383,12 +3432,22 @@ class AIAgent:
         the same intent, and a prefetch keyed on the interrupted turn
         would fire against stale context.
 
-        Normal completed turns still sync as before.  The whole body is
+        Only ``verified`` always permits durable sync.  The explicit
+        ``completed_unverified`` exception is limited to a conversational turn
+        with no tool calls/effects; response text never supplies verification.
+        Background review remains a separate verified-only gate.  External
+        memory providers remain best-effort.
+
+        Verified turns still sync as before.  The whole body is
         wrapped in ``try/except Exception`` because external memory
         providers are strictly best-effort — a misconfigured or offline
         backend must not block the user from seeing their response.
         """
-        if interrupted:
+        if interrupted or turn_outcome not in {"verified", "completed_unverified"}:
+            return
+        if turn_outcome == "completed_unverified" and (
+            turn_had_tool_activity or _turn_has_tool_activity(messages)
+        ):
             return
         if not (self._memory_manager and final_response and original_user_message):
             return

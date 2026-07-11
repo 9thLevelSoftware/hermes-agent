@@ -74,6 +74,7 @@ def _clear_approval_state():
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
+    getattr(mod, "_pending_by_session", {}).clear()
 
 
 # ------------------------------------------------------------------
@@ -215,6 +216,21 @@ class TestApproveCommand:
         result = await runner._handle_approve_command(_make_event("/approve"))
         assert "approved" in result.lower()
         assert "resuming" in result.lower()
+        assert entry.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_approve_arbitrary_text_keeps_legacy_fifo(self):
+        """Free text is not a request id unless it names a live request."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_approve_command(_make_event("/approve please"))
+        assert "approved" in result.lower()
         assert entry.event.is_set()
 
     @pytest.mark.asyncio
@@ -703,6 +719,25 @@ class TestFallbackNoCallback:
         assert result.get("status") == "pending_approval"
         assert result.get("approval_pending") is True
 
+    @pytest.mark.asyncio
+    async def test_exact_request_id_approves_fallback_request(self):
+        """An exact fallback request id resolves only that request."""
+        from tools import approval as mod
+
+        runner = _make_runner()
+        session_key = runner._session_key_for_source(_make_source())
+        request = mod.submit_pending(session_key, {
+            "operation": "terminal",
+            "arguments": {"command": "rm -rf /tmp/a"},
+            "pattern_key": "recursive delete",
+            "command": "rm -rf /tmp/a",
+        })
+
+        await runner._handle_approve_command(
+            _make_event(f"/approve {request['request_id']}")
+        )
+
+        assert mod._pending[request["request_id"]]["resolution"] == "once"
 
 # ------------------------------------------------------------------
 # Regression: cross-session approval routing isolation (#24100)

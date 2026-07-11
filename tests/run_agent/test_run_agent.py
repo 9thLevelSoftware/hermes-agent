@@ -2333,7 +2333,7 @@ class TestExecuteToolCalls:
             or "interrupted" in messages[0]["content"].lower()
         )
 
-    def test_invalid_json_args_defaults_empty(self, agent):
+    def test_invalid_json_args_are_rejected_without_dispatch(self, agent):
         tc = _mock_tool_call(
             name="web_search", arguments="not valid json", call_id="c1"
         )
@@ -2341,13 +2341,12 @@ class TestExecuteToolCalls:
         messages = []
         with patch("run_agent.handle_function_call", return_value="ok") as mock_hfc:
             agent._execute_tool_calls(mock_msg, messages, "task-1")
-            # Invalid JSON args should fall back to empty dict
-            args, kwargs = mock_hfc.call_args
-            assert args[:3] == ("web_search", {}, "task-1")
-            assert set(kwargs.get("enabled_tools", [])) == agent.valid_tool_names
+            mock_hfc.assert_not_called()
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert messages[0]["tool_call_id"] == "c1"
+        assert "valid json object" in messages[0]["content"].lower()
+        assert "tool was not executed" in messages[0]["content"].lower()
 
     def test_result_truncation_over_100k(self, agent, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
@@ -2501,6 +2500,150 @@ class TestRetryAfterCap:
 
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
+
+    def test_concurrent_timeout_marks_missing_result_unresolved(self, agent, monkeypatch):
+        """A deadline with no worker result must warn against blind retry."""
+        from agent import tool_executor
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
+        future = MagicMock()
+        future.cancel.return_value = False
+        future.cancelled.return_value = False
+        executor = MagicMock()
+        executor.submit.return_value = future
+        ticks = iter((0.0, 0.0, 1.0))
+        monkeypatch.setattr(tool_executor.time, "monotonic", lambda: next(ticks))
+        monkeypatch.setattr(
+            tool_executor.concurrent.futures,
+            "wait",
+            lambda fs, timeout=None: (set(), set(fs)),
+        )
+        agent._flush_messages_to_session_db = MagicMock()
+        tc = _mock_tool_call(name="write_file", arguments='{"path":"x"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", return_value=executor):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        result = messages[0]
+        assert result["effect_disposition"] == "unknown"
+        assert "[UNRESOLVED]" in result["content"]
+        assert "do not retry blindly" in result["content"].lower()
+        assert "cancelled" not in result["content"].lower()
+
+    def test_concurrent_timeout_prefers_confirmed_cancellation(self, agent, monkeypatch):
+        """A timeout-cancelled future must be classified as no-effect."""
+        from agent import tool_executor
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
+        future = MagicMock()
+        future.cancel.return_value = True
+        future.cancelled.return_value = True
+        executor = MagicMock()
+        executor.submit.return_value = future
+        ticks = iter((0.0, 0.0, 1.0))
+        monkeypatch.setattr(tool_executor.time, "monotonic", lambda: next(ticks))
+        monkeypatch.setattr(
+            tool_executor.concurrent.futures,
+            "wait",
+            lambda fs, timeout=None: (set(), set(fs)),
+        )
+        agent._flush_messages_to_session_db = MagicMock()
+        agent.session_id = "session-1"
+        agent._current_turn_id = "turn-1"
+        agent._current_api_request_id = "api-1"
+        hook_calls = []
+
+        def _capture_hook(hook_name, **kwargs):
+            hook_calls.append((hook_name, kwargs))
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _capture_hook)
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
+        tc = _mock_tool_call(name="write_file", arguments='{"path":"x"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", return_value=executor):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        result = messages[0]
+        assert result["content"] == "[Tool execution cancelled — write_file was skipped due to timeout]"
+        assert result["effect_disposition"] == "none"
+        assert "[UNRESOLVED]" not in result["content"]
+        post_calls = [kwargs for name, kwargs in hook_calls if name == "post_tool_call"]
+        assert len(post_calls) == 1
+        assert post_calls[0]["status"] == "cancelled"
+        assert post_calls[0]["error_type"] == "tool_timeout_cancelled"
+
+    def test_concurrent_late_real_result_wins_without_sleep(self, agent, monkeypatch):
+        """A real result present after the deadline snapshot beats fabrication."""
+        from agent import tool_executor
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
+        future = MagicMock()
+        future.cancel.return_value = False
+        future.cancelled.return_value = False
+        executor = MagicMock()
+
+        def submit_and_complete(target, *args, **kwargs):
+            target(*args, **kwargs)
+            return future
+
+        executor.submit.side_effect = submit_and_complete
+        ticks = iter((0.0, 0.0, 1.0))
+        monkeypatch.setattr(tool_executor.time, "monotonic", lambda: next(ticks))
+        monkeypatch.setattr(
+            tool_executor.concurrent.futures,
+            "wait",
+            lambda fs, timeout=None: (set(), set(fs)),
+        )
+        agent._flush_messages_to_session_db = MagicMock()
+        tc = _mock_tool_call(name="write_file", arguments='{"path":"x"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", return_value=executor), \
+             patch("run_agent.handle_function_call", return_value="real-result"):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert messages[0]["content"] == "real-result"
+        assert "timed out" not in messages[0]["content"]
+
+    @pytest.mark.parametrize("cancel_result", [False, True])
+    def test_concurrent_interrupt_is_cancelled_only_when_future_cancelled(
+        self, agent, monkeypatch, cancel_result
+    ):
+        """An interrupted worker without confirmed cancellation stays unresolved."""
+        from agent import tool_executor
+
+        monkeypatch.delenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", raising=False)
+        future = MagicMock()
+        future.cancel.return_value = cancel_result
+        future.cancelled.return_value = cancel_result
+        executor = MagicMock()
+        executor.submit.return_value = future
+        agent._flush_messages_to_session_db = MagicMock()
+        tc = _mock_tool_call(name="write_file", arguments='{"path":"x"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        def interrupt_on_wait(fs, timeout=None):
+            agent._interrupt_requested = True
+            return set(), set(fs)
+
+        monkeypatch.setattr(tool_executor.concurrent.futures, "wait", interrupt_on_wait)
+        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", return_value=executor):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        result = messages[0]
+        if cancel_result:
+            assert "cancelled" in result["content"].lower()
+        else:
+            assert result["effect_disposition"] == "unknown"
+            assert "[UNRESOLVED]" in result["content"]
+            assert "cancelled" not in result["content"].lower()
 
     def test_single_tool_uses_sequential_path(self, agent):
         """Single tool call should use sequential path, not concurrent."""
@@ -2776,6 +2919,7 @@ class TestConcurrentToolExecution:
         assert "fast-result" in messages[0]["content"]
         assert messages[1]["tool_call_id"] == "c2"
         assert "timed out after" in messages[1]["content"]
+        assert messages[1]["effect_disposition"] == "unknown"
         assert [batch[-1]["tool_call_id"] for batch in flushed] == ["c1", "c2"]
         assert "fast-result" in flushed[0][-1]["content"]
         assert "timed out after" in flushed[1][-1]["content"]
@@ -3789,6 +3933,48 @@ class TestHandleMaxIterations:
         kwargs = agent.client.chat.completions.create.call_args.kwargs
         assert kwargs["extra_body"]["provider"]["only"] == ["Anthropic"]
 
+    def test_summary_keeps_provider_preferences_for_nous(self, agent):
+        agent.base_url = "https://proxy.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "nous"
+        agent.providers_allowed = ["deepseek"]
+        agent.providers_ignored = ["deepinfra"]
+        agent.provider_sort = "throughput"
+        agent.provider_require_parameters = True
+        agent.provider_data_collection = "deny"
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60)
+
+        assert result == "Summary"
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        from agent.portal_tags import nous_portal_tags
+
+        assert kwargs["extra_body"]["tags"] == nous_portal_tags()
+        assert kwargs["extra_body"]["provider"] == {
+            "only": ["deepseek"],
+            "ignore": ["deepinfra"],
+            "sort": "throughput",
+            "require_parameters": True,
+            "data_collection": "deny",
+        }
+
+    def test_summary_keeps_nous_profile_body_without_routing_preferences(self, agent):
+        agent.base_url = "https://proxy.example.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider = "nous"
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+
+        result = agent._handle_max_iterations([{"role": "user", "content": "do stuff"}], 60)
+
+        assert result == "Summary"
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        from agent.portal_tags import nous_portal_tags
+
+        assert kwargs["extra_body"] == {"tags": nous_portal_tags()}
+
     def test_summary_drops_invalid_provider_sort(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
         agent._base_url_lower = agent.base_url.lower()
@@ -4186,7 +4372,8 @@ class TestRunConversation:
             result = agent.run_conversation("hello", conversation_history=prefill)
 
         mock_compress.assert_not_called()  # no compression triggered
-        assert result["completed"] is True
+        assert result["completed"] is False
+        assert result["outcome"] == "partial"
         # #34452: the bare "(empty)" sentinel is now replaced by a
         # user-visible end-of-turn explanation so the failure isn't silent.
         assert result["final_response"] != "(empty)"
@@ -4210,7 +4397,8 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation("answer me")
-        assert result["completed"] is True
+        assert result["completed"] is False
+        assert result["outcome"] == "partial"
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
@@ -4259,7 +4447,8 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation("answer me")
-        assert result["completed"] is True
+        assert result["completed"] is False
+        assert result["outcome"] == "partial"
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
@@ -4357,7 +4546,8 @@ class TestRunConversation:
             patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
         ):
             result = agent.run_conversation("answer me")
-        assert result["completed"] is True
+        assert result["completed"] is False
+        assert result["outcome"] == "partial"
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
@@ -4444,7 +4634,8 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("ask me")
         # Should recover partial streamed content, not fall through to (empty)
-        assert result["completed"] is True
+        assert result["completed"] is False
+        assert result["outcome"] == "partial"
         assert result["final_response"].startswith("The answer to your question is that")
         assert "No reply:" in result["final_response"]
         assert result["response_previewed"] is False

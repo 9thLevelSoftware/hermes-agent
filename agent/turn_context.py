@@ -319,6 +319,20 @@ def build_turn_context(
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
+    # Cosmetic side-signal: detect an affection "reaction" (ily / <3 / good bot)
+    # and notify the host so it can play hearts. Token-free, never touches the
+    # conversation, and never fatal — a purely optional UI beat.
+    reaction_callback = getattr(agent, "reaction_callback", None)
+    if reaction_callback is not None:
+        try:
+            from agent.reactions import detect_reaction
+
+            kind = detect_reaction(original_user_message)
+            if kind:
+                reaction_callback(kind)
+        except Exception:
+            pass
+
     if not agent.quiet_mode:
         _print_preview = summarize_user_message_for_log(user_message)
         agent._safe_print(
@@ -519,6 +533,7 @@ def build_turn_context(
     agent._turn_file_mutation_paths = set()
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
+    agent._turn_verification_status = None
 
     # Record the execution thread so interrupt()/clear_interrupt() can scope
     # the tool-level interrupt signal to THIS agent's thread only.

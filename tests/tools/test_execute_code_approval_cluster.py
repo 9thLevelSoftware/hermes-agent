@@ -119,6 +119,8 @@ def gw_session(monkeypatch):
     with A._lock:
         A._gateway_queues.pop(session_key, None)
         A._gateway_notify_cbs.pop(session_key, None)
+        A._session_approved.pop(session_key, None)
+        A._permanent_approved.discard("execute_code")
     try:
         yield session_key
     finally:

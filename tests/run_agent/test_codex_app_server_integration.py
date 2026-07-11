@@ -53,7 +53,7 @@ def _make_codex_agent(**kwargs):
     """Construct an AIAgent in codex_app_server mode without contacting any
     real provider. We pass api_mode explicitly so the constructor takes the
     fast path for direct credentials."""
-    return run_agent.AIAgent(
+    agent = run_agent.AIAgent(
         api_key="stub",
         base_url="https://stub.invalid",
         provider="openai",
@@ -63,6 +63,7 @@ def _make_codex_agent(**kwargs):
         skip_memory=True,
         **kwargs,
     )
+    return agent
 
 
 class TestApiModeAccepted:
@@ -143,6 +144,13 @@ class TestRunConversationCodexPath:
                 turn_id="turn-compact-1",
                 thread_id="thread-compact-1",
                 compacted=True,
+                token_usage_last={
+                    "totalTokens": 300_000,
+                    "inputTokens": 300_000,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 0,
+                    "reasoningOutputTokens": 0,
+                },
             )
 
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
@@ -157,8 +165,11 @@ class TestRunConversationCodexPath:
 
         assert result["completed"] is True
         assert agent.context_compressor.compression_count == 1
-        assert agent.context_compressor.last_prompt_tokens == -1
-        assert agent.context_compressor.awaiting_real_usage_after_compression is True
+        # A compacted turn with real usage is judged against that same real
+        # prompt count, exactly like a normal completed compression boundary.
+        assert agent.context_compressor.last_prompt_tokens == 300_000
+        assert agent.context_compressor.awaiting_real_usage_after_compression is False
+        assert agent.context_compressor._ineffective_compression_count == 1
         assert events == [
             (
                 "session:compress",
@@ -189,16 +200,45 @@ class TestRunConversationCodexPath:
                  and m.get("content") == "echo: hello"]
         assert final, f"expected final assistant message in {msgs}"
 
-    def test_projected_messages_are_synced_to_external_memory(self, fake_session):
+    def test_unverified_tool_turn_is_not_synced_to_external_memory(self, fake_session):
         agent = _make_codex_agent()
         agent._memory_manager = MagicMock()
         agent._memory_manager.build_system_prompt.return_value = ""
 
         with patch.object(agent, "_spawn_background_review", return_value=None):
-            result = agent.run_conversation("hello")
+            agent.run_conversation("hello")
+
+        agent._memory_manager.sync_all.assert_not_called()
+        agent._memory_manager.queue_prefetch_all.assert_not_called()
+
+    def test_unverified_no_tool_turn_is_synced_to_external_memory(self, monkeypatch):
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text=f"echo: {user_input}",
+                projected_messages=[{"role": "assistant", "content": f"echo: {user_input}"}],
+                tool_iterations=0,
+                interrupted=False,
+                error=None,
+                turn_id="turn-no-tools-1",
+                thread_id="thread-no-tools-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-no-tools-1"
+        )
+        agent = _make_codex_agent()
+        agent._turn_verification_status = "unverified"
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.build_system_prompt.return_value = ""
+
+        with patch.object(agent, "_spawn_background_review", return_value=None) as spawn:
+            agent.run_conversation("hello")
 
         agent._memory_manager.sync_all.assert_called_once()
-        assert agent._memory_manager.sync_all.call_args.kwargs["messages"] == result["messages"]
+        agent._memory_manager.queue_prefetch_all.assert_called_once()
+        spawn.assert_not_called()
+
 
     def test_nudge_counters_tick(self, fake_session):
         """The skill nudge counter must accumulate tool_iterations across
@@ -247,12 +287,10 @@ class TestRunConversationCodexPath:
         # args after every turn, which would crash with TypeError).
         assert not spawn.called
 
-    def test_background_review_skill_trigger_fires_above_threshold(
+    def test_background_review_skill_trigger_requires_verification(
         self, monkeypatch
     ):
-        """When tool iterations cross the skill nudge interval, the
-        background review fires with review_skills=True and the right
-        messages_snapshot signature."""
+        """Tool iterations alone must not trigger an unverified review."""
         from agent.transports.codex_app_server_session import (
             CodexAppServerSession, TurnResult,
         )
@@ -283,23 +321,12 @@ class TestRunConversationCodexPath:
                           return_value=None) as spawn:
             agent.run_conversation("do tool work")
 
-        assert spawn.called, "skill threshold tripped but review didn't fire"
-        # Verify the call signature matches what _spawn_background_review
-        # actually expects — this is the regression guard for the original
-        # bug where the codex path called it with no args at all.
-        call = spawn.call_args
-        assert "messages_snapshot" in call.kwargs
-        assert isinstance(call.kwargs["messages_snapshot"], list)
-        assert call.kwargs["review_skills"] is True
-        # Counter should be reset after the review fires
-        assert agent._iters_since_skill == 0
+        # The threshold is crossed, but Codex supplied no passed verification
+        # evidence, so the verified-only review gate must suppress the spawn.
+        spawn.assert_not_called()
 
-    def test_background_review_signature_never_breaks(self, fake_session):
-        """Even when no trigger fires, the helper must never call
-        _spawn_background_review with the wrong signature. Run a turn,
-        then run another turn after manually tripping the skill counter
-        and confirm the call shape is the kwargs-only form the function
-        actually accepts."""
+    def test_background_review_unverified_tool_turn_is_gated(self, fake_session):
+        """An unverified tool turn must not reach the review helper."""
         agent = _make_codex_agent()
         agent._skill_nudge_interval = 1  # very low so any iter trips it
         agent._iters_since_skill = 0
@@ -309,18 +336,9 @@ class TestRunConversationCodexPath:
         with patch.object(agent, "_spawn_background_review",
                           return_value=None) as spawn:
             agent.run_conversation("first")
-        # The fake session reports tool_iterations=1, which trips
-        # _skill_nudge_interval=1. So review should fire.
-        assert spawn.called
-        # Critical invariant: positional args must be empty, all real
-        # args must be kwargs (matching _spawn_background_review's
-        # actual signature).
-        call = spawn.call_args
-        assert call.args == (), (
-            f"expected no positional args, got {call.args!r} — "
-            "would crash _spawn_background_review at runtime"
-        )
-        assert "messages_snapshot" in call.kwargs
+        # tool_iterations is not verification evidence; the verified-only
+        # background-review gate must suppress the helper call.
+        spawn.assert_not_called()
 
     def test_chat_completions_loop_is_not_entered(self, fake_session):
         """The early-return must bypass the regular API call loop entirely.
