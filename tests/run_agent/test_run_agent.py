@@ -4357,7 +4357,8 @@ class TestRunConversation:
             result = agent.run_conversation("hello", conversation_history=prefill)
 
         mock_compress.assert_not_called()  # no compression triggered
-        assert result["completed"] is True
+        assert result["completed"] is False
+        assert result["outcome"] == "partial"
         # #34452: the bare "(empty)" sentinel is now replaced by a
         # user-visible end-of-turn explanation so the failure isn't silent.
         assert result["final_response"] != "(empty)"
@@ -4381,7 +4382,8 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation("answer me")
-        assert result["completed"] is True
+        assert result["completed"] is False
+        assert result["outcome"] == "partial"
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
@@ -4430,7 +4432,8 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation("answer me")
-        assert result["completed"] is True
+        assert result["completed"] is False
+        assert result["outcome"] == "partial"
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
@@ -4528,7 +4531,8 @@ class TestRunConversation:
             patch.object(agent, "_try_activate_fallback", side_effect=_mock_fallback),
         ):
             result = agent.run_conversation("answer me")
-        assert result["completed"] is True
+        assert result["completed"] is False
+        assert result["outcome"] == "partial"
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
@@ -4615,7 +4619,8 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("ask me")
         # Should recover partial streamed content, not fall through to (empty)
-        assert result["completed"] is True
+        assert result["completed"] is False
+        assert result["outcome"] == "partial"
         assert result["final_response"].startswith("The answer to your question is that")
         assert "No reply:" in result["final_response"]
         assert result["response_previewed"] is False
