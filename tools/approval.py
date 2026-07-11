@@ -1510,8 +1510,6 @@ def _approval_identity_matches(request: dict, expected_identity: Optional[dict])
     actual = _approval_identity(request)
     for field in _APPROVAL_IDENTITY_FIELDS:
         if field not in expected_identity:
-            if actual[field]:
-                return False
             continue
         expected = expected_identity[field]
         if expected is None:
