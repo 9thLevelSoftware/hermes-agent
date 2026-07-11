@@ -7829,7 +7829,7 @@ def _default_spawn(
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
-        "--cli",
+        "chat",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
         # so they see that profile's shell-hook allowlist instead of the
         # dispatcher's root allowlist. Pass --accept-hooks explicitly so
