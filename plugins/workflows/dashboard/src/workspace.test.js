@@ -172,4 +172,86 @@ describe("workspace responsive CSS", () => {
   it("lets Run and History scroll independently of the editor", () => {
     expect(SRC_CSS).toMatch(/\.hermes-workflows-(run-mode|history-mode)[^{}]*\{[^}]*overflow-y:\s*auto/);
   });
+
+  it("respects prefers-reduced-motion: reduce", () => {
+    expect(SRC_CSS).toMatch(/prefers-reduced-motion:\s*reduce/);
+  });
+});
+
+// ---- Accessibility: sidebar disclosures use native buttons ---------------
+
+import { readFileSync as rfSync } from "node:fs";
+
+const SRC_APP = rfSync(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), "app.js"),
+  "utf8",
+);
+
+describe("sidebar disclosure accessibility", () => {
+  it("sidebar collapsible sections use buttons for disclosure toggles", () => {
+    // All three sidebar sections (goal, workflows, executions) use a button
+    // inside the h3 for the toggle, not onClick on the div or h3 directly.
+    expect(SRC_APP).toMatch(/hermes-workflows-sidebar-collapsible[\s\S]*?h\("button"[^)]*aria-expanded/);
+    // No onClick on the section div itself for workflows/executions sections
+    expect(SRC_APP).not.toMatch(/sidebar-collapsible[^"]*\),\s*onClick:\s*function\(\)\s*\{\s*toggleSection/);
+  });
+
+  it("disclosure buttons have aria-expanded and aria-controls", () => {
+    // Goal disclosure
+    expect(SRC_APP).toMatch(/aria-expanded.*goalCollapsed/);
+    expect(SRC_APP).toMatch(/aria-controls.*sidebar-goal/);
+    // Workflows disclosure
+    expect(SRC_APP).toMatch(/aria-expanded.*wfCollapsed/);
+    expect(SRC_APP).toMatch(/aria-controls.*sidebar-workflows/);
+    // Executions disclosure
+    expect(SRC_APP).toMatch(/aria-expanded.*execCollapsed/);
+    expect(SRC_APP).toMatch(/aria-controls.*sidebar-executions/);
+  });
+});
+
+// ---- Accessibility: bottom panel disclosure --------------------------------
+
+describe("bottom panel disclosure accessibility", () => {
+  it("bottom toggle button has aria-expanded and aria-controls", () => {
+    expect(SRC_APP).toMatch(/aria-expanded.*bottomCollapsed/);
+    expect(SRC_APP).toMatch(/aria-controls.*hermes-workflows-bottom-content/);
+  });
+});
+
+// ---- Accessibility: focus trap and restore on run dialog -------------------
+
+describe("run dialog focus management", () => {
+  it("dialog traps focus and restores to opener on close", () => {
+    // Should have a focus trap mechanism for the run overlay dialog
+    expect(SRC_APP).toMatch(/hermes-workflows-run-overlay/);
+    expect(SRC_APP).toMatch(/role:\s*"dialog"/);
+    // Focus trap: save opener, trap Tab cycling, restore on close
+    expect(SRC_APP).toMatch(/activeElement/);
+    expect(SRC_APP).toMatch(/runPanelOpenerRef/);
+    expect(SRC_APP).toMatch(/restoreFocus|\.focus\(\)/i);
+  });
+});
+
+// ---- Accessibility: aria-live for operation results -------------------------
+
+describe("operation result announcements", () => {
+  it("operation results use aria-live polite for screen reader announcements", () => {
+    expect(SRC_APP).toMatch(/"aria-live".*"polite"/);
+  });
+});
+
+// ---- Accessibility: status text alongside color classes --------------------
+
+describe("status communication without relying on color alone", () => {
+  it("status badges include text content not just color classes", () => {
+    // Sidebar badges already show "on"/"off" text — verify the pattern exists
+    expect(SRC_APP).toMatch(/is-enabled.*\)/);  // text follows the class
+    expect(SRC_APP).toMatch(/"on"|"off"/);
+  });
+
+  it("execution status shows text alongside color class", () => {
+    // Execution sidebar items show status text, not just color
+    expect(SRC_APP).toMatch(/is-succeeded.*succeeded|succeeded.*is-succeeded/i);
+    expect(SRC_APP).toMatch(/is-failed.*failed|failed.*is-failed/i);
+  });
 });

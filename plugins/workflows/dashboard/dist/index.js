@@ -1639,6 +1639,8 @@
 			const stateRunPanelOpen = useState(false);
 			const runPanelOpen = stateRunPanelOpen[0];
 			const setRunPanelOpen = stateRunPanelOpen[1];
+			const runPanelOpenerRef = useRef(null);
+			const runPanelRef = useRef(null);
 			const [runFieldErrors, setRunFieldErrors] = useState({});
 			const stateInputFeeds = useState([]);
 			const inputFeeds = stateInputFeeds[0];
@@ -2210,6 +2212,38 @@
 					return i.status;
 				}).join(",")
 			]);
+			useEffect(function() {
+				if (!runPanelOpen) return void 0;
+				runPanelOpenerRef.current = document.activeElement;
+				var panel = runPanelRef.current;
+				if (panel) {
+					var first = panel.querySelector("button, [href], input, select, textarea, [tabindex]:not([tabindex=\"-1\"])");
+					if (first) first.focus();
+				}
+				function onKeyDown(event) {
+					if (event.key === "Escape") {
+						setRunPanelOpen(false);
+						return;
+					}
+					if (event.key !== "Tab" || !panel) return;
+					var focusable = panel.querySelectorAll("button, [href], input, select, textarea, [tabindex]:not([tabindex=\"-1\"])");
+					if (!focusable.length) return;
+					var firstEl = focusable[0];
+					var lastEl = focusable[focusable.length - 1];
+					if (event.shiftKey && document.activeElement === firstEl) {
+						event.preventDefault();
+						lastEl.focus();
+					} else if (!event.shiftKey && document.activeElement === lastEl) {
+						event.preventDefault();
+						firstEl.focus();
+					}
+				}
+				document.addEventListener("keydown", onKeyDown);
+				return function() {
+					document.removeEventListener("keydown", onKeyDown);
+					if (runPanelOpenerRef.current && runPanelOpenerRef.current.focus) runPanelOpenerRef.current.focus();
+				};
+			}, [runPanelOpen]);
 			function validateDefinition() {
 				setValidating(true);
 				setError("");
@@ -3570,9 +3604,14 @@
 					next[key] = !(key === "goal" ? goalCollapsed : !!sidebarCollapsed[key]);
 					setSidebarCollapsed(next);
 				}
-				return h("aside", { className: "hermes-workflows-sidebar" }, h("div", { className: "hermes-workflows-sidebar-section hermes-workflows-goal-compact hermes-workflows-sidebar-collapsible" + (goalCollapsed ? " is-collapsed" : "") }, h("h3", { onClick: function() {
-					toggleSection("goal");
-				} }, spec ? "New workflow / prompt" : "New workflow"), h("p", {
+				return h("aside", { className: "hermes-workflows-sidebar" }, h("div", { className: "hermes-workflows-sidebar-section hermes-workflows-goal-compact hermes-workflows-sidebar-collapsible" + (goalCollapsed ? " is-collapsed" : "") }, h("h3", null, h("button", {
+					type: "button",
+					"aria-expanded": goalCollapsed ? "false" : "true",
+					"aria-controls": "sidebar-goal-content",
+					onClick: function() {
+						toggleSection("goal");
+					}
+				}, spec ? "New workflow / prompt" : "New workflow")), h("div", { id: "sidebar-goal-content" }, h("p", {
 					className: "hermes-workflows-muted",
 					style: { fontSize: "0.78rem" }
 				}, "Describe it or start from blank."), h("input", {
@@ -3677,12 +3716,17 @@
 					type: "button",
 					onClick: rejectDraftCandidate,
 					style: { fontSize: "0.78rem" }
-				}, "Reject"))) : null), h("div", {
-					className: "hermes-workflows-sidebar-section" + (wfCollapsed ? " hermes-workflows-sidebar-collapsible is-collapsed" : " hermes-workflows-sidebar-collapsible"),
+				}, "Reject"))) : null)), h("div", { className: "hermes-workflows-sidebar-section" + (wfCollapsed ? " hermes-workflows-sidebar-collapsible is-collapsed" : " hermes-workflows-sidebar-collapsible") }, h("h3", null, h("button", {
+					type: "button",
+					"aria-expanded": wfCollapsed ? "false" : "true",
+					"aria-controls": "sidebar-workflows-content",
 					onClick: function() {
 						toggleSection("workflows");
 					}
-				}, h("h3", null, "Workflows"), h("div", { className: "hermes-workflows-sidebar-list" }, definitions.length ? definitions.map(function(definition) {
+				}, "Workflows")), h("div", {
+					id: "sidebar-workflows-content",
+					className: "hermes-workflows-sidebar-list"
+				}, definitions.length ? definitions.map(function(definition) {
 					var id = definition.workflow_id || definition.id;
 					var key = definitionSelectionKey(definition);
 					return h("button", {
@@ -3698,12 +3742,17 @@
 				}) : h("p", {
 					className: "hermes-workflows-muted",
 					style: { fontSize: "0.78rem" }
-				}, "No workflows deployed."))), h("div", {
-					className: "hermes-workflows-sidebar-section" + (execCollapsed ? " hermes-workflows-sidebar-collapsible is-collapsed" : " hermes-workflows-sidebar-collapsible"),
+				}, "No workflows deployed."))), h("div", { className: "hermes-workflows-sidebar-section" + (execCollapsed ? " hermes-workflows-sidebar-collapsible is-collapsed" : " hermes-workflows-sidebar-collapsible") }, h("h3", null, h("button", {
+					type: "button",
+					"aria-expanded": execCollapsed ? "false" : "true",
+					"aria-controls": "sidebar-executions-content",
 					onClick: function() {
 						toggleSection("executions");
 					}
-				}, h("h3", null, "Executions"), h("div", { className: "hermes-workflows-sidebar-list" }, executions.length ? executions.slice(0, 20).map(function(execution) {
+				}, "Executions")), h("div", {
+					id: "sidebar-executions-content",
+					className: "hermes-workflows-sidebar-list"
+				}, executions.length ? executions.slice(0, 20).map(function(execution) {
 					var eid = safeString(execution.execution_id || execution.id);
 					var execStatus = safeString(execution.status);
 					var statusClass = execStatus === "succeeded" ? " is-succeeded" : execStatus === "failed" ? " is-failed" : "";
@@ -3971,6 +4020,7 @@
 					return workflowIdForDefinition(d) === workflowId && versionForDefinition(d);
 				});
 				return h("div", {
+					ref: runPanelRef,
 					className: "hermes-workflows-run-overlay",
 					role: "dialog",
 					"aria-modal": "true",
@@ -4028,10 +4078,15 @@
 				}, "Validation"), h("button", {
 					type: "button",
 					className: "hermes-workflows-bottom-toggle",
+					"aria-expanded": bottomCollapsed ? "false" : "true",
+					"aria-controls": "hermes-workflows-bottom-content",
 					onClick: function() {
 						setBottomCollapsed(!bottomCollapsed);
 					}
-				}, bottomCollapsed ? "▴ Expand" : "▾ Collapse")), h("div", { className: "hermes-workflows-bottom-content" }, bottomCollapsed ? null : renderValidationChecklist()));
+				}, bottomCollapsed ? "▴ Expand" : "▾ Collapse")), h("div", {
+					id: "hermes-workflows-bottom-content",
+					className: "hermes-workflows-bottom-content"
+				}, bottomCollapsed ? null : renderValidationChecklist()));
 			}
 			function renderBuildMode() {
 				return h("section", {
@@ -4099,7 +4154,8 @@
 				onClick: clearBanners
 			}, "×")) : null, status ? h("div", {
 				className: "hermes-workflows-banner",
-				role: "status"
+				role: "status",
+				"aria-live": "polite"
 			}, h("span", null, status), h("button", {
 				type: "button",
 				className: "hermes-workflows-banner-close",

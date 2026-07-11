@@ -1164,3 +1164,14 @@
   opacity: 0;
   cursor: pointer;
 }
+
+/* Respect reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+  .hermes-workflows *,
+  .hermes-workflows *::before,
+  .hermes-workflows *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
