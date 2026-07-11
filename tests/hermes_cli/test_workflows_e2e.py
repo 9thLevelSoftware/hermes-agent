@@ -107,7 +107,7 @@ def test_workflow_kanban_completion_routes_approved_path_e2e(tmp_path, monkeypat
     task = tasks[0]
     assert task.workflow_template_id == spec.id
     assert task.current_step_key == "implement"
-    assert task.created_by == f"workflow:{exec_id}"
+    assert task.created_by == f"workflow:{exec_id}:version:1:node:implement"
     assert task.assignee == "worker"
     assert task.status in {"ready", "todo"}
     assert task.body is not None and "deadlift form" in task.body
