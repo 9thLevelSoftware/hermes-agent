@@ -30,6 +30,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -1785,6 +1786,64 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+_WORKFLOW_DISPATCH_INTERVAL_DEFAULT = 30.0
+_WORKFLOW_DISPATCH_LIMIT_DEFAULT = 50
+
+
+def _resolve_workflow_dispatch_settings(load_config_callable: Callable[[], Any]) -> tuple[bool, float, int]:
+    try:
+        cfg = load_config_callable()
+    except Exception as exc:
+        logger.warning("workflow dispatcher: cannot load config (%s); disabled", exc)
+        return False, _WORKFLOW_DISPATCH_INTERVAL_DEFAULT, _WORKFLOW_DISPATCH_LIMIT_DEFAULT
+
+    workflow_cfg = cfg.get("workflow", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(workflow_cfg, dict):
+        workflow_cfg = {}
+    # Default-on, matching kanban.dispatch_in_gateway — a deployed workflow
+    # should advance unattended unless the user explicitly opts out.
+    enabled = is_truthy_value(workflow_cfg.get("dispatch_in_gateway"), default=True)
+
+    raw_interval = workflow_cfg.get("tick_interval_seconds", _WORKFLOW_DISPATCH_INTERVAL_DEFAULT)
+    try:
+        interval = float(raw_interval)
+        if not math.isfinite(interval):
+            raise ValueError("non-finite interval")
+    except (TypeError, ValueError, OverflowError):
+        logger.warning(
+            "workflow dispatcher: invalid tick_interval_seconds=%r, using default %.0f",
+            raw_interval,
+            _WORKFLOW_DISPATCH_INTERVAL_DEFAULT,
+        )
+        interval = _WORKFLOW_DISPATCH_INTERVAL_DEFAULT
+    if interval < 1.0:
+        logger.warning(
+            "workflow dispatcher: tick_interval_seconds=%r is below 1; using 1",
+            raw_interval,
+        )
+        interval = 1.0
+
+    raw_limit = workflow_cfg.get("max_executions_per_tick", _WORKFLOW_DISPATCH_LIMIT_DEFAULT)
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning(
+            "workflow dispatcher: invalid max_executions_per_tick=%r, using default %d",
+            raw_limit,
+            _WORKFLOW_DISPATCH_LIMIT_DEFAULT,
+        )
+        limit = _WORKFLOW_DISPATCH_LIMIT_DEFAULT
+    if limit < 1:
+        logger.warning(
+            "workflow dispatcher: max_executions_per_tick=%r is below 1; using default %d",
+            raw_limit,
+            _WORKFLOW_DISPATCH_LIMIT_DEFAULT,
+        )
+        limit = _WORKFLOW_DISPATCH_LIMIT_DEFAULT
+
+    return enabled, interval, limit
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -2800,6 +2859,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+
+    async def _workflow_dispatcher_watcher(
+        self,
+        initial_delay: float = 5.0,
+        sleep: Optional[Callable[[float], Any]] = None,
+    ) -> None:
+        try:
+            from hermes_cli.config import load_config as _load_config
+        except Exception:
+            logger.warning("workflow dispatcher: config loader unavailable; disabled")
+            return
+
+        enabled, interval, limit = _resolve_workflow_dispatch_settings(_load_config)
+        if not enabled:
+            logger.info(
+                "workflow dispatcher: disabled via config workflow.dispatch_in_gateway=false"
+            )
+            return
+
+        try:
+            from hermes_cli import workflows_dispatcher
+        except Exception:
+            logger.warning("workflow dispatcher: dispatcher not importable; disabled")
+            return
+
+        logger.info(
+            "workflow dispatcher: enabled interval=%.1fs limit=%d",
+            interval,
+            limit,
+        )
+        sleeper = sleep or asyncio.sleep
+        if initial_delay > 0:
+            await sleeper(initial_delay)
+
+        while self._running:
+            try:
+                processed = await asyncio.to_thread(workflows_dispatcher.tick, limit=limit)
+                if processed:
+                    logger.info("workflow dispatcher: processed %d execution(s)", processed)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("workflow dispatcher: tick failed: %s", exc)
+            await sleeper(interval)
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -7352,6 +7455,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # simply don't use kanban; this loop becomes a no-op.
         asyncio.create_task(self._kanban_dispatcher_watcher())
 
+        # Start background workflow dispatcher — ticks queued workflow graph
+        # executions. Gated by `workflow.dispatch_in_gateway` (default True).
+        asyncio.create_task(self._workflow_dispatcher_watcher())
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -9406,6 +9513,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "kanban":
                 return await self._handle_kanban_command(event)
 
+            # /workflow bypasses the guard for the same reason as /kanban —
+            # it reads/advances workflows.db, never the running agent's state,
+            # and checking a stalled execution mid-run is a primary use case.
+            if _cmd_def_inner and _cmd_def_inner.name == "workflow":
+                return await self._handle_workflow_command(event)
+
             # /goal is safe mid-run for status/pause/clear/wait (inspection
             # and control-plane only — doesn't interrupt the running turn).
             # Setting a new goal text mid-run is rejected with the same
@@ -9815,6 +9928,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
+
+        if canonical == "workflow":
+            return await self._handle_workflow_command(event)
 
         if canonical == "suggestions":
             return await self._handle_suggestions_command(event)

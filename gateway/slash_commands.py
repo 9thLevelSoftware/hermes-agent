@@ -395,6 +395,29 @@ class GatewaySlashCommandsMixin:
             f"Slash commands you can run: {runnable_str}"
         )
 
+    async def _handle_workflow_command(self, event: MessageEvent) -> str:
+        """Handle /workflow — delegate to the shared workflow CLI.
+
+        Read/inspect/advance operations against workflows.db; run in a
+        thread pool so the gateway event loop stays responsive. Safe while
+        an agent is running because it never touches agent state.
+        """
+        import asyncio
+        from hermes_cli.workflows import run_slash
+
+        text = (event.text or "").strip()
+        if text.startswith("/"):
+            text = text.lstrip("/")
+        for prefix in ("workflows", "workflow"):
+            if text.startswith(prefix):
+                text = text[len(prefix):].lstrip()
+                break
+
+        try:
+            return await asyncio.to_thread(run_slash, text)
+        except Exception as exc:  # pragma: no cover - defensive
+            return f"⚠ workflow error: {exc}"
+
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
         """Handle /kanban — delegate to the shared kanban CLI.
 
