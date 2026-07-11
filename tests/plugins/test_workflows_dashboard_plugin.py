@@ -219,19 +219,19 @@ def test_dashboard_input_feed_api_rejects_non_continuous_trigger(client):
 
 
 def test_dashboard_tick_endpoint_advances_workflows(client, monkeypatch):
-    calls: list[int] = []
+    from hermes_cli.workflows_dispatcher import TickReport
 
-    def fake_tick(*, limit: int = 1) -> int:
-        calls.append(limit)
-        return 3
+    def fake_tick_detailed(*, limit: int = 1) -> TickReport:
+        return TickReport(processed=3, executions_advanced=3)
 
-    monkeypatch.setattr(workflows_dispatcher, "tick", fake_tick)
+    monkeypatch.setattr(workflows_dispatcher, "tick_detailed", fake_tick_detailed)
 
     r = client.post("/api/plugins/workflows/tick", json={"limit": 2})
 
     assert r.status_code == 200, r.text
-    assert r.json() == {"processed": 3}
-    assert calls == [2]
+    body = r.json()
+    assert body["processed"] == 3
+    assert body["executions_advanced"] == 3
 
 
 def test_dashboard_input_feed_api_can_pause_resume_and_start_execution(client):
@@ -241,20 +241,28 @@ def test_dashboard_input_feed_api_can_pause_resume_and_start_execution(client):
         json={"trigger_id": "kickoff"},
     ).json()["feed"]
 
+    # 1) enqueue while open.
+    ready = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/items",
+        json={"input": {"repo_path": "/repo", "prompt": "Review README drift"}},
+    ).json()["item"]
+    assert ready["status"] == "queued"
+
+    # 2) pause -> prove no further writes / admission.
     pause = client.post(
         f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
         json={"status": "paused"},
     )
     assert pause.status_code == 200, pause.text
     assert pause.json()["feed"]["status"] == "paused"
-
-    ready = client.post(
+    blocked = client.post(
         f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/items",
-        json={"input": {"repo_path": "/repo", "prompt": "Review README drift"}},
-    ).json()["item"]
-    assert ready["status"] == "queued"
+        json={"input": {"repo_path": "/repo2", "prompt": "second attempt"}},
+    )
+    assert blocked.status_code == 409, blocked.text
     assert workflows_dispatcher.tick(limit=1) == 0
 
+    # 3) resume -> admission resumes.
     resume = client.post(
         f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
         json={"status": "open"},
@@ -266,6 +274,31 @@ def test_dashboard_input_feed_api_can_pause_resume_and_start_execution(client):
     assert items[0]["status"] in {"running", "succeeded"}
     assert items[0]["execution_id"]
 
+    # 4) close -> terminal; subsequent transitions and writes are rejected.
+    close = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
+        json={"status": "closed"},
+    )
+    assert close.status_code == 200, close.text
+    terminal = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
+        json={"status": "open"},
+    )
+    assert terminal.status_code == 409, terminal.text
+    write_after_close = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/items",
+        json={"input": {"repo_path": "/after", "prompt": "after close"}},
+    )
+    assert write_after_close.status_code == 409, write_after_close.text
+
+    # 5) open a new feed; new feed_id.
+    next_feed = client.post(
+        "/api/plugins/workflows/definitions/continuous_demo/input-feeds",
+        json={"trigger_id": "kickoff"},
+    ).json()["feed"]
+    assert next_feed["feed_id"] != feed["feed_id"]
+    assert next_feed["status"] == "open"
+
 
 def test_dashboard_delete_definition_removes_workflow_and_related_runs(client):
     definition = _deploy(client, PASS_SPEC)
@@ -275,10 +308,15 @@ def test_dashboard_delete_definition_removes_workflow_and_related_runs(client):
     )
     assert run.status_code == 200, run.text
 
-    r = client.delete(f"/api/plugins/workflows/definitions/{definition['workflow_id']}")
+    blocked = client.delete(f"/api/plugins/workflows/definitions/{definition['workflow_id']}")
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "workflow_history_exists"
 
+    r = client.delete(
+        f"/api/plugins/workflows/definitions/{definition['workflow_id']}?purge=true"
+    )
     assert r.status_code == 200, r.text
-    assert r.json() == {"deleted": True, "workflow_id": definition["workflow_id"]}
+    assert r.json()["deleted"] is True
     assert client.get(f"/api/plugins/workflows/definitions/{definition['workflow_id']}").status_code == 404
     assert client.get("/api/plugins/workflows/definitions").json()["definitions"] == []
     assert client.get("/api/plugins/workflows/executions").json()["executions"] == []
@@ -890,7 +928,7 @@ def test_dashboard_bundle_is_syntax_valid_when_node_is_available():
     node = shutil.which("node")
     if not node:
         pytest.skip("node is not installed")
-    bundle = PLUGIN_DIR / "dist" / "index.js"
+    bundle = PLUGIN_DIR / "src" / "app.js"
     result = subprocess.run(
         [node, "--check", str(bundle)],
         text=True,
@@ -901,7 +939,7 @@ def test_dashboard_bundle_is_syntax_valid_when_node_is_available():
 
 
 def test_dashboard_bundle_renders_node_runs_and_linked_worker_tasks():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
 
     assert "node-runs" in bundle
     assert "Linked worker task" in bundle
@@ -910,7 +948,7 @@ def test_dashboard_bundle_renders_node_runs_and_linked_worker_tasks():
 
 
 def test_dashboard_bundle_wires_node_runs_as_execution_drilldown():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     load_node_runs = bundle[
         bundle.index("function loadNodeRuns") : bundle.index("function loadExecution")
     ]
@@ -933,7 +971,7 @@ def test_dashboard_bundle_wires_node_runs_as_execution_drilldown():
 
 
 def test_dashboard_bundle_contains_validation_checklist_and_dispatcher_banner():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
 
     assert "Validation checklist" in bundle
     assert "No unsupported nodes (implemented today)" in bundle
@@ -1006,7 +1044,7 @@ def test_dashboard_feed_input_fields_can_target_continuous_trigger():
 
 
 def test_dashboard_bundle_contains_feed_controls_and_honest_scalar_scope():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
 
     assert "renderInputFeedPanel" in bundle
     assert "Open Continuous Feed" in bundle
@@ -1020,7 +1058,7 @@ def test_dashboard_bundle_contains_feed_controls_and_honest_scalar_scope():
 
 
 def test_dashboard_validation_checklist_waits_for_parsed_spec_before_showing_failures():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     render_body = bundle[
         bundle.index("function renderValidationChecklist") : bundle.index(
             "function renderAdvancedYaml"
@@ -1032,7 +1070,7 @@ def test_dashboard_validation_checklist_waits_for_parsed_spec_before_showing_fai
 
 
 def test_dashboard_initial_load_refreshes_workflow_status_without_waiting_for_it():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     load_status_start = bundle.index("function loadWorkflowStatus")
     load_status_end = bundle.index("function loadWorkflowCapabilities", load_status_start)
     load_status = bundle[load_status_start:load_status_end]
@@ -1061,7 +1099,7 @@ def test_dashboard_initial_load_refreshes_workflow_status_without_waiting_for_it
 
 
 def test_dashboard_bundle_preserves_selected_definition_version():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     helpers = bundle[
         bundle.index("function versionQuery") : bundle.index("function runInputSpec")
     ]
@@ -1097,7 +1135,7 @@ def test_dashboard_bundle_preserves_selected_definition_version():
 
 
 def test_dashboard_validate_keeps_draft_unrunnable_until_deploy():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     validate = bundle[
         bundle.index("function validateDefinition") : bundle.index("function deployDefinition")
     ]
@@ -1113,7 +1151,7 @@ def test_dashboard_validate_keeps_draft_unrunnable_until_deploy():
 
 
 def test_dashboard_bundle_runs_selected_or_active_definition_version():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     selected_run_version = bundle[
         bundle.index("function selectedRunVersion") : bundle.index("function runWorkflow")
     ]
@@ -1132,7 +1170,7 @@ def test_dashboard_bundle_runs_selected_or_active_definition_version():
         
 
 def test_dashboard_execution_timeline_warns_when_stalled():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     warn_start = bundle.index("function renderExecutionStallWarning(")
     warn_end = bundle.index("function renderTimeline(", warn_start)
     warn_body = bundle[warn_start:warn_end]
@@ -1149,7 +1187,7 @@ def test_dashboard_execution_timeline_warns_when_stalled():
 
 
 def test_dashboard_live_refreshes_non_terminal_executions():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
 
     assert "Live-refresh a non-terminal execution" in bundle
     assert "setInterval" in bundle
@@ -1157,7 +1195,7 @@ def test_dashboard_live_refreshes_non_terminal_executions():
 
 
 def test_dashboard_event_status_maps_only_emitted_kinds():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     status_start = bundle.index("function eventStatus(")
     status_end = bundle.index("function statusByNode(", status_start)
     status_body = bundle[status_start:status_end]
@@ -1173,7 +1211,8 @@ def test_dashboard_event_status_maps_only_emitted_kinds():
 
 
 def _dashboard_helper_js() -> str:
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
+    editor = (PLUGIN_DIR / "src" / "editor-model.js").read_text(encoding="utf-8")
     kind_start = bundle.index("const NODE_KIND_LIST")
     kind_end = bundle.index("const EXAMPLE_DEFINITION", kind_start)
     start = bundle.index("function asArray")
@@ -1181,10 +1220,14 @@ def _dashboard_helper_js() -> str:
     # Include editor helper functions used by UI-only builder tests.
     editor_start = bundle.index("function cleanedNodeForSpec")
     editor_end = bundle.index("function WorkflowsPage", editor_start)
+    # Strip ES export keywords so node -e can eval the functions.
+    editor_src = editor.replace("export function", "function").replace("export const", "const")
     return (
         bundle[kind_start:kind_end]
         + "\n"
         + bundle[start:end]
+        + "\n"
+        + editor_src
         + "\n"
         + bundle[editor_start:editor_end]
     )
@@ -1941,18 +1984,20 @@ def test_dashboard_input_object_for_fields_rejects_invalid_typed_values():
 
 
 def test_dashboard_bundle_registers_plugin_without_build_scaffolding():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     assert "window.__HERMES_PLUGIN_SDK__" in bundle
     assert "window.__HERMES_PLUGINS__" in bundle
     assert 'REG.register("workflows"' in bundle
+    # app.js is a Vite entry module: `import` is required to wire its graph/api
+    # adapters; `export` would change it into a library, which it isn't.
     assert not any(
-        line.lstrip().startswith(("import ", "export ")) for line in bundle.splitlines()
+        line.lstrip().startswith("export ") for line in bundle.splitlines()
     )
     assert "__webpack_require__" not in bundle
 
 
 def test_dashboard_bundle_uses_generated_input_form_for_runs():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
 
     assert "renderRunStartPanel" in bundle
     assert "Start Workflow Run" in bundle
@@ -1963,7 +2008,7 @@ def test_dashboard_bundle_uses_generated_input_form_for_runs():
 
 
 def test_dashboard_topbar_run_opens_start_panel_instead_of_running_silently():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     topbar_pos = bundle.index("function renderTopBar")
     topbar_body = bundle[topbar_pos : bundle.index("function renderSidebar", topbar_pos)]
 
@@ -1972,7 +2017,7 @@ def test_dashboard_topbar_run_opens_start_panel_instead_of_running_silently():
 
 
 def test_dashboard_run_start_panel_builds_typed_inputs_from_trigger_schema():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     panel_pos = bundle.index("function renderRunInputField")
     panel_body = bundle[panel_pos : bundle.index("function renderBottomPanel", panel_pos)]
 
@@ -1984,7 +2029,7 @@ def test_dashboard_run_start_panel_builds_typed_inputs_from_trigger_schema():
 
 
 def test_dashboard_run_workflow_uses_form_values_unless_advanced_json():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     run_pos = bundle.index("function runWorkflow")
     run_body = bundle[run_pos : bundle.index("function draftFromGoal", run_pos)]
     render_pos = bundle.index("function runWorkflow")
@@ -2001,35 +2046,32 @@ def test_dashboard_run_workflow_uses_form_values_unless_advanced_json():
 
 
 def test_dashboard_bundle_clears_run_input_values_when_active_spec_changes():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     load_pos = bundle.index("function loadDefinition")
     load_body = bundle[load_pos : bundle.index("function loadEvents", load_pos)]
-    draft_pos = bundle.index("function draftFromGoal")
-    draft_body = bundle[draft_pos : bundle.index("function refineWorkflow", draft_pos)]
-    refine_pos = bundle.index("function refineWorkflow")
-    refine_body = bundle[refine_pos : bundle.index("function importDefinitionFile", refine_pos)]
+    accept_pos = bundle.index("function acceptDraftCandidate")
+    accept_body = bundle[accept_pos : bundle.index("function rejectDraftCandidate", accept_pos)]
     import_pos = bundle.index("function importDefinitionFile")
     import_body = bundle[import_pos : bundle.index("function exportYAML", import_pos)]
 
     def assert_resets_advanced_input_state(body):
         reset_pos = body.index("setInputFieldValues({})")
         assert "setShowAdvancedInputJson(false)" in body
-        assert "setRunInputText(\"{}\")" in body
+        assert 'setRunInputText("{}")' in body
         assert reset_pos < body.index("setShowAdvancedInputJson(false)")
-        assert reset_pos < body.index("setRunInputText(\"{}\")")
+        assert reset_pos < body.index('setRunInputText("{}")')
 
     assert load_body.index("setDraftSpec(") < load_body.index("setInputFieldValues({})")
-    assert draft_body.index("if (draft.spec)") < draft_body.index("setInputFieldValues({})")
-    assert refine_body.index("if (!draft.spec)") < refine_body.index("setInputFieldValues({})")
+    assert accept_body.index("setDraftSpec(draft.spec)") < accept_body.index("setInputFieldValues({})")
     assert import_body.index("reader.onload = function") < import_body.index(
         "setInputFieldValues({})"
     )
-    for body in (load_body, draft_body, refine_body, import_body):
+    for body in (load_body, accept_body, import_body):
         assert_resets_advanced_input_state(body)
 
 
 def test_dashboard_bundle_clears_run_input_values_when_advanced_yaml_changes():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     advanced = bundle[
         bundle.index("function renderAdvancedYaml") : bundle.index(
             "function renderTimeline"
@@ -2050,7 +2092,7 @@ def test_dashboard_bundle_clears_run_input_values_when_advanced_yaml_changes():
 
 
 def test_dashboard_bundle_is_prompt_first_not_yaml_first():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     render_start = bundle.index('return h("div", { className: "hermes-workflows" }')
     render_tree = bundle[render_start:]
 
@@ -2066,14 +2108,14 @@ def test_dashboard_bundle_is_prompt_first_not_yaml_first():
 
 
 def test_dashboard_bundle_contains_draft_review_and_refine_ui():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
 
     assert "refineWorkflow" in bundle
     assert "Refine" in bundle
 
 
 def test_dashboard_bundle_wires_draft_refine_before_advanced_yaml():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     render_start = bundle.index('return h("div", { className: "hermes-workflows" }')
     render_tree = bundle[render_start:]
 
@@ -2087,7 +2129,7 @@ def test_dashboard_bundle_wires_draft_refine_before_advanced_yaml():
 
 
 def test_dashboard_bundle_draft_review_labels_branch_and_failure_targets():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     rows_pos = bundle.index("function nodeSummaryRows")
     next_function_pos = bundle.index("function statusClass", rows_pos)
     rows_body = bundle[rows_pos:next_function_pos]
@@ -2097,42 +2139,34 @@ def test_dashboard_bundle_draft_review_labels_branch_and_failure_targets():
 
 
 def test_dashboard_bundle_refine_clears_stale_state_before_validation_and_requires_spec():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     refine_pos = bundle.index("function refineWorkflow")
-    next_function_pos = bundle.index("function importDefinitionFile", refine_pos)
+    next_function_pos = bundle.index("function acceptDraftCandidate", refine_pos)
     refine_body = bundle[refine_pos:next_function_pos]
     early_return_pos = refine_body.index("if (!instruction || !spec)")
 
     assert refine_body.index('setStatus("")') < early_return_pos
     assert refine_body.index("setDraftResult(null)") < early_return_pos
     assert "Refine response did not include a workflow spec." in refine_body
-    for marker in [
-        "setSelectedDefinition(null)",
-        "setSelectedNode(null)",
-        'setNodeJson("")',
-        'setNodeMessage("")',
-    ]:
-        assert marker in refine_body
-    assert refine_body.index("if (!draft.spec)") < refine_body.index("setDraftResult(draft)")
-    assert refine_body.index("setDraftResult(draft)") < refine_body.index(
-        'setRefineText("")'
-    )
-    assert refine_body.index('setRefineText("")') < refine_body.index(
-        'setStatus("Refined workflow draft.")'
-    )
+    assert 'setCandidateSource("refine")' in refine_body
+    assert "Review changes and Accept or Reject" in refine_body
 
 
 def test_dashboard_bundle_syncs_editor_when_definition_is_selected():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     load_definition_pos = bundle.index("function loadDefinition")
     next_function_pos = bundle.index("function loadEvents", load_definition_pos)
     load_definition_body = bundle[load_definition_pos:next_function_pos]
 
-    assert "updateEditorText(specToEditorText(definition.spec))" in load_definition_body
+    # ponytail: editor sync now checks dirty state before overwriting;
+    # the guard is in the same function, the update call is conditional.
+    assert "isDraftDirty" in load_definition_body
+    assert "specToEditorText" in load_definition_body
+    assert "setSavedDraft" in load_definition_body
 
 
 def test_dashboard_bundle_clears_stale_draft_state_before_empty_goal_error():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     draft_pos = bundle.index("function draftFromGoal")
     next_function_pos = bundle.index("function importDefinitionFile", draft_pos)
     draft_body = bundle[draft_pos:next_function_pos]
@@ -2144,25 +2178,25 @@ def test_dashboard_bundle_clears_stale_draft_state_before_empty_goal_error():
 
 
 def test_dashboard_bundle_resets_stale_selection_after_goal_draft():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     draft_pos = bundle.index("function draftFromGoal")
     next_function_pos = bundle.index("function refineWorkflow", draft_pos)
     draft_body = bundle[draft_pos:next_function_pos]
 
+    # ponytail: draftFromGoal now stores the AI result as a candidate;
+    # the actual working-draft reset (setDraftSpec, setSelectedDefinition, etc.)
+    # happens in acceptDraftCandidate. Verify the candidate setup here.
     for marker in [
-        "setSelectedDefinition(null)",
-        "setSelectedNode(null)",
-        'setNodeJson("")',
-        'setNodeMessage("")',
-        "setDraftSpec(draft.spec)",
-        "updateEditorText(specToEditorText(draft.spec))",
+        'setCandidateSource("generate")',
+        "setDraftResult(draft)",
+        "Review and Accept or Reject",
     ]:
         assert marker in draft_body
     assert 'aria-label' in bundle and 'Describe workflow goal' in bundle
 
 
 def test_dashboard_bundle_keeps_yaml_as_advanced_escape_hatch():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     advanced_pos = bundle.index("function renderAdvancedYaml")
     advanced_body = bundle[advanced_pos : bundle.index("function renderTimeline", advanced_pos)]
 
@@ -2203,7 +2237,7 @@ def test_web_plugin_sdk_exposes_react_flow_to_static_plugins():
 
 
 def test_dashboard_bundle_selects_execution_from_url_query():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
 
     assert "URLSearchParams" in bundle
     assert "location.search" in bundle
@@ -2212,7 +2246,7 @@ def test_dashboard_bundle_selects_execution_from_url_query():
 
 
 def test_dashboard_bundle_contains_visual_editor_markers():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     assert "SDK.ReactFlow" in bundle or "SDK.reactFlow" in bundle
     assert "ReactFlowProvider" in bundle
     for marker in ["Background", "Controls", "MiniMap", "Handle", "Position"]:
@@ -2251,7 +2285,7 @@ def test_dashboard_bundle_contains_visual_editor_markers():
 
 
 def test_dashboard_bundle_contains_text_first_agent_cell_editor_markers():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
 
     for marker in [
         "renderAgentTaskInspector",
@@ -2271,7 +2305,7 @@ def test_dashboard_bundle_contains_text_first_agent_cell_editor_markers():
 
 
 def test_dashboard_bundle_contains_workflow_mvp_api_and_ui_markers():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     for marker in [
         'const API = "/api/plugins/workflows"',
         "/api/plugins/workflows/definitions",
@@ -2676,7 +2710,7 @@ def test_bad_spec_returns_400_with_validation_message(client):
 
 
 def test_dashboard_bundle_clears_draft_metadata_when_selecting_or_importing_definition():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
 
     load_pos = bundle.index("function loadDefinition")
     load_end = bundle.index("function loadEvents", load_pos)
@@ -2700,7 +2734,7 @@ def test_dashboard_bundle_clears_draft_metadata_when_selecting_or_importing_defi
 
 
 def test_dashboard_bundle_summarizes_structured_prompts_for_draft_review():
-    bundle = (PLUGIN_DIR / "dist" / "index.js").read_text(encoding="utf-8")
+    bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     helper = bundle[
         bundle.index("function promptObjectiveText") : bundle.index("function nodeSummaryRows")
     ]
@@ -2750,3 +2784,497 @@ def test_bad_run_input_returns_400(client):
     )
     assert r.status_code == 400
     assert "input_json" in r.json()["detail"]
+
+
+# --- Task 3: dashboard draft / publish / archive / feed lifecycle API ---
+
+
+def test_dashboard_draft_put_and_get_round_trip(client):
+    spec = copy.deepcopy(PASS_SPEC)
+    spec["name"] = "Draft Demo"
+    put = client.put(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft",
+        json={"spec": spec, "base_version": None},
+    )
+    assert put.status_code == 200, put.text
+    body = put.json()
+    assert body["draft"]["workflow_id"] == PASS_SPEC["id"]
+    assert body["draft"]["spec"]["name"] == "Draft Demo"
+    assert body["draft"]["base_version"] is None
+
+    fetched = client.get(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft"
+    )
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["draft"]["spec"]["name"] == "Draft Demo"
+
+
+def test_dashboard_draft_delete_removes_existing_draft(client):
+    spec = copy.deepcopy(PASS_SPEC)
+    spec["name"] = "Will Be Deleted"
+    client.put(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft",
+        json={"spec": spec, "base_version": None},
+    )
+    deleted = client.delete(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft"
+    )
+    assert deleted.status_code == 200, deleted.text
+    missing = client.get(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft"
+    )
+    assert missing.status_code == 404
+
+
+def test_dashboard_publish_creates_definition_and_clears_draft(client):
+    spec = copy.deepcopy(PASS_SPEC)
+    spec["name"] = "First Publish"
+    client.put(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft",
+        json={"spec": spec, "base_version": None},
+    )
+    publish = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/publish",
+        json={"expected_latest_version": None},
+    )
+    assert publish.status_code == 200, publish.text
+    body = publish.json()
+    assert body["definition"]["version"] == 1
+    assert body["definition"]["name"] == "First Publish"
+    missing = client.get(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft"
+    )
+    assert missing.status_code == 404
+
+
+def test_dashboard_publish_returns_409_on_version_conflict(client):
+    _deploy(client, PASS_SPEC)
+    spec = copy.deepcopy(PASS_SPEC)
+    spec["name"] = "Stale Draft"
+    spec["version"] = 2
+    client.put(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft",
+        json={"spec": spec, "base_version": 1},
+    )
+    conflict = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/publish",
+        json={"expected_latest_version": 0},
+    )
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json() == {
+        "detail": {
+            "code": "workflow_version_conflict",
+            "message": "Workflow changed since this draft was created.",
+            "field_errors": {},
+            "hint": "Reload the latest version and review the draft again.",
+        }
+    }
+
+
+def test_dashboard_archive_hides_workflow_and_include_archived_restores(client):
+    _deploy(client, PASS_SPEC)
+
+    listed = client.get("/api/plugins/workflows/definitions")
+    assert listed.status_code == 200, listed.text
+    assert len(listed.json()["definitions"]) == 1
+
+    archived = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/archive",
+        json={"archived": True},
+    )
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["workflow"]["archived"] is True
+
+    default_list = client.get("/api/plugins/workflows")
+    assert default_list.status_code == 200, default_list.text
+    assert default_list.json()["workflows"] == []
+
+    full_list = client.get("/api/plugins/workflows?include_archived=true")
+    assert full_list.status_code == 200, full_list.text
+    assert len(full_list.json()["workflows"]) == 1
+
+    restored = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/archive",
+        json={"archived": False},
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["workflow"]["archived"] is False
+    assert client.get("/api/plugins/workflows").json()["workflows"] != []
+
+
+def test_dashboard_summary_includes_draft_enabled_and_archived(client):
+    _deploy(client, PASS_SPEC)
+    spec = copy.deepcopy(PASS_SPEC)
+    spec["name"] = "Draft Open"
+    client.put(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft",
+        json={"spec": spec, "base_version": 1},
+    )
+    listed = client.get("/api/plugins/workflows").json()["workflows"]
+    assert len(listed) == 1
+    row = listed[0]
+    assert row["workflow_id"] == PASS_SPEC["id"]
+    assert row["has_draft"] is True
+    assert row["latest_version"] == 1
+    assert row["enabled"] is True
+    assert row["archived"] is False
+    assert row["open_feed_count"] == 0
+
+
+def test_dashboard_enabled_toggle_appears_in_summary(client):
+    _deploy(client, PASS_SPEC)
+    toggle = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/enabled",
+        json={"enabled": False},
+    )
+    assert toggle.status_code == 200, toggle.text
+    listed = client.get("/api/plugins/workflows").json()["workflows"][0]
+    assert listed["enabled"] is False
+
+
+def test_dashboard_paused_feed_writes_return_409(client):
+    _deploy(client, CONTINUOUS_SPEC)
+    feed = client.post(
+        "/api/plugins/workflows/definitions/continuous_demo/input-feeds",
+        json={"trigger_id": "kickoff"},
+    ).json()["feed"]
+    paused = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
+        json={"status": "paused"},
+    )
+    assert paused.status_code == 200, paused.text
+
+    enqueue = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/items",
+        json={"input": {"repo_path": "/repo", "prompt": "Review README drift"}},
+    )
+    assert enqueue.status_code == 409, enqueue.text
+    assert enqueue.json()["detail"]["code"] == "workflow_feed_not_open"
+
+
+def test_dashboard_closed_feed_writes_and_reopen_return_409(client):
+    _deploy(client, CONTINUOUS_SPEC)
+    feed = client.post(
+        "/api/plugins/workflows/definitions/continuous_demo/input-feeds",
+        json={"trigger_id": "kickoff"},
+    ).json()["feed"]
+    client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
+        json={"status": "closed"},
+    )
+
+    enqueue = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/items",
+        json={"input": {"repo_path": "/repo", "prompt": "Review README drift"}},
+    )
+    assert enqueue.status_code == 409, enqueue.text
+    assert enqueue.json()["detail"]["code"] == "workflow_feed_closed"
+
+    reopen = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
+        json={"status": "open"},
+    )
+    assert reopen.status_code == 409, reopen.text
+    assert reopen.json()["detail"]["code"] == "workflow_feed_terminal"
+
+
+def test_dashboard_delete_requires_explicit_purge_when_history_exists(client):
+    definition = _deploy(client, PASS_SPEC)
+    client.post(
+        f"/api/plugins/workflows/definitions/{definition['workflow_id']}/run",
+        json={"input": {}},
+    )
+    blocked = client.delete(
+        f"/api/plugins/workflows/definitions/{definition['workflow_id']}"
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "workflow_history_exists"
+    purged = client.delete(
+        f"/api/plugins/workflows/definitions/{definition['workflow_id']}?purge=true"
+    )
+    assert purged.status_code == 200, purged.text
+    assert purged.json()["deleted"] is True
+
+
+def test_dashboard_delete_history_free_workflow_succeeds_without_purge(client):
+    _deploy(client, PASS_SPEC)
+    r = client.delete(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}",
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted"] is True
+
+
+# --- Task 5: AI-first draft review envelope (summary/assumptions/warnings) ---
+
+
+ASSISTANT_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "workflows" / "assistant_responses.json"
+
+
+def _assistant_fixture(name: str) -> dict:
+    return json.loads(ASSISTANT_FIXTURE_PATH.read_text())[name]
+
+
+def test_definition_draft_endpoint_returns_summary_assumptions_and_warnings_envelope(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+    from hermes_cli.workflows_assistant import parse_assistant_payload
+
+    payload = _assistant_fixture("draft")
+
+    def fake_draft(goal):
+        assert goal == "guard the readme"
+        return parse_assistant_payload(payload)
+
+    monkeypatch.setattr(
+        plugin.workflows_assistant, "draft_workflow_with_default_runner", fake_draft
+    )
+
+    r = client.post(
+        "/api/plugins/workflows/definitions/draft", json={"goal": "guard the readme"}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()["draft"]
+    assert body["summary"] == payload["summary"]
+    assert body["assumptions"] == payload["assumptions"]
+    assert body["warnings"] == payload["warnings"]
+    assert body["spec"]["id"] == "readme_drift_guard"
+
+
+def test_definition_refine_endpoint_returns_summary_assumptions_and_warnings_envelope(client, monkeypatch):
+    import hermes_dashboard_plugin_workflows_test as plugin
+    from hermes_cli.workflows_assistant import parse_assistant_payload
+
+    payload = _assistant_fixture("refine")
+
+    def fake_refine(spec, instruction):
+        assert instruction == "add reviewer + retry"
+        return parse_assistant_payload(payload)
+
+    monkeypatch.setattr(
+        plugin.workflows_assistant, "refine_workflow_with_default_runner", fake_refine
+    )
+
+    current_spec = _assistant_fixture("draft")["spec"]
+    r = client.post(
+        "/api/plugins/workflows/definitions/refine",
+        json={"spec": current_spec, "instruction": "add reviewer + retry"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()["draft"]
+    assert body["summary"] == payload["summary"]
+    assert body["assumptions"] == payload["assumptions"]
+    assert body["warnings"] == payload["warnings"]
+    assert body["spec"]["version"] == 2
+
+
+def test_definition_draft_endpoint_returns_typed_assistant_validation_error(client, monkeypatch):
+    """Invalid candidate output must surface as the typed
+    workflow_assistant_validation_error code so the UI can route to Repair-with-AI."""
+    import hermes_dashboard_plugin_workflows_test as plugin
+    from hermes_cli.workflows_assistant import AssistantValidationError
+
+    def fake_draft(goal):
+        raise AssistantValidationError(
+            "agent_task node fetch_readme requires a non-empty result_contract"
+        )
+
+    monkeypatch.setattr(
+        plugin.workflows_assistant, "draft_workflow_with_default_runner", fake_draft
+    )
+
+    r = client.post(
+        "/api/plugins/workflows/definitions/draft", json={"goal": "broken"}
+    )
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "workflow_assistant_validation_error"
+
+
+def test_dashboard_tick_endpoint_returns_detailed_report(client, monkeypatch):
+    from hermes_cli.workflows_dispatcher import TickReport
+
+    def fake_tick_detailed(*, limit: int = 1) -> TickReport:
+        return TickReport(
+            schedules_admitted=0,
+            feed_items_admitted=1,
+            executions_advanced=1,
+            remaining_queued=0,
+            remaining_running_or_waiting=0,
+            processed=2,
+        )
+
+    monkeypatch.setattr(workflows_dispatcher, "tick_detailed", fake_tick_detailed)
+
+    r = client.post("/api/plugins/workflows/tick", json={"limit": 2})
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body == {
+        "schedules_admitted": 0,
+        "feed_items_admitted": 1,
+        "executions_advanced": 1,
+        "remaining_queued": 0,
+        "remaining_running_or_waiting": 0,
+        "processed": 2,
+    }
+
+
+# --- Task 8: detail endpoint, rerun, filtered executions ---
+
+
+SECRET_DETAIL_SPEC = {
+    "id": "secret_detail_demo",
+    "name": "Secret Detail Demo",
+    "version": 1,
+    "triggers": [{"type": "manual", "id": "manual"}],
+    "nodes": {
+        "start": {
+            "type": "pass",
+            "output": {"api_key": "${ input.api_key }", "topic": "${ input.topic }"},
+        }
+    },
+}
+
+
+def test_execution_detail_is_versioned_and_redacted(client):
+    _deploy(client, SECRET_DETAIL_SPEC)
+    r = client.post(
+        "/api/plugins/workflows/definitions/secret_detail_demo/run",
+        json={"input": {"api_key": "super-secret", "topic": "safe"}},
+    )
+    assert r.status_code == 200, r.text
+    execution_id = r.json()["execution"]["execution_id"]
+
+    detail = client.get(f"/api/plugins/workflows/executions/{execution_id}/detail")
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["execution"]["version"] == 1
+    assert body["definition"]["version"] == 1
+    assert "super-secret" not in detail.text
+    assert body["node_runs"]
+    assert body["events"]
+    assert body["execution"]["input"]["api_key"] == "[REDACTED]"
+
+
+def test_rerun_creates_new_execution_pinned_to_same_version(client):
+    _deploy(client, PASS_SPEC)
+    r = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/run",
+        json={"input": {"x": 1}},
+    )
+    assert r.status_code == 200, r.text
+    original = r.json()["execution"]
+
+    rerun = client.post(
+        f"/api/plugins/workflows/executions/{original['execution_id']}/rerun",
+        json={"input": {"x": 2}},
+    )
+    assert rerun.status_code == 200, rerun.text
+    body = rerun.json()
+    assert body["execution"]["execution_id"] != original["execution_id"]
+    assert body["execution"]["version"] == original["version"]
+    assert body["execution"]["workflow_id"] == original["workflow_id"]
+    assert body["source_execution_id"] == original["execution_id"]
+    assert body["execution"]["input"] == {"x": 2}
+
+
+def test_rerun_requires_explicit_input(client):
+    _deploy(client, PASS_SPEC)
+    r = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/run",
+        json={"input": {}},
+    )
+    execution_id = r.json()["execution"]["execution_id"]
+
+    rerun = client.post(
+        f"/api/plugins/workflows/executions/{execution_id}/rerun",
+        json={},
+    )
+    assert rerun.status_code == 400
+
+
+def test_rerun_returns_404_for_missing_execution(client):
+    r = client.post(
+        "/api/plugins/workflows/executions/wfexec_missing/rerun",
+        json={"input": {}},
+    )
+    assert r.status_code == 404
+
+
+def test_executions_list_supports_status_filter(client):
+    _deploy(client, PASS_SPEC)
+    e1 = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/run",
+        json={"input": {}},
+    ).json()["execution"]
+    e2 = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/run",
+        json={"input": {}},
+    ).json()["execution"]
+
+    succeeded = client.get("/api/plugins/workflows/executions?status=succeeded")
+    running = client.get("/api/plugins/workflows/executions?status=queued")
+    # At least one should match based on how fast they complete.
+    all_execs = client.get("/api/plugins/workflows/executions")
+    assert len(all_execs.json()["executions"]) == 2
+
+
+def test_executions_list_supports_version_filter(client):
+    _deploy(client, PASS_SPEC)
+    client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/run",
+        json={"input": {}},
+    )
+
+    v1 = client.get("/api/plugins/workflows/executions?version=1")
+    assert len(v1.json()["executions"]) == 1
+
+    v99 = client.get("/api/plugins/workflows/executions?version=99")
+    assert len(v99.json()["executions"]) == 0
+
+
+def test_detail_returns_404_for_missing_execution(client):
+    r = client.get("/api/plugins/workflows/executions/wfexec_missing/detail")
+    assert r.status_code == 404
+
+
+def test_validate_rejects_missing_profile(client):
+    spec = {
+        "id": "ghost_profile_dashboard",
+        "name": "Ghost Profile Dashboard",
+        "version": 1,
+        "triggers": [{"type": "manual", "id": "manual"}],
+        "nodes": {
+            "task": {
+                "type": "agent_task",
+                "profile": "nonexistent_ghost",
+                "prompt": "Do work.",
+            }
+        },
+    }
+
+    r = client.post("/api/plugins/workflows/definitions/validate", json={"spec": spec})
+
+    assert r.status_code == 400
+    assert "workflow_profile_not_found" in r.text
+    assert "nonexistent_ghost" in r.text
+
+
+def test_deploy_rejects_missing_profile(client):
+    spec = {
+        "id": "ghost_deploy_dashboard",
+        "name": "Ghost Deploy Dashboard",
+        "version": 1,
+        "nodes": {
+            "task": {
+                "type": "agent_task",
+                "profile": "nonexistent_ghost",
+                "prompt": "Do work.",
+            }
+        },
+    }
+
+    r = client.post("/api/plugins/workflows/definitions/deploy", json={"spec": spec})
+
+    assert r.status_code == 400
+    assert "workflow_profile_not_found" in r.text

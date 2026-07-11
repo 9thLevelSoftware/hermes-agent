@@ -6,6 +6,7 @@ import json
 import secrets
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,16 @@ from hermes_cli import workflows_db as wfdb
 from hermes_cli.workflows_engine import EngineResult, run_in_memory_until_waiting
 from hermes_cli.workflows_prompts import render_agent_prompt, render_prompt_text
 from hermes_cli.workflows_spec import RESULT_CONTRACT_PRIMITIVES, WorkflowSpec
+
+
+@dataclass
+class TickReport:
+    schedules_admitted: int = 0
+    feed_items_admitted: int = 0
+    executions_advanced: int = 0
+    remaining_queued: int = 0
+    remaining_running_or_waiting: int = 0
+    processed: int = 0
 
 
 class _AgentTaskMaterializationError(RuntimeError):
@@ -1012,35 +1023,37 @@ def _finish(
     return True
 
 
-def tick(
+def _tick(
     *,
     db_path: Path | None = None,
     limit: int = 10,
     now: int | None = None,
     lease_seconds: int = 60,
-) -> int:
-    """Advance up to limit queued cheap workflow executions. Return number processed."""
+) -> TickReport:
+    """Advance up to limit queued cheap workflow executions. Return structured report."""
     if limit <= 0:
-        return 0
+        return TickReport()
 
     tick_now = int(time.time()) if now is None else now
-    processed = 0
+    report = TickReport()
     wfdb.init_db(db_path)
     with wfdb.connect(db_path) as conn:
         _resume_due_waits(conn, now=tick_now)
         _resume_due_retries(conn, now=tick_now)
         _resume_completed_agent_tasks(conn, now=tick_now)
         wfdb.sync_terminal_input_items(conn, now=tick_now)
-        while processed < limit:
+        while report.processed < limit:
             claimed = _claim_next(conn, now=tick_now, lease_seconds=lease_seconds)
             if claimed is None:
-                scheduled = _fire_due_schedules(conn, now=tick_now, limit=limit - processed)
+                scheduled = _fire_due_schedules(conn, now=tick_now, limit=limit - report.processed)
                 if scheduled:
+                    report.schedules_admitted += scheduled
                     continue
                 started = _start_ready_feed_items(conn, now=tick_now, limit=1)
                 if not started:
                     break
-                processed += started
+                report.feed_items_admitted += started
+                report.processed += started
                 continue
             execution_id, token = claimed
             execution = None
@@ -1077,6 +1090,38 @@ def tick(
                 spec=spec,
                 now=tick_now,
             ):
-                processed += 1
+                report.executions_advanced += 1
+                report.processed += 1
+        # ponytail: remaining counts via single queries instead of tracking in loop
+        remaining = conn.execute(
+            "SELECT status FROM workflow_executions WHERE status IN ('queued', 'running', 'waiting')"
+        ).fetchall()
+        for row in remaining:
+            if row["status"] == "queued":
+                report.remaining_queued += 1
+            else:
+                report.remaining_running_or_waiting += 1
         wfdb.sync_terminal_input_items(conn, now=tick_now)
-    return processed
+    return report
+
+
+def tick(
+    *,
+    db_path: Path | None = None,
+    limit: int = 10,
+    now: int | None = None,
+    lease_seconds: int = 60,
+) -> int:
+    """Advance up to limit queued cheap workflow executions. Return number processed."""
+    return _tick(db_path=db_path, limit=limit, now=now, lease_seconds=lease_seconds).processed
+
+
+def tick_detailed(
+    *,
+    db_path: Path | None = None,
+    limit: int = 10,
+    now: int | None = None,
+    lease_seconds: int = 60,
+) -> TickReport:
+    """Advance up to limit queued cheap workflow executions. Return structured report."""
+    return _tick(db_path=db_path, limit=limit, now=now, lease_seconds=lease_seconds)
