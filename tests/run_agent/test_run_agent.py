@@ -2501,6 +2501,105 @@ class TestRetryAfterCap:
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
 
+    def test_concurrent_timeout_marks_missing_result_unresolved(self, agent, monkeypatch):
+        """A deadline with no worker result must warn against blind retry."""
+        from agent import tool_executor
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
+        future = MagicMock()
+        future.cancel.return_value = False
+        future.cancelled.return_value = False
+        executor = MagicMock()
+        executor.submit.return_value = future
+        ticks = iter((0.0, 0.0, 1.0))
+        monkeypatch.setattr(tool_executor.time, "monotonic", lambda: next(ticks))
+        monkeypatch.setattr(
+            tool_executor.concurrent.futures,
+            "wait",
+            lambda fs, timeout=None: (set(), set(fs)),
+        )
+        agent._flush_messages_to_session_db = MagicMock()
+        tc = _mock_tool_call(name="write_file", arguments='{"path":"x"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", return_value=executor):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        result = messages[0]
+        assert result["effect_disposition"] == "unknown"
+        assert "[UNRESOLVED]" in result["content"]
+        assert "do not retry blindly" in result["content"].lower()
+        assert "cancelled" not in result["content"].lower()
+
+    def test_concurrent_late_real_result_wins_without_sleep(self, agent, monkeypatch):
+        """A real result present after the deadline snapshot beats fabrication."""
+        from agent import tool_executor
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
+        future = MagicMock()
+        future.cancel.return_value = False
+        future.cancelled.return_value = False
+        executor = MagicMock()
+
+        def submit_and_complete(target, *args, **kwargs):
+            target(*args, **kwargs)
+            return future
+
+        executor.submit.side_effect = submit_and_complete
+        ticks = iter((0.0, 0.0, 1.0))
+        monkeypatch.setattr(tool_executor.time, "monotonic", lambda: next(ticks))
+        monkeypatch.setattr(
+            tool_executor.concurrent.futures,
+            "wait",
+            lambda fs, timeout=None: (set(), set(fs)),
+        )
+        agent._flush_messages_to_session_db = MagicMock()
+        tc = _mock_tool_call(name="write_file", arguments='{"path":"x"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", return_value=executor), \
+             patch("run_agent.handle_function_call", return_value="real-result"):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert messages[0]["content"] == "real-result"
+        assert "timed out" not in messages[0]["content"]
+
+    @pytest.mark.parametrize("cancel_result", [False, True])
+    def test_concurrent_interrupt_is_cancelled_only_when_future_cancelled(
+        self, agent, monkeypatch, cancel_result
+    ):
+        """An interrupted worker without confirmed cancellation stays unresolved."""
+        from agent import tool_executor
+
+        monkeypatch.delenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", raising=False)
+        future = MagicMock()
+        future.cancel.return_value = cancel_result
+        future.cancelled.return_value = cancel_result
+        executor = MagicMock()
+        executor.submit.return_value = future
+        agent._flush_messages_to_session_db = MagicMock()
+        tc = _mock_tool_call(name="write_file", arguments='{"path":"x"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        def interrupt_on_wait(fs, timeout=None):
+            agent._interrupt_requested = True
+            return set(), set(fs)
+
+        monkeypatch.setattr(tool_executor.concurrent.futures, "wait", interrupt_on_wait)
+        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", return_value=executor):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        result = messages[0]
+        if cancel_result:
+            assert "cancelled" in result["content"].lower()
+        else:
+            assert result["effect_disposition"] == "unknown"
+            assert "[UNRESOLVED]" in result["content"]
+            assert "cancelled" not in result["content"].lower()
+
     def test_single_tool_uses_sequential_path(self, agent):
         """Single tool call should use sequential path, not concurrent."""
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")

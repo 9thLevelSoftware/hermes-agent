@@ -664,6 +664,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         futures = []
         future_to_index = {}
         timed_out_indices: set[int] = set()
+        cancelled_indices: set[int] = set()
         timeout_s = _resolve_concurrent_tool_timeout()
         deadline = time.monotonic() + timeout_s if timeout_s is not None else None
         if runnable_calls:
@@ -785,7 +786,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                 force=True,
                             )
                         for f in not_done:
-                            f.cancel()
+                            if f.cancel():
+                                index = future_to_index.get(f)
+                                if index is not None:
+                                    cancelled_indices.add(index)
                         # Give already-running tools a moment to notice the
                         # per-thread interrupt signal and exit gracefully.
                         concurrent.futures.wait(not_done, timeout=3.0)
@@ -813,6 +817,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     wait=not abandon_executor,
                     cancel_futures=abandon_executor,
                 )
+        cancelled_indices.update(
+            future_to_index[f]
+            for f in futures
+            if f.cancelled() and f in future_to_index
+        )
     finally:
         if spinner:
             # Build a summary message for the spinner stop
@@ -831,7 +840,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         effect_disposition = None
         if i in timed_out_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
-            function_result = f"Error executing tool '{name}': timed out after {suffix}"
+            function_result = (
+                f"Error executing tool '{name}': timed out after {suffix}; "
+                "[UNRESOLVED] the operation may have executed and its effect is UNKNOWN. "
+                "Do not retry blindly; inspect current state before retrying."
+            )
             effect_disposition = "unknown"
             _emit_terminal_post_tool_call(
                 agent,
@@ -848,8 +861,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_duration = float(timeout_s or 0.0)
         elif r is None:
             # Tool was cancelled (interrupt) or thread didn't return
-            if agent._interrupt_requested:
+            if i in cancelled_indices:
                 function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
+                effect_disposition = "none"
                 _emit_terminal_post_tool_call(
                     agent,
                     function_name=name,
@@ -860,6 +874,25 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     status="cancelled",
                     error_type="keyboard_interrupt",
                     error_message="Tool execution cancelled by user interrupt",
+                    middleware_trace=list(middleware_trace),
+                )
+            elif agent._interrupt_requested:
+                function_result = (
+                    f"[UNRESOLVED] Tool execution for '{name}' was interrupted before a result "
+                    "was observed. The operation may have executed and its effect is UNKNOWN. "
+                    "Do not retry blindly; inspect current state before retrying."
+                )
+                effect_disposition = "unknown"
+                _emit_terminal_post_tool_call(
+                    agent,
+                    function_name=name,
+                    function_args=args,
+                    result=function_result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(tc, "id", "") or "",
+                    status="unresolved",
+                    error_type="tool_interrupt_unresolved",
+                    error_message=function_result,
                     middleware_trace=list(middleware_trace),
                 )
             else:
