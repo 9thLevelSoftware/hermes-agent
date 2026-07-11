@@ -110,7 +110,7 @@ def build_tool_title(tool_name: str, args: Dict[str, Any]) -> str:
     if tool_name == "web_extract":
         urls = args.get("urls", [])
         if urls:
-            first = urls[0]
+            first = urls[0] if isinstance(urls, (list, tuple)) else urls
             if isinstance(first, dict):
                 first = first.get("url") or first.get("href") or "?"
             elif not isinstance(first, str):

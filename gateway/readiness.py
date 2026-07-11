@@ -31,7 +31,7 @@ def _probe_state_db(home: Path) -> dict[str, Any]:
         # A readiness probe must never compete with normal state writers. A
         # read-only schema query still catches unreadable/corrupt databases
         # without taking a write reservation on every health poll.
-        uri = f"file:{path.as_posix()}?mode=ro"
+        uri = f"{path.resolve().as_uri()}?mode=ro"
         with sqlite3.connect(uri, uri=True, timeout=1.0) as conn:
             conn.execute("PRAGMA query_only = ON")
             conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
