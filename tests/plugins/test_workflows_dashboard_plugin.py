@@ -241,20 +241,28 @@ def test_dashboard_input_feed_api_can_pause_resume_and_start_execution(client):
         json={"trigger_id": "kickoff"},
     ).json()["feed"]
 
+    # 1) enqueue while open.
+    ready = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/items",
+        json={"input": {"repo_path": "/repo", "prompt": "Review README drift"}},
+    ).json()["item"]
+    assert ready["status"] == "queued"
+
+    # 2) pause -> prove no further writes / admission.
     pause = client.post(
         f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
         json={"status": "paused"},
     )
     assert pause.status_code == 200, pause.text
     assert pause.json()["feed"]["status"] == "paused"
-
-    ready = client.post(
+    blocked = client.post(
         f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/items",
-        json={"input": {"repo_path": "/repo", "prompt": "Review README drift"}},
-    ).json()["item"]
-    assert ready["status"] == "queued"
+        json={"input": {"repo_path": "/repo2", "prompt": "second attempt"}},
+    )
+    assert blocked.status_code == 409, blocked.text
     assert workflows_dispatcher.tick(limit=1) == 0
 
+    # 3) resume -> admission resumes.
     resume = client.post(
         f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
         json={"status": "open"},
@@ -266,6 +274,31 @@ def test_dashboard_input_feed_api_can_pause_resume_and_start_execution(client):
     assert items[0]["status"] in {"running", "succeeded"}
     assert items[0]["execution_id"]
 
+    # 4) close -> terminal; subsequent transitions and writes are rejected.
+    close = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
+        json={"status": "closed"},
+    )
+    assert close.status_code == 200, close.text
+    terminal = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
+        json={"status": "open"},
+    )
+    assert terminal.status_code == 409, terminal.text
+    write_after_close = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/items",
+        json={"input": {"repo_path": "/after", "prompt": "after close"}},
+    )
+    assert write_after_close.status_code == 409, write_after_close.text
+
+    # 5) open a new feed; new feed_id.
+    next_feed = client.post(
+        "/api/plugins/workflows/definitions/continuous_demo/input-feeds",
+        json={"trigger_id": "kickoff"},
+    ).json()["feed"]
+    assert next_feed["feed_id"] != feed["feed_id"]
+    assert next_feed["status"] == "open"
+
 
 def test_dashboard_delete_definition_removes_workflow_and_related_runs(client):
     definition = _deploy(client, PASS_SPEC)
@@ -275,10 +308,15 @@ def test_dashboard_delete_definition_removes_workflow_and_related_runs(client):
     )
     assert run.status_code == 200, run.text
 
-    r = client.delete(f"/api/plugins/workflows/definitions/{definition['workflow_id']}")
+    blocked = client.delete(f"/api/plugins/workflows/definitions/{definition['workflow_id']}")
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "workflow_history_exists"
 
+    r = client.delete(
+        f"/api/plugins/workflows/definitions/{definition['workflow_id']}?purge=true"
+    )
     assert r.status_code == 200, r.text
-    assert r.json() == {"deleted": True, "workflow_id": definition["workflow_id"]}
+    assert r.json()["deleted"] is True
     assert client.get(f"/api/plugins/workflows/definitions/{definition['workflow_id']}").status_code == 404
     assert client.get("/api/plugins/workflows/definitions").json()["definitions"] == []
     assert client.get("/api/plugins/workflows/executions").json()["executions"] == []
@@ -2752,3 +2790,222 @@ def test_bad_run_input_returns_400(client):
     )
     assert r.status_code == 400
     assert "input_json" in r.json()["detail"]
+
+
+# --- Task 3: dashboard draft / publish / archive / feed lifecycle API ---
+
+
+def test_dashboard_draft_put_and_get_round_trip(client):
+    spec = copy.deepcopy(PASS_SPEC)
+    spec["name"] = "Draft Demo"
+    put = client.put(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft",
+        json={"spec": spec, "base_version": None},
+    )
+    assert put.status_code == 200, put.text
+    body = put.json()
+    assert body["draft"]["workflow_id"] == PASS_SPEC["id"]
+    assert body["draft"]["spec"]["name"] == "Draft Demo"
+    assert body["draft"]["base_version"] is None
+
+    fetched = client.get(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft"
+    )
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["draft"]["spec"]["name"] == "Draft Demo"
+
+
+def test_dashboard_draft_delete_removes_existing_draft(client):
+    spec = copy.deepcopy(PASS_SPEC)
+    spec["name"] = "Will Be Deleted"
+    client.put(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft",
+        json={"spec": spec, "base_version": None},
+    )
+    deleted = client.delete(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft"
+    )
+    assert deleted.status_code == 200, deleted.text
+    missing = client.get(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft"
+    )
+    assert missing.status_code == 404
+
+
+def test_dashboard_publish_creates_definition_and_clears_draft(client):
+    spec = copy.deepcopy(PASS_SPEC)
+    spec["name"] = "First Publish"
+    client.put(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft",
+        json={"spec": spec, "base_version": None},
+    )
+    publish = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/publish",
+        json={"expected_latest_version": None},
+    )
+    assert publish.status_code == 200, publish.text
+    body = publish.json()
+    assert body["definition"]["version"] == 1
+    assert body["definition"]["name"] == "First Publish"
+    missing = client.get(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft"
+    )
+    assert missing.status_code == 404
+
+
+def test_dashboard_publish_returns_409_on_version_conflict(client):
+    _deploy(client, PASS_SPEC)
+    spec = copy.deepcopy(PASS_SPEC)
+    spec["name"] = "Stale Draft"
+    spec["version"] = 2
+    client.put(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft",
+        json={"spec": spec, "base_version": 1},
+    )
+    conflict = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/publish",
+        json={"expected_latest_version": 0},
+    )
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json() == {
+        "detail": {
+            "code": "workflow_version_conflict",
+            "message": "Workflow changed since this draft was created.",
+            "field_errors": {},
+            "hint": "Reload the latest version and review the draft again.",
+        }
+    }
+
+
+def test_dashboard_archive_hides_workflow_and_include_archived_restores(client):
+    _deploy(client, PASS_SPEC)
+
+    listed = client.get("/api/plugins/workflows/definitions")
+    assert listed.status_code == 200, listed.text
+    assert len(listed.json()["definitions"]) == 1
+
+    archived = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/archive",
+        json={"archived": True},
+    )
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["workflow"]["archived"] is True
+
+    default_list = client.get("/api/plugins/workflows")
+    assert default_list.status_code == 200, default_list.text
+    assert default_list.json()["workflows"] == []
+
+    full_list = client.get("/api/plugins/workflows?include_archived=true")
+    assert full_list.status_code == 200, full_list.text
+    assert len(full_list.json()["workflows"]) == 1
+
+    restored = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/archive",
+        json={"archived": False},
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["workflow"]["archived"] is False
+    assert client.get("/api/plugins/workflows").json()["workflows"] != []
+
+
+def test_dashboard_summary_includes_draft_enabled_and_archived(client):
+    _deploy(client, PASS_SPEC)
+    spec = copy.deepcopy(PASS_SPEC)
+    spec["name"] = "Draft Open"
+    client.put(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/draft",
+        json={"spec": spec, "base_version": 1},
+    )
+    listed = client.get("/api/plugins/workflows").json()["workflows"]
+    assert len(listed) == 1
+    row = listed[0]
+    assert row["workflow_id"] == PASS_SPEC["id"]
+    assert row["has_draft"] is True
+    assert row["latest_version"] == 1
+    assert row["enabled"] is True
+    assert row["archived"] is False
+    assert row["open_feed_count"] == 0
+
+
+def test_dashboard_enabled_toggle_appears_in_summary(client):
+    _deploy(client, PASS_SPEC)
+    toggle = client.post(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}/enabled",
+        json={"enabled": False},
+    )
+    assert toggle.status_code == 200, toggle.text
+    listed = client.get("/api/plugins/workflows").json()["workflows"][0]
+    assert listed["enabled"] is False
+
+
+def test_dashboard_paused_feed_writes_return_409(client):
+    _deploy(client, CONTINUOUS_SPEC)
+    feed = client.post(
+        "/api/plugins/workflows/definitions/continuous_demo/input-feeds",
+        json={"trigger_id": "kickoff"},
+    ).json()["feed"]
+    paused = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
+        json={"status": "paused"},
+    )
+    assert paused.status_code == 200, paused.text
+
+    enqueue = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/items",
+        json={"input": {"repo_path": "/repo", "prompt": "Review README drift"}},
+    )
+    assert enqueue.status_code == 409, enqueue.text
+    assert enqueue.json()["detail"]["code"] == "workflow_feed_not_open"
+
+
+def test_dashboard_closed_feed_writes_and_reopen_return_409(client):
+    _deploy(client, CONTINUOUS_SPEC)
+    feed = client.post(
+        "/api/plugins/workflows/definitions/continuous_demo/input-feeds",
+        json={"trigger_id": "kickoff"},
+    ).json()["feed"]
+    client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
+        json={"status": "closed"},
+    )
+
+    enqueue = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/items",
+        json={"input": {"repo_path": "/repo", "prompt": "Review README drift"}},
+    )
+    assert enqueue.status_code == 409, enqueue.text
+    assert enqueue.json()["detail"]["code"] == "workflow_feed_closed"
+
+    reopen = client.post(
+        f"/api/plugins/workflows/input-feeds/{feed['feed_id']}/status",
+        json={"status": "open"},
+    )
+    assert reopen.status_code == 409, reopen.text
+    assert reopen.json()["detail"]["code"] == "workflow_feed_terminal"
+
+
+def test_dashboard_delete_requires_explicit_purge_when_history_exists(client):
+    definition = _deploy(client, PASS_SPEC)
+    client.post(
+        f"/api/plugins/workflows/definitions/{definition['workflow_id']}/run",
+        json={"input": {}},
+    )
+    blocked = client.delete(
+        f"/api/plugins/workflows/definitions/{definition['workflow_id']}"
+    )
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json()["detail"]["code"] == "workflow_history_exists"
+    purged = client.delete(
+        f"/api/plugins/workflows/definitions/{definition['workflow_id']}?purge=true"
+    )
+    assert purged.status_code == 200, purged.text
+    assert purged.json()["deleted"] is True
+
+
+def test_dashboard_delete_history_free_workflow_succeeds_without_purge(client):
+    _deploy(client, PASS_SPEC)
+    r = client.delete(
+        f"/api/plugins/workflows/definitions/{PASS_SPEC['id']}",
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted"] is True

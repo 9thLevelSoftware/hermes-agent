@@ -73,6 +73,65 @@ def _http_413() -> HTTPException:
     )
 
 
+def _envelope(
+    *,
+    code: str,
+    message: str,
+    status_code: int,
+    field_errors: dict[str, str] | None = None,
+    hint: str | None = None,
+) -> HTTPException:
+    detail = {
+        "code": code,
+        "message": redact_sensitive(message),
+        "field_errors": field_errors or {},
+    }
+    if hint is not None:
+        detail["hint"] = hint
+    return HTTPException(status_code=status_code, detail=detail)
+
+
+def _http_409(
+    *,
+    code: str,
+    message: str,
+    field_errors: dict[str, str] | None = None,
+    hint: str | None = None,
+) -> HTTPException:
+    return _envelope(
+        code=code,
+        message=message,
+        status_code=409,
+        field_errors=field_errors,
+        hint=hint,
+    )
+
+
+def _http_404_envelope(
+    *,
+    code: str,
+    message: str,
+    hint: str | None = None,
+) -> HTTPException:
+    return _envelope(code=code, message=message, status_code=404, hint=hint)
+
+
+def _http_400_envelope(
+    *,
+    code: str,
+    message: str,
+    field_errors: dict[str, str] | None = None,
+    hint: str | None = None,
+) -> HTTPException:
+    return _envelope(
+        code=code,
+        message=message,
+        status_code=400,
+        field_errors=field_errors,
+        hint=hint,
+    )
+
+
 def _assistant_validation_http() -> HTTPException:
     return HTTPException(
         status_code=400,
@@ -177,6 +236,7 @@ def _definition_record(conn, workflow_id: str, version: int | None = None):
 
 def _definition_to_dict(record, *, include_spec: bool = False) -> dict[str, Any]:
     payload = {
+        "archived": bool(getattr(record, "archived", False)),
         "checksum": record.checksum,
         "created_at": record.created_at,
         "created_by": record.created_by,
@@ -247,6 +307,15 @@ def _feed_to_dict(feed: wfdb.WorkflowInputFeed) -> dict[str, Any]:
         "updated_at": feed.updated_at,
         "version": feed.version,
         "workflow_id": feed.workflow_id,
+    }
+
+
+def _draft_to_dict(draft: wfdb.WorkflowDraftRecord) -> dict[str, Any]:
+    return {
+        "base_version": draft.base_version,
+        "spec": _spec_dict(draft.spec),
+        "updated_at": draft.updated_at,
+        "workflow_id": draft.workflow_id,
     }
 
 
@@ -548,13 +617,144 @@ def get_definition(
 
 
 @router.delete("/definitions/{workflow_id}")
-def delete_definition(workflow_id: str) -> dict[str, Any]:
+def delete_definition(workflow_id: str, purge: bool = Query(default=False)) -> dict[str, Any]:
     try:
         with _connect_initialized() as conn:
-            wfdb.delete_definition(conn, workflow_id)
+            deleted = wfdb.delete_definition(conn, workflow_id, purge=purge)
     except KeyError as exc:
         raise _http_404(exc) from exc
+    except wfdb.WorkflowHistoryExists as exc:
+        raise _http_409(
+            code="workflow_history_exists",
+            message=str(exc),
+            hint="Pass ?purge=true to delete the workflow and all of its history.",
+        ) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="workflow definition not found")
+    return {"deleted": True, "workflow_id": workflow_id, "purge": purge}
+
+
+@router.get("")
+@router.get("/")
+def list_workflows(include_archived: bool = Query(default=False)) -> dict[str, Any]:
+    with _connect_initialized() as conn:
+        summaries = wfdb.list_workflow_summaries(conn, include_archived=include_archived)
+    return {"workflows": summaries}
+
+
+@router.put("/definitions/{workflow_id}/draft")
+async def put_definition_draft(workflow_id: str, request: Request) -> dict[str, Any]:
+    try:
+        payload = _yaml_or_object(await _read_body(request), what="draft request")
+        base_version = payload.get("base_version")
+        if base_version is not None and not isinstance(base_version, int):
+            raise ValueError("base_version must be an integer or null")
+        spec = _load_spec_from_payload(payload.get("spec"))
+        if spec.id != workflow_id:
+            raise ValueError(
+                f"draft spec id {spec.id!r} does not match path workflow_id {workflow_id!r}"
+            )
+        with _connect_initialized() as conn:
+            draft = wfdb.save_draft(conn, spec, base_version=base_version)
+    except (json.JSONDecodeError, yaml.YAMLError, ValidationError, ValueError) as exc:
+        raise _http_400(exc) from exc
+    return {"draft": _draft_to_dict(draft)}
+
+
+@router.get("/definitions/{workflow_id}/draft")
+def get_definition_draft(workflow_id: str) -> dict[str, Any]:
+    try:
+        with _connect_initialized() as conn:
+            draft = wfdb.get_draft(conn, workflow_id)
+    except KeyError as exc:
+        raise _http_404(exc) from exc
+    if draft is None:
+        raise _http_404_envelope(
+            code="workflow_draft_not_found",
+            message=f"No draft saved for workflow {workflow_id!r}.",
+            hint="PUT a draft at this path to create one.",
+        )
+    return {"draft": _draft_to_dict(draft)}
+
+
+@router.delete("/definitions/{workflow_id}/draft")
+def delete_definition_draft(workflow_id: str) -> dict[str, Any]:
+    with _connect_initialized() as conn:
+        deleted = wfdb.delete_draft(conn, workflow_id)
+    if not deleted:
+        raise _http_404_envelope(
+            code="workflow_draft_not_found",
+            message=f"No draft saved for workflow {workflow_id!r}.",
+        )
     return {"deleted": True, "workflow_id": workflow_id}
+
+
+@router.post("/definitions/{workflow_id}/publish")
+async def publish_definition(workflow_id: str, request: Request) -> dict[str, Any]:
+    try:
+        payload = _yaml_or_object(await _read_body(request), what="publish request")
+        expected_raw = payload.get("expected_latest_version")
+        if expected_raw is not None and not isinstance(expected_raw, int):
+            raise ValueError("expected_latest_version must be an integer or null")
+        with _connect_initialized() as conn:
+            record = wfdb.publish_draft(
+                conn,
+                workflow_id,
+                expected_latest_version=expected_raw,
+                created_by="dashboard",
+            )
+    except wfdb.WorkflowVersionConflict as exc:
+        raise _http_409(
+            code="workflow_version_conflict",
+            message="Workflow changed since this draft was created.",
+            hint="Reload the latest version and review the draft again.",
+        ) from exc
+    except KeyError as exc:
+        raise _http_404(exc) from exc
+    except (json.JSONDecodeError, yaml.YAMLError, ValidationError, ValueError) as exc:
+        raise _http_400(exc) from exc
+    return {"definition": _definition_to_dict(record, include_spec=True)}
+
+
+@router.post("/definitions/{workflow_id}/enabled")
+async def set_definition_enabled_route(
+    workflow_id: str, request: Request
+) -> dict[str, Any]:
+    try:
+        payload = _yaml_or_object(await _read_body(request), what="enabled request")
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")
+        with _connect_initialized() as conn:
+            record = wfdb.set_definition_enabled(conn, workflow_id, enabled)
+    except KeyError as exc:
+        raise _http_404(exc) from exc
+    except (json.JSONDecodeError, yaml.YAMLError, ValidationError, ValueError) as exc:
+        raise _http_400(exc) from exc
+    return {"definition": _definition_to_dict(record)}
+
+
+@router.post("/definitions/{workflow_id}/archive")
+async def set_definition_archived_route(
+    workflow_id: str, request: Request
+) -> dict[str, Any]:
+    try:
+        payload = _yaml_or_object(await _read_body(request), what="archive request")
+        archived = payload.get("archived")
+        if not isinstance(archived, bool):
+            raise ValueError("archived must be a boolean")
+        with _connect_initialized() as conn:
+            wfdb.set_workflow_archived(conn, workflow_id, archived)
+            record = wfdb.get_definition_record(conn, workflow_id)
+    except KeyError as exc:
+        raise _http_404(exc) from exc
+    except (json.JSONDecodeError, yaml.YAMLError, ValidationError, ValueError) as exc:
+        raise _http_400(exc) from exc
+    return {
+        "workflow_id": record.workflow_id,
+        "archived": archived,
+        "workflow": _definition_to_dict(record),
+    }
 
 
 @router.post("/definitions/{workflow_id}/input-feeds")
@@ -614,6 +814,18 @@ async def set_input_feed_status(feed_id: str, request: Request) -> dict[str, Any
         with _connect_initialized() as conn:
             feed = wfdb.set_input_feed_status(conn, feed_id, status)
     except (json.JSONDecodeError, yaml.YAMLError, ValueError) as exc:
+        if "cannot transition" in str(exc) and "closed" in str(exc):
+            raise _http_409(
+                code="workflow_feed_terminal",
+                message="Closed input feeds cannot transition to another state.",
+                hint="Open a new feed to continue admitting items.",
+            ) from exc
+        if "cannot transition" in str(exc):
+            raise _http_409(
+                code="workflow_feed_invalid_transition",
+                message=str(exc),
+                hint="Use a valid transition (open->paused/closed, paused->open/closed).",
+            ) from exc
         raise _http_400(exc) from exc
     except KeyError as exc:
         raise _http_404(exc) from exc
@@ -627,6 +839,18 @@ async def enqueue_input_item(feed_id: str, request: Request) -> dict[str, Any]:
         with _connect_initialized() as conn:
             item = wfdb.enqueue_input_item(conn, feed_id, input_data)
     except (json.JSONDecodeError, yaml.YAMLError, ValueError) as exc:
+        if "feed is closed" in str(exc):
+            raise _http_409(
+                code="workflow_feed_closed",
+                message="Closed input feeds do not accept new items.",
+                hint="Open a new feed to continue enqueueing items.",
+            ) from exc
+        if "feed is paused" in str(exc):
+            raise _http_409(
+                code="workflow_feed_not_open",
+                message="Paused input feeds do not accept new items.",
+                hint="Resume the feed (set status=open) before enqueueing items.",
+            ) from exc
         raise _http_400(exc) from exc
     except KeyError as exc:
         raise _http_404(exc) from exc
@@ -654,6 +878,18 @@ async def update_input_item(item_id: str, request: Request) -> dict[str, Any]:
         with _connect_initialized() as conn:
             item = wfdb.update_input_item(conn, item_id, input_data)
     except (json.JSONDecodeError, yaml.YAMLError, ValueError) as exc:
+        if "feed is closed" in str(exc):
+            raise _http_409(
+                code="workflow_feed_closed",
+                message="Closed input feeds do not accept item updates.",
+                hint="Open a new feed to continue updating items.",
+            ) from exc
+        if "feed is paused" in str(exc):
+            raise _http_409(
+                code="workflow_feed_not_open",
+                message="Paused input feeds do not accept item updates.",
+                hint="Resume the feed (set status=open) before updating items.",
+            ) from exc
         raise _http_400(exc) from exc
     except KeyError as exc:
         raise _http_404(exc) from exc

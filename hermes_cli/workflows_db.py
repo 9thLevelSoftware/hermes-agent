@@ -28,6 +28,7 @@ class WorkflowDefinitionRecord:
     version: int
     name: str
     enabled: bool
+    archived: bool
     spec: WorkflowSpec
     checksum: str
     created_by: str | None
@@ -75,8 +76,30 @@ class WorkflowInputItem:
     updated_at: int
 
 
+@dataclass(frozen=True)
+class WorkflowDraftRecord:
+    workflow_id: str
+    spec: WorkflowSpec
+    base_version: int | None
+    updated_at: int
+
+
+class WorkflowVersionConflict(Exception):
+    """Raised when a draft's expected_latest_version no longer matches the DB."""
+
+
+class WorkflowHistoryExists(Exception):
+    """Raised when a destructive delete would orphan execution/feed history."""
+
+
 _TERMINAL_EXECUTION_STATUSES = {"blocked", "cancelled", "failed", "succeeded"}
 _MUTABLE_INPUT_ITEM_STATUSES = {"needs_input", "queued"}
+_FEED_STATUSES = {"open", "paused", "closed"}
+_FEED_TRANSITIONS: dict[str, set[str]] = {
+    "open": {"paused", "closed"},
+    "paused": {"open", "closed"},
+    "closed": set(),
+}
 _INIT_DB_LOCK = threading.Lock()
 _INITIALIZED_DB_PATHS: set[Path] = set()
 
@@ -87,6 +110,7 @@ CREATE TABLE IF NOT EXISTS workflow_definitions (
     version     INTEGER NOT NULL,
     name        TEXT NOT NULL,
     enabled     INTEGER NOT NULL DEFAULT 1,
+    archived    INTEGER NOT NULL DEFAULT 0,
     spec_json   TEXT NOT NULL,
     checksum    TEXT NOT NULL,
     created_by  TEXT,
@@ -190,6 +214,13 @@ CREATE INDEX IF NOT EXISTS idx_workflow_input_items_status
 CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_input_items_dedupe
     ON workflow_input_items(feed_id, dedupe_value)
     WHERE dedupe_value IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS workflow_drafts (
+    workflow_id  TEXT PRIMARY KEY,
+    spec_json    TEXT NOT NULL,
+    base_version INTEGER,
+    updated_at   INTEGER NOT NULL
+);
 """
 
 
@@ -234,6 +265,15 @@ def init_db(db_path: Path | None = None) -> None:
                 conn.execute("ALTER TABLE workflow_node_runs ADD COLUMN kanban_task_id TEXT")
             if "kanban_board" not in columns:
                 conn.execute("ALTER TABLE workflow_node_runs ADD COLUMN kanban_board TEXT")
+            def_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(workflow_definitions)")
+            }
+            if "archived" not in def_columns:
+                conn.execute(
+                    "ALTER TABLE workflow_definitions "
+                    "ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
+                )
             dedupe_index = next(
                 (
                     row
@@ -305,11 +345,13 @@ def _next_cron_run(expr: str, base_ts: int) -> int:
 
 
 def _record_from_row(row: sqlite3.Row) -> WorkflowDefinitionRecord:
+    archived_value = row["archived"] if "archived" in row.keys() else 0
     return WorkflowDefinitionRecord(
         workflow_id=row["workflow_id"],
         version=row["version"],
         name=row["name"],
         enabled=bool(row["enabled"]),
+        archived=bool(archived_value),
         spec=WorkflowSpec.model_validate(json.loads(row["spec_json"])),
         checksum=row["checksum"],
         created_by=row["created_by"],
@@ -521,36 +563,253 @@ def list_definitions(conn: sqlite3.Connection) -> list[WorkflowDefinitionRecord]
     return [_record_from_row(row) for row in rows]
 
 
-def delete_definition(conn: sqlite3.Connection, workflow_id: str) -> bool:
+def save_draft(
+    conn: sqlite3.Connection,
+    spec: WorkflowSpec,
+    *,
+    base_version: int | None,
+    updated_at: int | None = None,
+) -> WorkflowDraftRecord:
+    ts = int(time.time()) if updated_at is None else updated_at
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO workflow_drafts (workflow_id, spec_json, base_version, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(workflow_id) DO UPDATE SET
+                spec_json = excluded.spec_json,
+                base_version = excluded.base_version,
+                updated_at = excluded.updated_at
+            """,
+            (spec.id, _spec_json(spec), base_version, ts),
+        )
+    return WorkflowDraftRecord(
+        workflow_id=spec.id,
+        spec=spec,
+        base_version=base_version,
+        updated_at=ts,
+    )
+
+
+def get_draft(conn: sqlite3.Connection, workflow_id: str) -> WorkflowDraftRecord | None:
+    row = conn.execute(
+        "SELECT * FROM workflow_drafts WHERE workflow_id = ?",
+        (workflow_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return WorkflowDraftRecord(
+        workflow_id=row["workflow_id"],
+        spec=WorkflowSpec.model_validate(json.loads(row["spec_json"])),
+        base_version=row["base_version"],
+        updated_at=row["updated_at"],
+    )
+
+
+def delete_draft(conn: sqlite3.Connection, workflow_id: str) -> bool:
+    with write_txn(conn):
+        deleted = conn.execute(
+            "DELETE FROM workflow_drafts WHERE workflow_id = ?",
+            (workflow_id,),
+        ).rowcount
+    return deleted > 0
+
+
+def _latest_definition_version(conn: sqlite3.Connection, workflow_id: str) -> int | None:
+    row = conn.execute(
+        "SELECT MAX(version) FROM workflow_definitions WHERE workflow_id = ?",
+        (workflow_id,),
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def publish_draft(
+    conn: sqlite3.Connection,
+    workflow_id: str,
+    *,
+    expected_latest_version: int | None,
+    created_by: str | None,
+) -> WorkflowDefinitionRecord:
+    draft = get_draft(conn, workflow_id)
+    if draft is None:
+        raise KeyError(f"workflow draft not found: {workflow_id}")
+    latest = _latest_definition_version(conn, workflow_id)
+    if latest != expected_latest_version:
+        raise WorkflowVersionConflict(
+            f"workflow {workflow_id} expected latest version "
+            f"{expected_latest_version!r}, found {latest!r}"
+        )
+    next_version = (latest or 0) + 1
+    publish_spec = draft.spec.model_copy(update={"version": next_version})
+    try:
+        with write_txn(conn):
+            deployed_version = deploy_definition(
+                conn, publish_spec, created_by=created_by, auto_bump=False
+            )
+            conn.execute(
+                "DELETE FROM workflow_drafts WHERE workflow_id = ?",
+                (workflow_id,),
+            )
+    except WorkflowVersionConflict:
+        raise
+    except Exception:
+        raise
+    return _definition_record(conn, workflow_id, deployed_version)
+
+
+def set_workflow_archived(
+    conn: sqlite3.Connection,
+    workflow_id: str,
+    archived: bool,
+) -> None:
+    with write_txn(conn):
+        updated = conn.execute(
+            "UPDATE workflow_definitions SET archived = ? WHERE workflow_id = ?",
+            (1 if archived else 0, workflow_id),
+        ).rowcount
+    if not updated:
+        raise KeyError(f"workflow definition not found: {workflow_id}")
+
+
+def list_workflow_summaries(
+    conn: sqlite3.Connection,
+    *,
+    include_archived: bool = False,
+) -> list[dict[str, Any]]:
+    # Single grouped read pass: latest version + enabled + archived + last
+    # execution status + open feed count, joined to current draft rows.
+    sql = """
+        WITH latest AS (
+            SELECT workflow_id, MAX(version) AS latest_version
+              FROM workflow_definitions
+             GROUP BY workflow_id
+        ),
+        latest_row AS (
+            SELECT d.workflow_id, l.latest_version, d.enabled, d.archived, d.name
+              FROM workflow_definitions d
+              JOIN latest l ON l.workflow_id = d.workflow_id AND l.latest_version = d.version
+        ),
+        exec_status AS (
+            SELECT workflow_id, status FROM (
+                SELECT workflow_id, status,
+                       ROW_NUMBER() OVER (PARTITION BY workflow_id ORDER BY updated_at DESC, execution_id DESC) AS rn
+                  FROM workflow_executions
+            ) WHERE rn = 1
+        ),
+        feed_counts AS (
+            SELECT workflow_id, SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_count
+              FROM workflow_input_feeds
+             GROUP BY workflow_id
+        )
+        SELECT lr.workflow_id,
+               lr.latest_version,
+               lr.enabled,
+               lr.archived,
+               lr.name,
+               es.status AS latest_execution_status,
+               COALESCE(fc.open_count, 0) AS open_feed_count,
+               CASE WHEN d.workflow_id IS NULL THEN 0 ELSE 1 END AS has_draft
+          FROM latest_row lr
+          LEFT JOIN exec_status es ON es.workflow_id = lr.workflow_id
+          LEFT JOIN feed_counts fc ON fc.workflow_id = lr.workflow_id
+          LEFT JOIN workflow_drafts d ON d.workflow_id = lr.workflow_id
+        ORDER BY lr.workflow_id
+    """
+    rows = conn.execute(sql).fetchall()
+    summaries: list[dict[str, Any]] = []
+    for row in rows:
+        if not include_archived and bool(row["archived"]):
+            continue
+        summaries.append({
+            "workflow_id": row["workflow_id"],
+            "name": row["name"],
+            "latest_version": int(row["latest_version"]),
+            "enabled": bool(row["enabled"]),
+            "archived": bool(row["archived"]),
+            "latest_execution_status": row["latest_execution_status"],
+            "open_feed_count": int(row["open_feed_count"] or 0),
+            "has_draft": bool(row["has_draft"]),
+        })
+    return summaries
+
+
+def _has_workflow_history(conn: sqlite3.Connection, workflow_id: str) -> bool:
+    for table in ("workflow_executions", "workflow_input_feeds"):
+        row = conn.execute(
+            f"SELECT 1 FROM {table} WHERE workflow_id = ? LIMIT 1",
+            (workflow_id,),
+        ).fetchone()
+        if row is not None:
+            return True
+    return False
+
+
+def delete_definition(
+    conn: sqlite3.Connection,
+    workflow_id: str,
+    *,
+    purge: bool = False,
+) -> bool:
+    if purge:
+        return _purge_definition(conn, workflow_id)
+    with write_txn(conn):
+        has_def = conn.execute(
+            "SELECT 1 FROM workflow_definitions WHERE workflow_id = ? LIMIT 1",
+            (workflow_id,),
+        ).fetchone()
+        has_draft = conn.execute(
+            "SELECT 1 FROM workflow_drafts WHERE workflow_id = ? LIMIT 1",
+            (workflow_id,),
+        ).fetchone()
+        if has_def is None and has_draft is None:
+            return False
+        if has_def is not None and _has_workflow_history(conn, workflow_id):
+            raise WorkflowHistoryExists(
+                f"workflow {workflow_id} has execution or feed history; "
+                "purge=true required to delete"
+            )
+        conn.execute("DELETE FROM workflow_drafts WHERE workflow_id = ?", (workflow_id,))
+        if has_def is None:
+            return True
+        return _purge_definition_rows(conn, workflow_id)
+
+
+def _purge_definition(conn: sqlite3.Connection, workflow_id: str) -> bool:
     with write_txn(conn):
         if not conn.execute(
             "SELECT 1 FROM workflow_definitions WHERE workflow_id = ? LIMIT 1",
             (workflow_id,),
         ).fetchone():
-            raise KeyError(f"workflow definition not found: {workflow_id}")
-        conn.execute(
-            """
-            DELETE FROM workflow_events
-             WHERE execution_id IN (
-                SELECT execution_id FROM workflow_executions WHERE workflow_id = ?
-             )
-            """,
-            (workflow_id,),
-        )
-        conn.execute(
-            """
-            DELETE FROM workflow_node_runs
-             WHERE execution_id IN (
-                SELECT execution_id FROM workflow_executions WHERE workflow_id = ?
-             )
-            """,
-            (workflow_id,),
-        )
-        conn.execute("DELETE FROM workflow_executions WHERE workflow_id = ?", (workflow_id,))
-        conn.execute("DELETE FROM workflow_schedules WHERE workflow_id = ?", (workflow_id,))
-        conn.execute("DELETE FROM workflow_input_items WHERE workflow_id = ?", (workflow_id,))
-        conn.execute("DELETE FROM workflow_input_feeds WHERE workflow_id = ?", (workflow_id,))
-        conn.execute("DELETE FROM workflow_definitions WHERE workflow_id = ?", (workflow_id,))
+            return False
+        conn.execute("DELETE FROM workflow_drafts WHERE workflow_id = ?", (workflow_id,))
+        _purge_definition_rows(conn, workflow_id)
+    return True
+
+
+def _purge_definition_rows(conn: sqlite3.Connection, workflow_id: str) -> bool:
+    conn.execute(
+        """
+        DELETE FROM workflow_events
+         WHERE execution_id IN (
+            SELECT execution_id FROM workflow_executions WHERE workflow_id = ?
+         )
+        """,
+        (workflow_id,),
+    )
+    conn.execute(
+        """
+        DELETE FROM workflow_node_runs
+         WHERE execution_id IN (
+            SELECT execution_id FROM workflow_executions WHERE workflow_id = ?
+         )
+        """,
+        (workflow_id,),
+    )
+    conn.execute("DELETE FROM workflow_executions WHERE workflow_id = ?", (workflow_id,))
+    conn.execute("DELETE FROM workflow_schedules WHERE workflow_id = ?", (workflow_id,))
+    conn.execute("DELETE FROM workflow_input_items WHERE workflow_id = ?", (workflow_id,))
+    conn.execute("DELETE FROM workflow_input_feeds WHERE workflow_id = ?", (workflow_id,))
+    conn.execute("DELETE FROM workflow_definitions WHERE workflow_id = ?", (workflow_id,))
     return True
 
 
@@ -758,17 +1017,31 @@ def list_input_feeds(conn: sqlite3.Connection, *, status: str | None = None) -> 
 
 
 def set_input_feed_status(conn: sqlite3.Connection, feed_id: str, status: str) -> WorkflowInputFeed:
-    if status not in {"open", "paused", "closed"}:
+    if status not in _FEED_STATUSES:
         raise ValueError(f"invalid feed status: {status}")
     now = int(time.time())
+    feed = get_input_feed(conn, feed_id)
+    if status == feed.status:
+        return feed
+    if status not in _FEED_TRANSITIONS[feed.status]:
+        raise ValueError(
+            f"workflow input feed {feed_id} cannot transition from "
+            f"{feed.status} to {status}"
+            + ("; closed feed cannot transition" if feed.status == "closed" else "")
+        )
     with write_txn(conn):
-        updated = conn.execute(
+        conn.execute(
             "UPDATE workflow_input_feeds SET status = ?, updated_at = ? WHERE feed_id = ?",
             (status, now, feed_id),
-        ).rowcount
-    if not updated:
-        raise KeyError(f"workflow input feed not found: {feed_id}")
+        )
     return get_input_feed(conn, feed_id)
+
+
+def _require_open_feed(feed: WorkflowInputFeed) -> None:
+    if feed.status != "open":
+        raise ValueError(
+            f"workflow input feed is {feed.status}: {feed.feed_id}"
+        )
 
 
 def get_input_item(conn: sqlite3.Connection, item_id: str) -> WorkflowInputItem:
@@ -808,6 +1081,7 @@ def enqueue_input_item(
     now: int | None = None,
 ) -> WorkflowInputItem:
     feed = get_input_feed(conn, feed_id)
+    _require_open_feed(feed)
     trigger = _trigger_for_feed(conn, feed)
     materialized = _materialize_input(trigger, input_data)
     status, criteria = _criteria_for(trigger, materialized)
@@ -856,9 +1130,10 @@ def update_input_item(
     now: int | None = None,
 ) -> WorkflowInputItem:
     item = get_input_item(conn, item_id)
+    feed = get_input_feed(conn, item.feed_id)
+    _require_open_feed(feed)
     if item.status not in _MUTABLE_INPUT_ITEM_STATUSES:
         raise ValueError(f"workflow input item is not mutable: {item_id}")
-    feed = get_input_feed(conn, item.feed_id)
     trigger = _trigger_for_feed(conn, feed)
     materialized = _materialize_input(trigger, input_data)
     status, criteria = _criteria_for(trigger, materialized)
