@@ -219,6 +219,21 @@ class TestApproveCommand:
         assert entry.event.is_set()
 
     @pytest.mark.asyncio
+    async def test_approve_arbitrary_text_keeps_legacy_fifo(self):
+        """Free text is not a request id unless it names a live request."""
+        from tools.approval import _ApprovalEntry, _gateway_queues
+
+        runner = _make_runner()
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+        entry = _ApprovalEntry({"command": "test"})
+        _gateway_queues[session_key] = [entry]
+
+        result = await runner._handle_approve_command(_make_event("/approve please"))
+        assert "approved" in result.lower()
+        assert entry.event.is_set()
+
+    @pytest.mark.asyncio
     async def test_approve_all_resolves_multiple(self):
         """/approve all resolves all pending approvals."""
         from tools.approval import _ApprovalEntry, _gateway_queues

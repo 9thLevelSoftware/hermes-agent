@@ -4362,6 +4362,7 @@ class GatewaySlashCommandsMixin:
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval, has_pending_approval,
+            get_pending_approval,
         )
 
         if not (has_blocking_approval(session_key) or has_pending_approval(session_key)):
@@ -4370,18 +4371,25 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.approval_expired")
             return t("gateway.approve.no_pending")
 
-        # Parse args: support an exact request id plus the legacy choices.
+        # Parse args: accept an exact request id only when it is a live request
+        # owned by this session; arbitrary free text remains legacy choice text.
         raw_args = event.get_command_args().strip().split()
         args = [arg.lower() for arg in raw_args]
         request_id = next(
-            (raw for raw, arg in zip(raw_args, args) if arg != "all" and arg not in {
-                "once", "approve", "approved", "allow", "session", "ses",
-                "always", "permanent", "permanently",
-            }),
+            (
+                raw for raw, arg in zip(raw_args, args)
+                if arg not in {"all", "once", "approve", "approved", "allow",
+                                "session", "ses", "always", "permanent",
+                                "permanently"}
+                and (get_pending_approval(raw) or {}).get("session_key") == session_key
+            ),
             None,
         )
         resolve_all = "all" in args and request_id is None
-        remaining = [a for a in args if a not in {"all", request_id}]
+        remaining = [
+            arg for arg in args
+            if arg in {"always", "permanent", "permanently", "session", "ses"}
+        ]
 
         if any(a in {"always", "permanent", "permanently"} for a in remaining):
             choice = "always"
@@ -4437,11 +4445,10 @@ class GatewaySlashCommandsMixin:
         raw_args = event.get_command_args().strip()
         tokens = raw_args.split()
         request_id = None
-        if tokens and (
-            len(tokens[0]) == 32 and all(c in "0123456789abcdefABCDEF" for c in tokens[0])
-            or has_pending_approval(session_key) and get_pending_approval(tokens[0]) is not None
-        ):
-            request_id = tokens[0]
+        if tokens:
+            candidate = get_pending_approval(tokens[0]) or {}
+            if candidate.get("session_key") == session_key:
+                request_id = tokens[0]
         resolve_all = bool(tokens) and tokens[0].lower() == "all" and request_id is None
         if resolve_all:
             reason = raw_args[len(tokens[0]):].strip()

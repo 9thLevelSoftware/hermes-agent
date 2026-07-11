@@ -9,6 +9,7 @@ This module is the single source of truth for the dangerous command system:
 """
 
 import contextvars
+import copy
 import fnmatch
 import functools
 import hashlib
@@ -1471,24 +1472,48 @@ def _approval_arguments(approval: dict):
         return approval["arguments"]
     if "args" in approval:
         return approval["args"]
-    if "argument_hash" in approval:
-        return None
     return approval.get("command", approval.get("code", approval.get("description", "")))
 
 
 def _approval_argument_hash(approval: dict) -> str:
-    """Hash normalized approval arguments without persisting their raw value."""
-    supplied = approval.get("argument_hash") or approval.get("args_hash")
-    if supplied:
-        return str(supplied)
+    """Hash normalized approval arguments; never trust a caller-supplied hash."""
     normalized = json.dumps(
-        _approval_arguments(approval),
+        copy.deepcopy(_approval_arguments(approval)),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
         default=str,
     )
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _prune_pending_locked() -> None:
+    """Drop terminal fallback records and repair the session index.
+
+    Callers hold ``_lock``. A just-expired record is left in place until the
+    next safe-point call so legacy inspection can still report its status.
+    """
+    for request_id, request in list(_pending.items()):
+        status = request.get("status")
+        if status in {"pending", "resolved"}:
+            try:
+                if time.time() >= float(request["expires_at"]):
+                    request["status"] = "expired"
+            except (KeyError, TypeError, ValueError):
+                request["status"] = "stale"
+            continue
+        if status in {"consumed", "expired", "stale"}:
+            _pending.pop(request_id, None)
+    for session_key, request_ids in list(_pending_by_session.items()):
+        kept = [
+            request_id for request_id in request_ids
+            if request_id in _pending
+            and _pending[request_id].get("session_key") == session_key
+        ]
+        if kept:
+            _pending_by_session[session_key] = kept
+        else:
+            _pending_by_session.pop(session_key, None)
 
 
 def _mark_expired(request: dict) -> bool:
@@ -1516,6 +1541,7 @@ def _resolve_fallback_approval(
 ) -> int:
     """Resolve an in-memory fallback request, preserving the legacy int API."""
     with _lock:
+        _prune_pending_locked()
         if request_id:
             request = _pending.get(request_id)
             if not request or request.get("session_key") != session_key:
@@ -1628,6 +1654,7 @@ def has_blocking_approval(session_key: str) -> bool:
 def has_pending_approval(session_key: str) -> bool:
     """Return whether a valid no-callback approval remains for *session_key*."""
     with _lock:
+        _prune_pending_locked()
         return any(
             request is not None and _mark_expired(request)
             for request_id in _pending_by_session.get(session_key, [])
@@ -1636,10 +1663,11 @@ def has_pending_approval(session_key: str) -> bool:
 
 
 def get_pending_approval(request_id: str) -> Optional[dict]:
-    """Return a copy of an in-memory approval request, if it still exists."""
+    """Return a deep copy of an in-memory approval request, if it exists."""
     with _lock:
+        _prune_pending_locked()
         request = _pending.get(request_id)
-        return dict(request) if request is not None else None
+        return copy.deepcopy(request) if request is not None else None
 
 
 def consume_pending_approval(
@@ -1650,6 +1678,7 @@ def consume_pending_approval(
 ) -> Optional[dict]:
     """Consume one resolved fallback approval after revalidating its identity."""
     with _lock:
+        _prune_pending_locked()
         request = _pending.get(request_id)
         if not request or request.get("session_key") != session_key:
             return None
@@ -1662,7 +1691,8 @@ def consume_pending_approval(
         except (KeyError, TypeError, ValueError):
             request["status"] = "stale"
             return None
-        if request_hash and request_hash != request.get("argument_hash"):
+        stored_hash = request.get("argument_hash")
+        if not request_hash or not stored_hash or request_hash != stored_hash:
             request["status"] = "stale"
             logger.warning(
                 "approval_resolution outcome=changed resolution_mode=consume "
@@ -1671,14 +1701,17 @@ def consume_pending_approval(
             )
             return None
         request["status"] = "consumed"
-        return dict(request)
+        consumed = copy.deepcopy(request)
+        _prune_pending_locked()
+        return consumed
 
 
 def submit_pending(session_key: str, approval: dict) -> dict:
     """Store and return an identity-bound, in-memory fallback approval request."""
-    request = dict(approval)
+    request = copy.deepcopy(approval)
     request_id = str(request.get("request_id") or uuid.uuid4().hex)
     with _lock:
+        _prune_pending_locked()
         existing = _pending.get(request_id)
         if existing is not None:
             if _approval_argument_hash(request) != existing.get("argument_hash"):
@@ -1688,7 +1721,7 @@ def submit_pending(session_key: str, approval: dict) -> dict:
                     "request_id=%s session_key=%s",
                     request_id, session_key,
                 )
-            return dict(existing)
+            return copy.deepcopy(existing)
         created_at = float(request.get("created_at") or time.time())
         expires_at = request.get("expires_at")
         if expires_at is None:
@@ -1711,7 +1744,82 @@ def submit_pending(session_key: str, approval: dict) -> dict:
         })
         _pending[request_id] = request
         _pending_by_session.setdefault(session_key, []).append(request_id)
-        return dict(request)
+        return copy.deepcopy(request)
+
+
+def _consume_matching_pending_approval(
+    session_key: str,
+    operation: str,
+    arguments,
+) -> tuple[Optional[dict], bool]:
+    """Consume the resolved request for this exact operation, if any.
+
+    The bool reports a resolved same-operation request whose hash did not
+    match. That is a stale retry and must fail closed instead of opening a new
+    approval request for changed arguments.
+    """
+    current_hash = _approval_argument_hash({"arguments": arguments})
+    with _lock:
+        _prune_pending_locked()
+        candidates = []
+        for request_id in _pending_by_session.get(session_key, []):
+            request = _pending.get(request_id)
+            if (
+                request is not None
+                and request.get("status") == "resolved"
+                and request.get("operation") == operation
+            ):
+                candidates.append(request)
+        matching = next(
+            (request for request in candidates
+             if request.get("argument_hash") == current_hash),
+            None,
+        )
+        if matching is None:
+            for request in candidates:
+                request["status"] = "stale"
+            return None, bool(candidates)
+        request_id = matching["request_id"]
+
+    consumed = consume_pending_approval(
+        session_key, request_id, request_hash=current_hash,
+    )
+    return consumed, consumed is None
+
+
+def _apply_consumed_approval_scope(session_key: str, request: dict) -> None:
+    """Apply the stored once/session/always choice after exact consumption."""
+    choice = request.get("resolution")
+    if choice not in {"session", "always"}:
+        return
+    keys = request.get("pattern_keys") or [
+        request.get("policy_key") or request.get("pattern_key")
+    ]
+    if isinstance(keys, str):
+        keys = [keys]
+    for key in keys:
+        if key:
+            approve_session(session_key, key)
+    if choice == "always" and request.get("allow_permanent", True):
+        for key in keys:
+            if key:
+                approve_permanent(key)
+        save_permanent_allowlist(_permanent_approved)
+
+
+def _stale_pending_approval_result(operation: str, description: str) -> dict:
+    """Build the fail-closed result for a changed resolved retry."""
+    return {
+        "approved": False,
+        "status": "stale",
+        "outcome": "stale",
+        "user_consent": False,
+        "message": (
+            f"BLOCKED: the resolved {operation} approval no longer matches "
+            f"the current arguments ({description}). Do NOT retry with changed "
+            "arguments; request a new approval."
+        ),
+    }
 
 
 def approve_session(session_key: str, pattern_key: str):
@@ -2262,6 +2370,29 @@ def _run_approval_gate(
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
+    pending_metadata = approval_metadata or {}
+    pending_operation = (
+        pending_metadata.get("operation")
+        or pending_metadata.get("tool_name")
+        or "terminal"
+    )
+    pending_arguments = pending_metadata.get("arguments")
+    if pending_arguments is None:
+        pending_arguments = {"command": display_target}
+    consumed, stale = _consume_matching_pending_approval(
+        session_key, pending_operation, pending_arguments,
+    )
+    if consumed is not None:
+        _apply_consumed_approval_scope(session_key, consumed)
+        return {
+            "approved": True,
+            "message": None,
+            "user_approved": True,
+            "description": description,
+        }
+    if stale:
+        return _stale_pending_approval_result(pending_operation, description)
+
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
@@ -2380,7 +2511,10 @@ def _run_approval_gate(
 
         # No notify callback (e.g. API server without an attached chat):
         # queue for /approve /deny review, agent sees approval_required.
-        pending = dict(approval_metadata or {})
+        pending = copy.deepcopy(approval_metadata or {})
+        pending.setdefault("operation", pending_operation)
+        pending.setdefault("tool_name", pending_operation)
+        pending.setdefault("arguments", copy.deepcopy(pending_arguments))
         pending.update({
             "command": display_target,
             "pattern_key": pattern_key,
@@ -2965,6 +3099,22 @@ def check_all_command_guards(command: str, env_type: str,
     if not warnings:
         return {"approved": True, "message": None}
 
+    consumed, stale = _consume_matching_pending_approval(
+        session_key, "terminal", {"command": command},
+    )
+    if consumed is not None:
+        _apply_consumed_approval_scope(session_key, consumed)
+        return {
+            "approved": True,
+            "message": None,
+            "user_approved": True,
+            "description": "; ".join(desc for _, desc, _ in warnings),
+        }
+    if stale:
+        return _stale_pending_approval_result("terminal", "; ".join(
+            desc for _, desc, _ in warnings
+        ))
+
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
@@ -3106,10 +3256,12 @@ def check_all_command_guards(command: str, env_type: str,
         pending_request = submit_pending(session_key, {
             "operation": "terminal",
             "tool_name": "terminal",
+            "arguments": {"command": command},
             "argument_hash": _approval_argument_hash({"arguments": {"command": command}}),
             "command": _disp_command,
             "pattern_key": primary_key,
             "pattern_keys": all_keys,
+            "allow_permanent": not has_tirith,
             "description": _disp_combined_desc,
         })
         pending_fields = {
@@ -3277,6 +3429,21 @@ def check_execute_code_guard(code: str, env_type: str,
     # Check session/permanent approval — same gate as check_all_command_guards.
     # Without this, "Approve session" / "Always" choices are stored but never
     # consulted, so every execute_code call re-prompts the user (#39275).
+    consumed, stale = _consume_matching_pending_approval(
+        session_key,
+        "execute_code",
+        {"command": command, "code": code},
+    )
+    if consumed is not None:
+        _apply_consumed_approval_scope(session_key, consumed)
+        return {
+            "approved": True,
+            "message": None,
+            "user_approved": True,
+            "description": description,
+        }
+    if stale:
+        return _stale_pending_approval_result("execute_code", description)
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
@@ -3314,10 +3481,12 @@ def check_execute_code_guard(code: str, env_type: str,
         pending_request = submit_pending(session_key, {
             "operation": "execute_code",
             "tool_name": "execute_code",
+            "arguments": {"command": command, "code": code},
             "argument_hash": _approval_argument_hash({"arguments": {"command": command, "code": code}}),
             "command": display_command,
             "pattern_key": pattern_key,
             "pattern_keys": [pattern_key],
+            "allow_permanent": True,
             "description": display_description,
         })
         pending_fields = {
