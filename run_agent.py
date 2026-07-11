@@ -2845,6 +2845,20 @@ class AIAgent:
         state dict hasn't been initialised yet (e.g. a tool dispatched
         outside ``run_conversation``).
         """
+        try:
+            parsed_result = json.loads(result) if isinstance(result, str) else result
+            evidence = (
+                parsed_result.get("verification_evidence")
+                if isinstance(parsed_result, dict)
+                else None
+            )
+            if isinstance(evidence, dict):
+                self._turn_verification_status = (
+                    evidence if evidence.get("status") == "passed" else None
+                )
+        except (TypeError, ValueError):
+            pass
+
         if tool_name not in _FILE_MUTATING_TOOLS:
             return
         state = getattr(self, "_turn_failed_file_mutations", None)
@@ -2855,6 +2869,7 @@ class AIAgent:
             return
         landed = file_mutation_result_landed(tool_name, result)
         if landed:
+            self._turn_verification_status = None
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
                 changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
