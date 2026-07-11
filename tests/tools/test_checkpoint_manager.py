@@ -226,6 +226,40 @@ class TestTakeCheckpoint:
         assert len(calls) == 1
         assert sorted(results) == [False, True]
 
+    def test_inflight_checkpoint_survives_new_turn(self, mgr, work_dir, monkeypatch):
+        mgr._git_available = True
+        take_started = threading.Event()
+        release_take = threading.Event()
+        calls = []
+        first_result = []
+
+        def fake_take(directory, reason):
+            calls.append((directory, reason))
+            take_started.set()
+            release_take.wait(timeout=5)
+            return True
+
+        monkeypatch.setattr(mgr, "_take", fake_take)
+
+        first = threading.Thread(
+            target=lambda: first_result.append(
+                mgr.ensure_checkpoint(str(work_dir), "first")
+            )
+        )
+        first.start()
+        assert take_started.wait(timeout=5)
+
+        mgr.new_turn()
+        second_result = mgr.ensure_checkpoint(str(work_dir), "second")
+
+        release_take.set()
+        first.join(timeout=5)
+        assert not first.is_alive()
+
+        assert second_result is False
+        assert first_result == [True]
+        assert len(calls) == 1
+
     def test_failed_checkpoint_can_retry_same_turn(self, mgr, work_dir, monkeypatch):
         mgr._git_available = True
         calls = []

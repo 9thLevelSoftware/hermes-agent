@@ -652,7 +652,6 @@ class CheckpointManager:
         """Reset per-turn dedup.  Call at the start of each agent iteration."""
         with self._checkpoint_state_lock:
             self._checkpointed_dirs.clear()
-            self._checkpointing_dirs.clear()
 
     # ------------------------------------------------------------------
     # Public API
