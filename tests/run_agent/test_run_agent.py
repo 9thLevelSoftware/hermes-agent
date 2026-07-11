@@ -2532,6 +2532,36 @@ class TestConcurrentToolExecution:
         assert "do not retry blindly" in result["content"].lower()
         assert "cancelled" not in result["content"].lower()
 
+    def test_concurrent_timeout_prefers_confirmed_cancellation(self, agent, monkeypatch):
+        """A timeout-cancelled future must be classified as no-effect."""
+        from agent import tool_executor
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
+        future = MagicMock()
+        future.cancel.return_value = True
+        future.cancelled.return_value = True
+        executor = MagicMock()
+        executor.submit.return_value = future
+        ticks = iter((0.0, 0.0, 1.0))
+        monkeypatch.setattr(tool_executor.time, "monotonic", lambda: next(ticks))
+        monkeypatch.setattr(
+            tool_executor.concurrent.futures,
+            "wait",
+            lambda fs, timeout=None: (set(), set(fs)),
+        )
+        agent._flush_messages_to_session_db = MagicMock()
+        tc = _mock_tool_call(name="write_file", arguments='{"path":"x"}', call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with patch("tools.daemon_pool.DaemonThreadPoolExecutor", return_value=executor):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        result = messages[0]
+        assert result["effect_disposition"] == "none"
+        assert "cancelled" in result["content"].lower()
+        assert "[UNRESOLVED]" not in result["content"]
+
     def test_concurrent_late_real_result_wins_without_sleep(self, agent, monkeypatch):
         """A real result present after the deadline snapshot beats fabrication."""
         from agent import tool_executor

@@ -838,7 +838,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # loop. Prefer that real result over a fabricated timeout message — the
         # tool genuinely succeeded, just slightly late.
         effect_disposition = None
-        if i in timed_out_indices and r is None:
+        if i in timed_out_indices and i not in cancelled_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = (
                 f"Error executing tool '{name}': timed out after {suffix}; "
