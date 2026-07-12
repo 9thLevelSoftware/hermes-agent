@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import shutil
 import sqlite3
 from pathlib import Path
@@ -63,22 +64,69 @@ def _probe_disk(home: Path) -> dict[str, Any]:
         return _check("degraded", type(exc).__name__)
 
 
+def _live_platform_health() -> dict[str, dict[str, Any]]:
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        status = runner._runtime_health_status() if runner is not None else {}
+        return status if isinstance(status, dict) else {}
+    except Exception:
+        return {}
+
+
 def _probe_gateway(runtime_status: dict[str, Any]) -> dict[str, Any]:
     state = str(runtime_status.get("gateway_state") or "unknown")
     platforms = runtime_status.get("platforms")
+    live_health = _live_platform_health()
     connected = 0
     configured = 0
+    degraded = 0
+    platform_health: dict[str, dict[str, Any]] = {}
     if isinstance(platforms, dict):
         configured = len(platforms)
-        connected = sum(
-            1
-            for value in platforms.values()
-            if isinstance(value, dict)
-            and str(value.get("state") or value.get("status") or "").lower()
-            in {"connected", "running", "ok"}
-        )
-    status = "ok" if state in {"running", "draining"} else "degraded"
-    return _check(status, state=state, connected_platforms=connected, platforms=configured)
+        for name, value in platforms.items():
+            if not isinstance(value, dict):
+                degraded += 1
+                continue
+            platform_state = str(value.get("state") or value.get("status") or "").lower()
+            if platform_state in {"connected", "running", "ok"}:
+                connected += 1
+            live = live_health.get(str(name), {})
+            health_state = str(value.get("health_state") or live.get("health_state") or "").lower()
+            if health_state not in {"healthy", "degraded", "open_circuit", "probing"}:
+                health_state = "healthy" if platform_state in {"connected", "running", "ok"} else "degraded"
+            try:
+                next_probe_at = float(value.get("next_probe_at", live.get("next_probe_at", 0.0)))
+                if not math.isfinite(next_probe_at) or next_probe_at < 0:
+                    next_probe_at = 0.0
+            except (TypeError, ValueError):
+                next_probe_at = 0.0
+            try:
+                suppressed_failures = max(
+                    0, int(value.get("suppressed_failures", live.get("suppressed_failures", 0)))
+                )
+            except (TypeError, ValueError):
+                suppressed_failures = 0
+            platform_health[str(name)] = {
+                "health_state": health_state,
+                "next_probe_at": next_probe_at,
+                "suppressed_failures": suppressed_failures,
+            }
+            degraded += health_state != "healthy"
+    status = "ok" if state in {"running", "draining"} and not degraded else "degraded"
+    return _check(
+        status,
+        state=state,
+        connected_platforms=connected,
+        platforms=configured,
+        configured=configured,
+        connected=connected,
+        degraded=degraded,
+        configured_platforms=configured,
+        degraded_platforms=degraded,
+        platform_health=platform_health,
+    )
 
 
 def collect_runtime_readiness(

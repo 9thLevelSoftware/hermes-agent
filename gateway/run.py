@@ -57,6 +57,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
+from agent.runtime_health import RuntimeHealthRegistry
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -2917,6 +2918,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        self._runtime_health = RuntimeHealthRegistry()
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
         # default/active profile's map so the ~93 existing self.adapters[...]
@@ -4107,12 +4109,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
-        logger.error(
-            "Fatal %s adapter error (%s): %s",
-            adapter.platform.value,
-            adapter.fatal_error_code or "unknown",
-            adapter.fatal_error_message or "unknown error",
+        failure_error = (
+            adapter.fatal_error_message
+            or adapter.fatal_error_code
+            or "unknown adapter error"
         )
+        _, should_log = self._record_platform_failure(adapter.platform, failure_error)
+        if should_log:
+            logger.error(
+                "Fatal %s adapter error (%s): %s",
+                adapter.platform.value,
+                adapter.fatal_error_code or "unknown",
+                adapter.fatal_error_message or "unknown error",
+            )
+        else:
+            logger.debug(
+                "Repeated fatal %s adapter error suppressed (%s)",
+                adapter.platform.value,
+                adapter.fatal_error_code or "unknown",
+            )
         # Phase 7 Unit 7d-B: a relay credential revoked by opt-out is not an
         # error to retry — render it as a clean "disabled" state, not red
         # "fatal"/"retrying". (The code is set non-retryable, so it also drops
@@ -4703,6 +4718,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.debug("Drain-control watcher tick error: %s", exc, exc_info=True)
             await asyncio.sleep(interval)
+
+    def _runtime_health_registry(self) -> RuntimeHealthRegistry:
+        registry = getattr(self, "_runtime_health", None)
+        if registry is None:
+            registry = RuntimeHealthRegistry()
+            self._runtime_health = registry
+        return registry
+
+    @staticmethod
+    def _runtime_health_key(platform: Platform) -> str:
+        return f"platform:{platform.value}"
+
+    def _record_platform_failure(
+        self, platform: Platform, error: BaseException | str
+    ) -> tuple[Any, bool]:
+        """Record one reconnect failure without duplicating scheduler state."""
+        return self._runtime_health_registry().record_failure(
+            self._runtime_health_key(platform), error
+        )
+
+    def _record_platform_success(self, platform: Platform) -> Any:
+        return self._runtime_health_registry().record_success(
+            self._runtime_health_key(platform)
+        )
+
+    def _runtime_health_status(self) -> dict[str, dict[str, Any]]:
+        """Return only bounded, non-sensitive platform health fields."""
+        return {
+            snapshot.key.split(":", 1)[-1]: {
+                "health_state": snapshot.state,
+                "next_probe_at": snapshot.next_probe_at,
+                "suppressed_failures": snapshot.suppressed_failures,
+            }
+            for snapshot in self._runtime_health_registry().snapshot().values()
+        }
 
     def _update_platform_runtime_status(
         self,
@@ -7187,6 +7237,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
                     connected_count += 1
+                    self._record_platform_success(platform)
                     self._update_platform_runtime_status(
                         platform.value,
                         platform_state="connected",
@@ -7206,6 +7257,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # partial-init state.
                     await self._safe_adapter_disconnect(adapter, platform)
                     if adapter.has_fatal_error:
+                        self._record_platform_failure(
+                            platform,
+                            adapter.fatal_error_message or adapter.fatal_error_code or "failed to connect",
+                        )
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
@@ -7228,6 +7283,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "next_retry": time.monotonic() + 30,
                             }
                     else:
+                        self._record_platform_failure(platform, "failed to connect")
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="retrying",
@@ -7249,6 +7305,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # that raised mid-connect may still have a live
                 # aiohttp.ClientSession or child subprocess.
                 await self._safe_adapter_disconnect(adapter, platform)
+                self._record_platform_failure(platform, e)
                 self._update_platform_runtime_status(
                     platform.value,
                     platform_state="retrying",
@@ -7996,10 +8053,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     adapter = self._create_adapter(platform, platform_config)
                     if not adapter:
-                        logger.warning(
-                            "Reconnect %s: adapter creation returned None, removing from retry queue",
-                            platform.value,
+                        _, should_log = self._record_platform_failure(
+                            platform, "adapter creation returned None"
                         )
+                        if should_log:
+                            logger.warning(
+                                "Reconnect %s: adapter creation returned None, removing from retry queue",
+                                platform.value,
+                            )
+                        else:
+                            logger.debug(
+                                "Reconnect %s: repeated adapter creation failure suppressed",
+                                platform.value,
+                            )
                         del self._failed_platforms[platform]
                         continue
 
@@ -8021,6 +8087,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self.adapters[platform] = adapter
                         self._sync_voice_mode_state_to_adapter(adapter)
                         self.delivery_router.adapters = self.adapters
+                        self._record_platform_success(platform)
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
                             platform.value,
@@ -8053,16 +8120,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     # Check if the failure is non-retryable
                     elif adapter.has_fatal_error and not adapter.fatal_error_retryable:
+                        _, should_log = self._record_platform_failure(
+                            platform,
+                            adapter.fatal_error_message or adapter.fatal_error_code or "failed to reconnect",
+                        )
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="fatal",
                             error_code=adapter.fatal_error_code,
                             error_message=adapter.fatal_error_message,
                         )
-                        logger.warning(
-                            "Reconnect %s: non-retryable error (%s), removing from retry queue",
-                            platform.value, adapter.fatal_error_message,
-                        )
+                        if should_log:
+                            logger.warning(
+                                "Reconnect %s: non-retryable error (%s), removing from retry queue",
+                                platform.value, adapter.fatal_error_message,
+                            )
+                        else:
+                            logger.debug(
+                                "Reconnect %s: repeated non-retryable failure suppressed",
+                                platform.value,
+                            )
                         # The adapter is about to be dropped from the queue
                         # without ever being installed on self.adapters, so
                         # nothing else will call disconnect() on it. We must
@@ -8074,19 +8151,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await _dispose_unused_adapter(adapter)
                         del self._failed_platforms[platform]
                     else:
+                        _, should_log = self._record_platform_failure(
+                            platform,
+                            adapter.fatal_error_message or adapter.fatal_error_code or "failed to reconnect",
+                        )
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="retrying",
                             error_code=adapter.fatal_error_code,
                             error_message=adapter.fatal_error_message or "failed to reconnect",
                         )
+                        if should_log:
+                            logger.warning(
+                                "Reconnect %s failed, next retry in %ds",
+                                platform.value, min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP),
+                            )
+                        else:
+                            logger.debug(
+                                "Reconnect %s repeated failure suppressed; next retry in %ds",
+                                platform.value, min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP),
+                            )
                         backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
                         info["attempts"] = attempt
                         info["next_retry"] = time.monotonic() + backoff
-                        logger.info(
-                            "Reconnect %s failed, next retry in %ds",
-                            platform.value, backoff,
-                        )
                         # Same fd-leak concern as the non-retryable branch
                         # above: the adapter failed to connect and is being
                         # thrown away. Without an explicit dispose call, the
@@ -8112,6 +8199,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # resources don't accumulate while the watcher
                         # keeps retrying.
                         await _dispose_unused_adapter(adapter)
+                    _, should_log = self._record_platform_failure(platform, e)
                     self._update_platform_runtime_status(
                         platform.value,
                         platform_state="retrying",
@@ -8121,10 +8209,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     backoff = min(30 * (2 ** (attempt - 1)), _BACKOFF_CAP)
                     info["attempts"] = attempt
                     info["next_retry"] = time.monotonic() + backoff
-                    logger.warning(
-                        "Reconnect %s error: %s, next retry in %ds",
-                        platform.value, e, backoff,
-                    )
+                    if should_log:
+                        logger.warning(
+                            "Reconnect %s error: %s, next retry in %ds",
+                            platform.value, e, backoff,
+                        )
+                    else:
+                        logger.debug(
+                            "Reconnect %s repeated error suppressed; next retry in %ds",
+                            platform.value, backoff,
+                        )
                     # A raised exception during reconnect (connect timeout, DNS
                     # resolution failure, etc.) is inherently transient — keep
                     # retrying at the backoff cap rather than auto-pausing.
