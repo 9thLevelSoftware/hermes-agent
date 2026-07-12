@@ -74,9 +74,9 @@ def test_body_nonempty_and_bounded(skill_md) -> None:
 
 
 def test_referenced_files_exist(skill_md) -> None:
-    linked = re.findall(r"\]\((references/[^)#]+)", skill_md)
+    linked = set(re.findall(r"\]\((references/[^)#]+)", skill_md))
     assert linked, "SKILL.md should link its reference files"
-    for rel in linked:
+    for rel in sorted(linked):
         assert (SKILL_DIR / rel).is_file(), f"SKILL.md links missing file: {rel}"
 
 
