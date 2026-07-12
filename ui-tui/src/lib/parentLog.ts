@@ -2,6 +2,8 @@ import { appendFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
+import { safeStderrWrite } from './safeWrite.js'
+
 // Mirror the Python gateway's panic log (tui_gateway/server.py::_CRASH_LOG) from
 // the Node parent so lifecycle breadcrumbs interleave, by timestamp, with the
 // child's `=== SIGTERM received ===` / `=== gateway exit ===` entries.
@@ -53,7 +55,7 @@ export function recordParentLifecycle(line: string): void {
   } catch {
     if (!warned) {
       warned = true
-      process.stderr.write('hermes-tui: parent lifecycle log unavailable\n')
+      safeStderrWrite('hermes-tui: parent lifecycle log unavailable\n')
     }
   }
 }
