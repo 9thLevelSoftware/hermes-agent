@@ -70,5 +70,64 @@ def test_measure_tool_schema_cost_keeps_all_tools_when_threshold_skips(monkeypat
 
     assert result["visible_tools"] == result["raw_tools"]
     assert result["visible_tokens"] == result["raw_tokens"]
+    # This is the eligible deferrable catalog count, even when auto assembly
+    # is inactive.
     assert result["deferred_tools"] == 1
     assert result["saved_tokens"] == 0
+
+
+def test_current_cost_discovers_mcp_before_get_tool_definitions(monkeypatch):
+    from scripts import measure_tool_schema_cost as script
+    from tools import tool_search
+
+    calls = []
+    monkeypatch.setattr(
+        script,
+        "discover_mcp_tools",
+        lambda: calls.append("discover"),
+    )
+    monkeypatch.setattr(
+        script,
+        "get_tool_definitions",
+        lambda **kwargs: calls.append("get_tool_definitions") or [],
+    )
+    monkeypatch.setattr(
+        script,
+        "load_config",
+        lambda: tool_search.ToolSearchConfig.from_raw({}),
+    )
+    monkeypatch.setattr(script, "_resolve_active_context_length", lambda: 0)
+    monkeypatch.setattr(script, "measure_tool_schema_cost", lambda *args, **kwargs: {})
+
+    script._current_cost()
+
+    assert calls == ["discover", "get_tool_definitions"]
+
+
+def test_current_cost_forwards_runtime_context_length(monkeypatch):
+    from scripts import measure_tool_schema_cost as script
+    from tools import tool_search
+
+    received = {}
+    monkeypatch.setattr(script, "discover_mcp_tools", lambda: None)
+    monkeypatch.setattr(script, "get_tool_definitions", lambda **kwargs: [])
+    monkeypatch.setattr(
+        script,
+        "load_config",
+        lambda: tool_search.ToolSearchConfig.from_raw({}),
+    )
+    monkeypatch.setattr(
+        script,
+        "_resolve_active_context_length",
+        lambda: 123_456,
+    )
+
+    def capture_measurement(tool_defs, **kwargs):
+        received.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(script, "measure_tool_schema_cost", capture_measurement)
+
+    script._current_cost()
+
+    assert received["context_length"] == 123_456

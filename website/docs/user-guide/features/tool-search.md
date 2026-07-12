@@ -62,9 +62,25 @@ token threshold. Below that, the tools-array assembly is a pure pass-through
 and you pay no overhead. If the active context length is unknown, the
 absolute threshold is used by itself.
 
-The effective tool list and schemas are fixed for an existing conversation.
-Changes to tool configuration or attached toolsets take effect at the next
-agent/session boundary, not partway through an existing conversation.
+Tool schemas stay stable within a model request and its prompt-cache prefix.
+An explicit `/reload-mcp`, a gateway/TUI registry refresh, or a between-turn
+rebuild can update subsequent assemblies. These changes do not splice new
+schemas into past context; updated schemas apply at the next assembly/request
+boundary.
+
+## Offline schema-cost diagnostic
+
+To measure the live configured tool surface without contacting a model or
+invoking a tool, run:
+
+```bash
+python scripts/measure_tool_schema_cost.py --json
+```
+
+The diagnostic performs configured MCP discovery before taking its raw tool
+snapshot and uses the runtime's active-model context resolver. Its
+`deferred_tools` field is the eligible deferrable catalog count, so it can be
+nonzero even when the current Tool Search assembly stays inactive.
 
 ## Configuration
 
@@ -122,9 +138,9 @@ to any progressive-disclosure design, not specific to this implementation:
   less well; the published Anthropic numbers (49% → 74% on Opus 4 with
   vs. without tool search) show the upside but also that ~26 points of
   accuracy is still retrieval failure.
-- **Toolset edits wait for a boundary.** The effective tool list and schemas
-  remain fixed for an existing conversation. Adding or removing tools, or
-  changing Tool Search settings, takes effect when a new agent/session starts.
+- **Refreshes wait for a boundary.** An explicit `/reload-mcp`, gateway/TUI
+  registry refresh, or between-turn rebuild can update subsequent assemblies,
+  but never rewrites past context or changes an in-flight request.
 
 ## Implementation details
 
@@ -133,11 +149,11 @@ to any progressive-disclosure design, not specific to this implementation:
   BM25 returns no positive-score hits, which protects against
   zero-IDF degenerate cases (e.g. searching `"github"` against a
   catalog where every tool name contains "github").
-- **Catalog follows the session's fixed tool list.** It rebuilds from that
-  list as needed — there is no session-keyed `Map` — while configuration and
-  toolset changes wait for the next agent/session boundary. This avoids the
-  class of bug where a stored catalog drifts out of sync with the live tool
-  registry.
+- **Catalog follows the session's tool snapshot.** It rebuilds from that
+  snapshot as needed — there is no session-keyed `Map` — and a refresh makes a
+  newer registry snapshot available for subsequent assemblies. This avoids
+  the class of bug where a stored catalog drifts out of sync with the live
+  tool registry.
 - **The catalog is scoped to the session's toolsets.** `tool_search`,
   `tool_describe`, and `tool_call` only ever see and invoke tools the
   session was actually granted. A subagent, kanban worker, or gateway

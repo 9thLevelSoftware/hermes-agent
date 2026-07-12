@@ -15,7 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from model_tools import get_tool_definitions
+from model_tools import _resolve_active_context_length, get_tool_definitions
+from tools.mcp_tool import discover_mcp_tools
 from tools.tool_search import (
     ToolSearchConfig,
     assemble_tool_defs,
@@ -40,7 +41,11 @@ def measure_tool_schema_cost(
     config: ToolSearchConfig,
     context_length: int | None = None,
 ) -> dict[str, int]:
-    """Return aggregate schema-cost measurements for one tool assembly."""
+    """Return aggregate schema-cost measurements for one tool assembly.
+
+    ``deferred_tools`` is the eligible deferrable catalog count, whether or not
+    this assembly activated Tool Search.
+    """
     raw_defs = list(tool_defs)
     assembly = assemble_tool_defs(
         raw_defs,
@@ -59,20 +64,9 @@ def measure_tool_schema_cost(
     }
 
 
-def _configured_context_length() -> int:
-    """Use only an explicit context length; unknown context uses the absolute cap."""
-    try:
-        from hermes_cli.config import load_config as _load_config
-
-        model = (_load_config() or {}).get("model")
-        configured = model.get("context_length") if isinstance(model, dict) else None
-        return configured if isinstance(configured, int) and configured > 0 else 0
-    except Exception:
-        return 0
-
-
 def _current_cost() -> dict[str, int]:
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        discover_mcp_tools()
         raw_defs = get_tool_definitions(
             quiet_mode=True,
             skip_tool_search_assembly=True,
@@ -80,7 +74,7 @@ def _current_cost() -> dict[str, int]:
     return measure_tool_schema_cost(
         raw_defs,
         config=load_config(),
-        context_length=_configured_context_length(),
+        context_length=_resolve_active_context_length(),
     )
 
 
@@ -93,6 +87,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({key: result[key] for key in _COST_KEYS}))
     else:
         print(" ".join(f"{key}={result[key]}" for key in _COST_KEYS))
+        print(
+            "deferred_tools is the eligible deferrable catalog count; "
+            "it may be nonzero when Tool Search is inactive."
+        )
     return 0
 
 
