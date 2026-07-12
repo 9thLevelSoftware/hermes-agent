@@ -18,7 +18,7 @@ kanban_create(
     workspace_kind="worktree",
     workspace_path="/abs/path/to/target/repo",
     priority=2,
-    goal_mode=True,                        # judge-enforced completion
+    goal_mode=True,                        # judge-enforced completion (needs auxiliary.goal_judge)
     max_runtime_seconds=3600,              # when the work is bounded
     skills=["test-driven-development"],    # optional specialist context
 )
@@ -52,11 +52,16 @@ Exact commands to run and their expected outcome, e.g.:
 
 ## Handoff
 When the change needs human review (any code or config change does):
-1. `kanban_comment` with metadata: changed_files, tests_run, diff path or
-   PR url, decisions made.
-2. `kanban_block(reason="review-required: <one-line summary>")`.
+1. `kanban_comment` whose body carries the structured payload as
+   markdown: changed files, tests run, diff path or PR url, decisions
+   made. (The comment tool has no metadata parameter — structured
+   `metadata=` belongs on `kanban_complete` only.)
+2. `kanban_block(kind="needs_input", reason="review-required: <one-line summary>")`.
+   The `kind` is required on goal_mode tasks — a bare block is rejected
+   so workers can't sidestep the completion judge.
 Only truly terminal chores (typo fix, docs touch-up with verification
-passing) may `kanban_complete` directly.
+passing) may `kanban_complete` directly — pass the same structured
+payload via `metadata=` there.
 ```
 
 The kanban lifecycle itself (complete/block/heartbeat semantics) is injected
@@ -84,11 +89,18 @@ or leave them for the user.
 |---|---|---|
 | `worktree` + `workspace_path` | Any change to a git repo. Worker gets an isolated branch; nothing touches the user's checkout. | **Preserved** on completion |
 | `dir:` absolute path | Shared non-repo state (docs tree, vault, ops dir) | **Preserved** on completion |
-| `scratch` (default) | Research/analysis whose only output is the summary + comments | **Deleted** on completion |
+| `scratch` (default) | Research/analysis whose only output is the summary + comments | **Deleted** on completion (managed paths) |
 
-Never put an artifact you want to keep in `scratch` — it is wiped the moment
-the task completes. Research tasks should paste their findings into the
-completion `summary`/`metadata`, not leave files behind.
+When `workspace_path` points at a git repo root, the worker does not run in
+that path — it lands in `<repo>/.worktrees/<task_id>` on a dedicated task
+branch. Look for diffs there, not in the checkout you named.
+
+Never put an artifact you want to keep in `scratch` — dispatcher-created
+scratch dirs (under the board's managed `workspaces/` root) are removed when
+the task completes. Don't rely on the wipe for hygiene either: a scratch
+path outside the managed root is preserved with a warning instead of
+deleted. Research tasks should paste their findings into the completion
+`summary`/`metadata`, not leave files behind.
 
 ## Idempotency keys
 

@@ -1,8 +1,8 @@
 ---
 name: self-improvement-loop
-description: Use when the user wants Hermes to improve itself or its projects unattended on a schedule — set up and run a kanban-backed loop where a recurring cron reviewer surveys improvement sources, files prioritized tasks with acceptance criteria, and dispatcher-spawned worker profiles implement them behind a human review gate. Covers one-time setup (board, worker profile, cron job), the recurring review pass, task-filing conventions, backpressure, and monitoring.
+description: Cron reviewer files improvement tasks; kanban workers fix.
 version: 1.0.0
-author: Hermes Agent
+author: 9thLevelSoftware, Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
@@ -192,7 +192,10 @@ lists are empty, respond with only `[SILENT]` so nothing is delivered.
 6. **Premature completion by workers.** Vague acceptance criteria let a
    worker declare victory early. Criteria must be checkable commands;
    `goal_mode=True` adds a judge that keeps the worker going until they pass
-   (or blocks the task for review when the budget runs out).
+   (or blocks the task for review when the budget runs out). The judge
+   requires an `auxiliary.goal_judge` model in `config.yaml` — without one
+   the completion gate is deliberately skipped (fail-open), so `goal_mode`
+   is a silent no-op.
 7. **Tasks landing in `triage`.** With `kanban.auto_decompose: true`
    (default) the aux-model decomposer rewrites triage cards. This loop files
    fully-specified tasks straight to `todo`/`ready` — never pass
@@ -211,14 +214,3 @@ After setup (all commands in [references/setup.md](references/setup.md)):
       files tasks or delivers/silences correctly
 - [ ] Filed task gets claimed by the dispatcher and the worker's run appears
       in `hermes kanban runs <task_id>`
-
-## File map
-
-```
-SKILL.md                      ← this file (modes, review pass, rules)
-references/
-  setup.md                    ← one-time setup: board, profile, toolset gate,
-                                cron job, tuning, teardown
-  task-filing.md              ← task body template, priority rubric, workspace
-                                selection, idempotency keys, review gate
-```

@@ -85,28 +85,34 @@ cronjob(
     action="create",
     name="self-improvement-review",
     schedule="every 4h",
-    skill="self-improvement-loop",
+    skills=["self-improvement-loop"],
     enabled_toolsets=["kanban", "file", "web"],   # deliberately NO terminal
     deliver="telegram",                            # or discord/slack/email/local/…
     prompt=REVIEW_PROMPT,                          # see below
 )
 ```
 
-CLI equivalent:
-
-```bash
-hermes cron create "every 4h" "$REVIEW_PROMPT" \
-    --skill self-improvement-loop \
-    --name self-improvement-review \
-    --deliver telegram
-```
-
-Then **pin the model** so the unattended job never inherits a surprise
-provider switch (unpinned jobs fail closed when the global default changes):
+There is no CLI flag for `enabled_toolsets` — `hermes cron create` only
+exposes name/deliver/repeat/skill/script/workdir. Create the job from chat
+via the `cronjob` tool as above; if the job was created another way, apply
+the gate from chat before the first run:
 
 ```python
 cronjob(action="update", job_id="self-improvement-review",
-        provider="<provider>", model="<model>")
+        enabled_toolsets=["kanban", "file", "web"])
+```
+
+Without that gate the reviewer runs with the cron platform's default
+toolset — including `terminal` — which violates critical rule #1.
+
+Then **pin the model** so the unattended job never inherits a surprise
+provider switch (unpinned jobs fail closed when the global default changes).
+`model` is an object in the tool schema; a flat `model="<name>"` string is
+silently dropped:
+
+```python
+cronjob(action="update", job_id="self-improvement-review",
+        model={"provider": "<provider>", "model": "<model>"})
 ```
 
 ### The review prompt
@@ -141,7 +147,7 @@ pinned model.
 Trigger one pass manually and watch it end-to-end:
 
 ```bash
-hermes cron run self-improvement-review        # fires on next ticker tick
+hermes cron run self-improvement-review        # claims + runs in this process; blocks until done
 hermes kanban --board self-improvement list    # tasks appear once filed
 hermes kanban runs <task_id>                   # worker attempt history
 hermes dashboard                               # visual board, live
@@ -159,9 +165,10 @@ worker's run terminated in `done` or a `review-required:` block — not
 | Cadence | job `schedule` | `every 4h` | Slower is usually better; the cap makes faster cadences mostly no-ops. |
 | Open-task cap | review prompt | 3 | Raise only after the loop demonstrably drains. |
 | Per-task runtime | `max_runtime_seconds` on `kanban_create` | unset | Set for known-bounded work; dispatcher SIGTERMs and re-queues on breach. |
-| Worker persistence | `goal_mode=True` on `kanban_create` | off | Judge-driven keep-going until acceptance criteria pass; blocks for review on budget exhaustion. |
+| Worker persistence | `goal_mode=True` on `kanban_create` | off | Judge-driven keep-going until acceptance criteria pass; blocks for review on budget exhaustion. Requires an `auxiliary.goal_judge` model in `config.yaml` — without one the gate is a silent no-op. |
 | Delivery | job `deliver` | — | `local` saves to `~/.hermes/cron/output/` only; any connected platform name delivers there. |
-| Reply-to-report | `cron.mirror_delivery` / `attach_to_session` | off | Makes the delivered report a continuable conversation. |
+| Reply-to-report (global) | `cron.mirror_delivery` in `config.yaml` | off | Makes every cron delivery a continuable conversation. |
+| Reply-to-report (this job) | `attach_to_session=True` on the `cronjob` tool | off | Per-job override of the global setting. |
 
 ## Teardown / pause
 

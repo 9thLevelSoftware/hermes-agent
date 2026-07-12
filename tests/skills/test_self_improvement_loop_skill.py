@@ -56,10 +56,13 @@ def test_name_matches_dir(frontmatter) -> None:
     assert frontmatter["name"] == "self-improvement-loop"
 
 
-def test_description_trigger_focused(frontmatter) -> None:
+def test_description_hardline(frontmatter) -> None:
+    # AGENTS.md "Skill authoring standards (HARDLINE)" rule 1:
+    # ≤ 60 characters, one sentence, ends with a period.
     desc = frontmatter["description"]
-    assert desc.startswith("Use when"), f"description should start with 'Use when': {desc!r}"
-    assert len(desc) <= 1024
+    assert len(desc) <= 60, f"description is {len(desc)} chars (hardline ≤60): {desc!r}"
+    assert desc.endswith("."), f"description must end with a period: {desc!r}"
+    assert desc.count(".") == 1, f"description must be one sentence: {desc!r}"
 
 
 def test_license_and_platforms(frontmatter) -> None:
