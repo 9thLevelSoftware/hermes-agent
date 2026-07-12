@@ -3223,16 +3223,20 @@
 				nodePositions
 			]);
 			useEffect(function() {
-				const key = graphItems(activeSpec() || {}).map(function(item) {
-					return item.specKind + ":" + item.id;
+				const key = flowNodes.map(function(item) {
+					return item.data.specKind + ":" + item.id;
 				}).join("|");
-				if (key && key !== membershipKeyRef.current && flowInstanceRef.current && typeof flowInstanceRef.current.fitView === "function") flowInstanceRef.current.fitView();
-				membershipKeyRef.current = key;
-			}, [
-				draftSpec,
-				editorText,
-				flowNodes
-			]);
+				if (!key || key === membershipKeyRef.current) return void 0;
+				const frame = requestAnimationFrame(function() {
+					const instance = flowInstanceRef.current;
+					if (!instance || typeof instance.fitView !== "function") return;
+					instance.fitView();
+					membershipKeyRef.current = key;
+				});
+				return function() {
+					cancelAnimationFrame(frame);
+				};
+			}, [flowNodes]);
 			useEffect(function() {
 				if (!error && !status) return void 0;
 				const timer = setTimeout(clearBanners, error ? 12e3 : 6e3);

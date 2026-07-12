@@ -19,6 +19,12 @@ describe("workflow canvas workspace layout", () => {
     expect(cssSource).toContain("linear-gradient(to bottom");
   });
 
+  it("fits only after the rendered flow-node membership is available", () => {
+    expect(appSource).toContain("const key = flowNodes.map");
+    expect(appSource).toContain("requestAnimationFrame");
+    expect(appSource).toContain("membershipKeyRef.current = key;");
+  });
+
   it("converts the palette drop point into flow coordinates before creating a node", () => {
     expect(appSource).toContain("screenToFlowPosition");
     expect(appSource).toContain("addWorkflowCellAtPosition(type, dropPosition)");

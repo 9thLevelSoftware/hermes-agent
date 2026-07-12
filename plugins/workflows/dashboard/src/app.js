@@ -1701,17 +1701,21 @@ import { renderInspector } from "./inspector.js";
     }, [draftSpec, editorText, events, selectedNode, nodePositions]);
 
     useEffect(function () {
-      // ponytail: re-fit the React Flow viewport only when the ordered
-      // membership key changes — status polling is a status-only change.
-      const spec = activeSpec();
-      const key = buildGraphItems(spec || {}).map(function (item) {
-        return item.specKind + ":" + item.id;
+      // Fit only after React Flow has rendered the current membership.  The
+      // previous draft-driven effect ran before setFlowNodes committed, so it
+      // could fit stale nodes and then incorrectly suppress its own retry.
+      const key = flowNodes.map(function (item) {
+        return item.data.specKind + ":" + item.id;
       }).join("|");
-      if (key && key !== membershipKeyRef.current && flowInstanceRef.current && typeof flowInstanceRef.current.fitView === "function") {
-        flowInstanceRef.current.fitView();
-      }
-      membershipKeyRef.current = key;
-    }, [draftSpec, editorText, flowNodes]);
+      if (!key || key === membershipKeyRef.current) return undefined;
+      const frame = requestAnimationFrame(function () {
+        const instance = flowInstanceRef.current;
+        if (!instance || typeof instance.fitView !== "function") return;
+        instance.fitView();
+        membershipKeyRef.current = key;
+      });
+      return function () { cancelAnimationFrame(frame); };
+    }, [flowNodes]);
 
     useEffect(function () {
       if (!error && !status) return undefined;
