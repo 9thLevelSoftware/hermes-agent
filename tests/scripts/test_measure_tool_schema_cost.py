@@ -197,6 +197,63 @@ def test_current_cost_shuts_down_when_measurement_raises(monkeypatch):
     assert calls == ["discover", "get_tool_definitions", "measure", "shutdown"]
 
 
+def test_current_cost_preserves_body_error_when_cleanup_also_raises(monkeypatch):
+    from scripts import measure_tool_schema_cost as script
+
+    monkeypatch.setattr(script, "suppress_interactive_oauth", nullcontext)
+    monkeypatch.setattr(
+        script,
+        "discover_mcp_tools",
+        lambda: (_ for _ in ()).throw(RuntimeError("body failed")),
+    )
+    monkeypatch.setattr(
+        script,
+        "shutdown_mcp_servers",
+        lambda: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="body failed"):
+        script._current_cost()
+
+
+def test_current_cost_keeps_result_when_cleanup_raises(monkeypatch):
+    from scripts import measure_tool_schema_cost as script
+    from tools import tool_search
+
+    result = {"raw_tools": 1}
+    monkeypatch.setattr(script, "suppress_interactive_oauth", nullcontext)
+    monkeypatch.setattr(script, "discover_mcp_tools", lambda: None)
+    monkeypatch.setattr(script, "get_tool_definitions", lambda **kwargs: [])
+    monkeypatch.setattr(
+        script,
+        "load_config",
+        lambda: tool_search.ToolSearchConfig.from_raw({}),
+    )
+    monkeypatch.setattr(script, "_resolve_active_context_length", lambda: 0)
+    monkeypatch.setattr(script, "measure_tool_schema_cost", lambda *args, **kwargs: result)
+    monkeypatch.setattr(
+        script,
+        "shutdown_mcp_servers",
+        lambda: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
+    )
+
+    assert script._current_cost() == result
+
+
+def test_current_cost_rejects_existing_mcp_servers_before_discovery(monkeypatch):
+    from scripts import measure_tool_schema_cost as script
+
+    calls = []
+    monkeypatch.setattr(script, "_servers", {"live": object()}, raising=False)
+    monkeypatch.setattr(script, "discover_mcp_tools", lambda: calls.append("discover"))
+    monkeypatch.setattr(script, "shutdown_mcp_servers", lambda: calls.append("shutdown"))
+
+    with pytest.raises(RuntimeError, match="separate process"):
+        script._current_cost()
+
+    assert calls == []
+
+
 def test_main_json_emits_only_measurement_json(monkeypatch, capsys):
     from scripts import measure_tool_schema_cost as script
     from tools import tool_search

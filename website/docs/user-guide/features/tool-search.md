@@ -77,14 +77,17 @@ run:
 python scripts/measure_tool_schema_cost.py --json
 ```
 
-The diagnostic briefly connects to configured MCP servers for non-interactive
-discovery before taking its raw tool snapshot, then shuts those servers down.
-OAuth flows that require user interaction are skipped or treated as
-unavailable. It therefore can have network and short-lived MCP process side
-effects even though it does not invoke model or tool calls. It also uses the
-runtime's active-model context resolver. Its `deferred_tools` field is the
-eligible deferrable catalog count, so it can be nonzero even when the current
-Tool Search assembly stays inactive.
+The diagnostic is CLI-only: run it as a standalone process. It refuses to run
+inside a process with active MCP connections so it cannot disrupt a live
+Hermes session. In its own process it briefly connects to configured MCP
+servers for non-interactive discovery before taking its raw tool snapshot, then
+best-effort shuts those servers down. Cleanup errors are suppressed so they do
+not replace a discovery or measurement error. OAuth flows that require user
+interaction are skipped or treated as unavailable. It therefore can have
+network and short-lived MCP process side effects even though it does not invoke
+model or tool calls. It also uses the runtime's active-model context resolver.
+Its `deferred_tools` field is the eligible deferrable catalog count, so it can
+be nonzero even when the current Tool Search assembly stays inactive.
 
 ## Configuration
 

@@ -17,7 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from model_tools import _resolve_active_context_length, get_tool_definitions
 from tools.mcp_oauth import suppress_interactive_oauth
-from tools.mcp_tool import discover_mcp_tools, shutdown_mcp_servers
+from tools.mcp_tool import _lock, _servers, discover_mcp_tools, shutdown_mcp_servers
 from tools.tool_search import (
     ToolSearchConfig,
     assemble_tool_defs,
@@ -65,7 +65,26 @@ def measure_tool_schema_cost(
     }
 
 
+def _has_active_mcp_servers() -> bool:
+    with _lock:
+        return bool(_servers)
+
+
+def _cleanup_mcp_servers() -> None:
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            shutdown_mcp_servers()
+    except Exception:
+        pass
+
+
 def _current_cost() -> dict[str, int]:
+    if _has_active_mcp_servers():
+        raise RuntimeError(
+            "The schema-cost diagnostic cannot run in a process with active MCP "
+            "servers; run scripts/measure_tool_schema_cost.py in a separate process."
+        )
+
     try:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             with suppress_interactive_oauth():
@@ -79,10 +98,12 @@ def _current_cost() -> dict[str, int]:
                     config=load_config(),
                     context_length=_resolve_active_context_length(),
                 )
-                return result
-    finally:
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            shutdown_mcp_servers()
+    except BaseException:
+        _cleanup_mcp_servers()
+        raise
+
+    _cleanup_mcp_servers()
+    return result
 
 
 def main(argv: Sequence[str] | None = None) -> int:
