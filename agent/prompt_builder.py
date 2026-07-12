@@ -282,6 +282,19 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+KANBAN_ORCHESTRATOR_GUIDANCE = (
+    "# Kanban orchestrator mode\n"
+    "You have access to Kanban board tools but are NOT assigned a specific "
+    "task (no `HERMES_KANBAN_TASK`). Use `kanban_list(board=<board-slug>)` "
+    "with an explicit board to review the board state. To decompose work, "
+    "use `kanban_create(title=..., assignee=<profile>, parents=[...])` to "
+    "spawn child tasks and `kanban_link(parent_id=..., child_id=...)` to "
+    "express dependencies. Do NOT call `kanban_show()` with no arguments — "
+    "it defaults to `HERMES_KANBAN_TASK`, which is not set in orchestrator "
+    "mode; always pass an explicit `task_id` if you need to inspect a "
+    "specific task."
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "

@@ -1192,16 +1192,30 @@ def init_agent(
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
-    # Kanban worker/orchestrator lifecycle guidance is session-static:
-    # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
-    # Resolving the ~835-token block once here avoids re-running the
-    # membership test + reference on every system-prompt rebuild
-    # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    # Kanban worker/orchestrator lifecycle guidance is session-static.
+    # The dispatcher decides at spawn time whether this process is a kanban
+    # *worker* (HERMES_KANBAN_TASK set in env) or an *orchestrator* (kanban
+    # toolset enabled but no HERMES_KANBAN_TASK). The two modes receive
+    # different guidance blocks:
+    #
+    #   worker      → KANBAN_GUIDANCE (full lifecycle: kanban_show() first,
+    #                 complete/block handoff rules, workspace setup, …)
+    #   orchestrator → KANBAN_ORCHESTRATOR_GUIDANCE (concise hint to use
+    #                 kanban_list with an explicit board, no worker-only
+    #                 language)
+    #   normal chat → no kanban block at all
+    #
+    # Keying the worker block on HERMES_KANBAN_TASK (not on kanban_show
+    # presence) prevents orchestrator/cron-review sessions from receiving
+    # worker-only instructions like "call kanban_show() with no args",
+    # which error out when no task is assigned.
+    from agent.prompt_builder import KANBAN_GUIDANCE, KANBAN_ORCHESTRATOR_GUIDANCE
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        agent._kanban_worker_guidance = KANBAN_GUIDANCE
+    elif "kanban_show" in agent.valid_tool_names:
+        agent._kanban_worker_guidance = KANBAN_ORCHESTRATOR_GUIDANCE
+    else:
+        agent._kanban_worker_guidance = ""
 
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:
