@@ -310,6 +310,71 @@
   cursor: grabbing;
 }
 
+.hermes-workflows .hermes-workflows-canvas {
+  position: relative;
+}
+
+.hermes-workflows .hermes-workflows-node-palette-overlay {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  z-index: 20;
+  width: min(22rem, calc(100% - 2rem));
+  max-height: calc(100% - 2rem);
+  pointer-events: auto;
+}
+
+.hermes-workflows .hermes-workflows-node-palette-panel {
+  max-height: inherit;
+  overflow-y: auto;
+  padding: 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius, 0.75rem);
+  background: color-mix(in srgb, var(--color-card) 96%, transparent);
+  box-shadow: 0 16px 40px color-mix(in srgb, var(--color-background) 70%, transparent);
+}
+
+.hermes-workflows .hermes-workflows-node-palette-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.hermes-workflows .hermes-workflows-node-palette-header h2 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.hermes-workflows .hermes-workflows-node-palette-tile {
+  border-color: color-mix(in srgb, var(--wf-palette-color, var(--color-border)) 60%, var(--color-border));
+}
+
+.hermes-workflows .hermes-workflows-node-palette-tile:hover {
+  border-color: var(--wf-palette-color, var(--color-primary, var(--color-foreground)));
+}
+
+.hermes-workflows .hermes-workflows-node-palette-tile[draggable="true"] {
+  cursor: grab;
+}
+
+.hermes-workflows .hermes-workflows-node-palette-tile[draggable="true"]:active {
+  cursor: grabbing;
+}
+
+.hermes-workflows .hermes-workflows-node-palette-overlay .hermes-workflows-palette-search-input {
+  margin: 0 0 0.4rem;
+}
+
+.hermes-workflows .hermes-workflows-node-palette-overlay .hermes-workflows-palette-category {
+  margin-top: 0.55rem;
+}
+
+.hermes-workflows .hermes-workflows-node-palette-overlay .hermes-workflows-node-palette {
+  gap: 0.3rem;
+}
+
 .hermes-workflows .hermes-workflows-canvas-drop-target {
   outline: 2px dashed var(--color-primary, var(--color-foreground));
   outline-offset: -4px;

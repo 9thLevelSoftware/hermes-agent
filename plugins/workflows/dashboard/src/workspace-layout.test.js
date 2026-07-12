@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 
 const sourceDir = path.dirname(fileURLToPath(import.meta.url));
 const appSource = fs.readFileSync(path.join(sourceDir, "app.js"), "utf8");
+const paletteSource = fs.readFileSync(path.join(sourceDir, "palette.js"), "utf8");
+const topbarSource = fs.readFileSync(path.join(sourceDir, "topbar.js"), "utf8");
 const cssSource = fs.readFileSync(path.join(sourceDir, "style.css"), "utf8");
 
 describe("workflow canvas workspace layout", () => {
@@ -27,8 +29,20 @@ describe("workflow canvas workspace layout", () => {
 
   it("converts the palette drop point into flow coordinates before creating a node", () => {
     expect(appSource).toContain("screenToFlowPosition");
+    expect(appSource).toContain("snapFlowPosition(flowPositionFromDropEvent(event))");
     expect(appSource).toContain("addWorkflowCellAtPosition(type, dropPosition)");
     expect(appSource).toContain("function addWorkflowCellAtPosition(type, position)");
+  });
+
+  it("wires the live workflow rail and manual node overlay", () => {
+    const paletteZoneStart = appSource.indexOf("hermes-workflows-palette-zone");
+    const paletteZoneEnd = appSource.indexOf("hermes-workflows-canvas-zone", paletteZoneStart);
+    const livePaletteZone = appSource.slice(paletteZoneStart, paletteZoneEnd);
+    expect(topbarSource).toContain('"Add Node"');
+    expect(appSource).toContain("openNodePalette");
+    expect(paletteSource).toContain("NodePaletteOverlay");
+    expect(appSource).toContain("h(WorkflowRail");
+    expect(livePaletteZone).not.toContain("renderPalette({");
   });
 
   it("keeps the React Flow canvas mounted while onboarding has no workflow", () => {

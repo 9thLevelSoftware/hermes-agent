@@ -48,4 +48,15 @@ describe("renderTopBar", () => {
     }));
     expect(statusNode(node).children).toContain("v3 · enabled");
   });
+
+  it("shows an always-visible Add Node action that opens the manual palette", () => {
+    let opened = 0;
+    const node = renderTopBar(props({ openNodePalette: () => { opened += 1; } }));
+    const actions = node.children[2];
+    const addNode = actions.children.find((child) => child && child.children && child.children.includes("Add Node"));
+    expect(addNode).toBeTruthy();
+    expect(addNode.props["aria-label"]).toBe("Add Node");
+    addNode.props.onClick();
+    expect(opened).toBe(1);
+  });
 });

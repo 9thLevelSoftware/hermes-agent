@@ -19,8 +19,10 @@ import {
 } from "./history.js";
 import {
   WORKSPACE_MODES,
+  libraryGroups,
   locationForMode,
   modeForLocation,
+  snapFlowPosition,
 } from "./workspace.js";
 import { renderTopBar as renderExtractedTopBar } from "./topbar.js";
 import {
@@ -34,7 +36,12 @@ import {
   defaultTriggerForType,
 } from "./editor-model.js";
 import { makeWorkflowNode } from "./canvas-nodes.js";
-import { renderPalette, renderWorkflowOnboarding } from "./palette.js";
+import {
+  NODE_CATEGORIES,
+  NodePaletteOverlay,
+  renderWorkflowOnboarding,
+  WorkflowRail,
+} from "./palette.js";
 import { renderInspector } from "./inspector.js";
 
 (function () {
@@ -934,7 +941,14 @@ import { renderInspector } from "./inspector.js";
     // re-renders the flow without mutating membership, so nodePositions and
     // the viewport must stay put.
     const flowInstanceRef = useRef(null);
+    const canvasRef = useRef(null);
     const membershipKeyRef = useRef("");
+    const stateNodePaletteOpen = useState(false);
+    const nodePaletteOpen = stateNodePaletteOpen[0];
+    const setNodePaletteOpen = stateNodePaletteOpen[1];
+    const stateNodePaletteGroup = useState("");
+    const nodePaletteGroup = stateNodePaletteGroup[0];
+    const setNodePaletteGroup = stateNodePaletteGroup[1];
     const stateDefinitions = useState([]);
     const definitions = stateDefinitions[0];
     const setDefinitions = stateDefinitions[1];
@@ -1225,6 +1239,15 @@ import { renderInspector } from "./inspector.js";
     const setTicking = stateTicking[1];
     const initialExecutionId = initialExecutionIdFromLocation();
 
+    useEffect(function () {
+      if (!nodePaletteOpen || typeof document === "undefined") return undefined;
+      function closeOnEscape(event) {
+        if (event.key === "Escape") closeNodePalette();
+      }
+      document.addEventListener("keydown", closeOnEscape);
+      return function () { document.removeEventListener("keydown", closeOnEscape); };
+    }, [nodePaletteOpen]);
+
     function fail(err) {
       setError(errorMessage(err));
     }
@@ -1241,6 +1264,16 @@ import { renderInspector } from "./inspector.js";
 
     function activeSpec() {
       return parseJsonObject(editorText) || draftSpec || null;
+    }
+
+    function openNodePalette(groupName = "") {
+      setNodePaletteGroup(groupName);
+      setNodePaletteOpen(true);
+    }
+
+    function closeNodePalette() {
+      setNodePaletteOpen(false);
+      setNodePaletteGroup("");
     }
 
     function checklistSpec() {
@@ -2406,6 +2439,26 @@ import { renderInspector } from "./inspector.js";
       return clientPosition;
     }
 
+    function paletteNodePosition() {
+      const instance = flowInstanceRef.current;
+      const canvas = canvasRef.current;
+      const rect = canvas && typeof canvas.getBoundingClientRect === "function" ? canvas.getBoundingClientRect() : null;
+      if (instance && rect && typeof instance.screenToFlowPosition === "function") {
+        return snapFlowPosition(instance.screenToFlowPosition({
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2,
+        }));
+      }
+      return snapFlowPosition({ x: 280, y: 180 });
+    }
+
+    function addNodeFromPalette(type) {
+      const position = paletteNodePosition();
+      if (type === "manual" || type === "schedule" || type === "webhook") addTriggerOfType(type, position);
+      else addWorkflowCellAtPosition(type, position);
+      closeNodePalette();
+    }
+
     function deleteSelectedCell() {
       if (!selectedNode) return;
       const spec = activeSpec();
@@ -2996,6 +3049,7 @@ import { renderInspector } from "./inspector.js";
       const edges = spec ? flowEdges : [];
       return h("div", { className: "hermes-workflows-flow-surface" },
         h("div", {
+          ref: canvasRef,
           className: "hermes-workflows-canvas" + (isDragOver ? " hermes-workflows-canvas-drop-target" : ""),
           onDragOver: function (event) {
             event.preventDefault();
@@ -3006,7 +3060,7 @@ import { renderInspector } from "./inspector.js";
             event.preventDefault();
             setIsDragOver(false);
             const type = (event.dataTransfer && event.dataTransfer.getData("text/plain")) || window.__HERMES_DRAG_NODE_TYPE || "";
-            const dropPosition = flowPositionFromDropEvent(event);
+            const dropPosition = snapFlowPosition(flowPositionFromDropEvent(event));
             if (type === "manual" || type === "schedule" || type === "webhook") {
               addTriggerOfType(type, dropPosition);
             } else if (type) {
@@ -3092,6 +3146,15 @@ import { renderInspector } from "./inspector.js";
             )
           ),
           !spec ? renderCanvasOnboarding("hermes-workflows-canvas-onboarding") : null,
+          h(NodePaletteOverlay, {
+            createElement: h,
+            React: React,
+            isOpen: nodePaletteOpen,
+            nodePaletteGroup: nodePaletteGroup,
+            categories: NODE_CATEGORIES,
+            closeNodePalette: closeNodePalette,
+            onSelectNode: addNodeFromPalette,
+          }),
           contextMenu.visible ? h(React.Fragment, null,
             h("div", {
               className: "hermes-workflows-context-menu-overlay",
@@ -3649,6 +3712,7 @@ import { renderInspector } from "./inspector.js";
         setRunWorkflowId(workflowIdForDefinition(selectedDefinition));
         setRunPanelOpen(true);
       },
+      openNodePalette: openNodePalette,
       running: running,
       refresh: function () { refresh(); },
       loading: loading,
@@ -3767,34 +3831,36 @@ import { renderInspector } from "./inspector.js";
         ) : null,
         h("div", { className: "hermes-workflows-body" + (workspaceMode === "build" && selectedNode ? " has-inspector" : "") },
           h("div", { className: "hermes-workflows-palette-zone" },
-            renderPalette({
-            createElement: h,
-            React: React,
-            activeSpec: spec,
-            hideWorkflowForm: !spec,
-            goalText: goalText,
-            setGoalText: setGoalText,
-            newWorkflowName: newWorkflowName,
-            setNewWorkflowName: setNewWorkflowName,
-            draftFromGoal: draftFromGoal,
-            drafting: drafting,
-            startBlankWorkflow: startBlankWorkflow,
-            refineWorkflow: refineWorkflow,
-            refining: refining,
-            refineText: refineText,
-            setRefineText: setRefineText,
-            draftResult: draftResult,
-            candidateSource: candidateSource,
-            acceptDraftCandidate: acceptDraftCandidate,
-            rejectDraftCandidate: rejectDraftCandidate,
-            definitions: definitions,
-            selectedDefinition: selectedDefinition,
-            loadDefinition: loadDefinition,
-            executions: executions,
-            loadExecution: loadExecution,
-            addTriggerOfType: addTriggerOfType,
-            addWorkflowCellOfType: addWorkflowCellOfType,
-          })),
+            h(WorkflowRail, {
+              variant: "rail",
+              createElement: h,
+              React: React,
+              activeSpec: spec,
+              hideWorkflowForm: !spec,
+              goalText: goalText,
+              setGoalText: setGoalText,
+              newWorkflowName: newWorkflowName,
+              setNewWorkflowName: setNewWorkflowName,
+              draftFromGoal: draftFromGoal,
+              drafting: drafting,
+              startBlankWorkflow: startBlankWorkflow,
+              refineWorkflow: refineWorkflow,
+              refining: refining,
+              refineText: refineText,
+              setRefineText: setRefineText,
+              draftResult: draftResult,
+              candidateSource: candidateSource,
+              acceptDraftCandidate: acceptDraftCandidate,
+              rejectDraftCandidate: rejectDraftCandidate,
+              definitions: definitions,
+              selectedDefinition: selectedDefinition,
+              loadDefinition: loadDefinition,
+              executions: executions,
+              loadExecution: loadExecution,
+              libraryGroups: libraryGroups(NODE_CATEGORIES),
+              openNodePalette: openNodePalette,
+            })
+          ),
           h("div", { className: "hermes-workflows-canvas-zone" },
             renderActiveMode()
           ),
