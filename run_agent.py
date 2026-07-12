@@ -643,6 +643,74 @@ class AIAgent:
                 "Session DB creation failed (will retry next turn): %s", e
             )
 
+    # ── Session lease (Task4) ──────────────────────────────────────────────
+    # Conservative ownership claim on the session row. The lease is
+    # informational — agents touch it on every turn prologue, close()
+    # releases it, and reconciliation (separate caller, no background
+    # thread) ends expired rows + marks their sessions abandoned.
+    def _lease_owner_id_for(self) -> str:
+        """Stable owner id for this agent process.
+
+        Lazily built on first use so non-session-DB agents never pay for
+        it. Format mirrors _compression_lock_holder (pid:tid:agent-instance)
+        so the two locking systems share an identifiable owner shape.
+        """
+        owner = getattr(self, "_lease_owner_id", None)
+        if owner:
+            return owner
+        import os
+        import threading
+        owner = (
+            f"pid={os.getpid()}"
+            f":tid={threading.get_ident()}"
+            f":agent={id(self):x}"
+        )
+        self._lease_owner_id = owner
+        return owner
+
+    def _claim_or_touch_session_lease(self) -> None:
+        """First-turn claim; subsequent turns touch. Never raises.
+
+        Best-effort — the lease is informational. A failed claim (someone
+        else owns the lease) or DB error leaves the existing owner in
+        place; we don't compete, we just note our presence.
+        """
+        if getattr(self, "_persist_disabled", False):
+            return
+        db = getattr(self, "_session_db", None)
+        sid = getattr(self, "session_id", None)
+        if db is None or not sid:
+            return
+        try:
+            from agent.agent_init import SESSION_LEASE_TTL_SECONDS
+            owner = self._lease_owner_id_for()
+            # Try touch first; if that fails (no lease yet, or someone else
+            # owns it), fall back to claim. Order matters: subsequent
+            # turns almost always hit the touch path and skip the claim's
+            # DELETE-expired round-trip.
+            if not db.touch_session_lease(sid, owner, SESSION_LEASE_TTL_SECONDS):
+                db.claim_session_lease(sid, owner, SESSION_LEASE_TTL_SECONDS)
+        except Exception as exc:
+            logger.debug(
+                "session lease claim/touch skipped for %s: %s", sid, exc,
+            )
+
+    def _release_session_lease(self) -> None:
+        """Best-effort release on close. Never raises."""
+        if getattr(self, "_persist_disabled", False):
+            return
+        db = getattr(self, "_session_db", None)
+        sid = getattr(self, "session_id", None)
+        owner = getattr(self, "_lease_owner_id", None)
+        if db is None or not sid or not owner:
+            return
+        try:
+            db.release_session_lease(sid, owner)
+        except Exception as exc:
+            logger.debug(
+                "session lease release skipped for %s: %s", sid, exc,
+            )
+
     def _transition_context_engine_session(
         self,
         *,
@@ -3631,6 +3699,19 @@ class AIAgent:
                     session_end_failed = True
                 else:
                     self._session_end_called = True
+
+            # Session lease release (Task4): after end_session so the
+            # lease is the last thing we touch on the row in this
+            # process. Best-effort and never raises (helper swallows).
+            if (
+                not session_end_failed
+                and session_db is not None
+                and session_id
+            ):
+                try:
+                    self._release_session_lease()
+                except Exception:
+                    pass
 
             if (
                 not session_end_failed

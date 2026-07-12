@@ -361,6 +361,10 @@ def build_turn_context(
             exc_info=True,
         )
 
+    # Conservative session lease (Task4): first turn claims, subsequent
+    # turns extend. Best-effort — never raises; lease is informational.
+    agent._claim_or_touch_session_lease()
+
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.
     # See ``_should_run_preflight_estimate`` for the OR semantics that fix

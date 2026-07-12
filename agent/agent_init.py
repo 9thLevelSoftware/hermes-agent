@@ -58,6 +58,14 @@ from utils import base_url_host_matches, is_truthy_value
 # from inside that module.)
 logger = logging.getLogger("run_agent")
 
+# Conservative session-lease TTL (Task4): an agent that hasn't touched
+# its lease within this window is considered abandoned by reconciliation.
+# 7 days is the default ceiling on a stuck CLI process, long enough that
+# a multi-day agent that crashed mid-conversation can be reclaimed without
+# interfering with normal long-running turns. Picked deliberately large
+# to avoid churn — the lease is informational, not a heartbeat.
+SESSION_LEASE_TTL_SECONDS = 7 * 24 * 60 * 60.0  # 604800s
+
 
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
@@ -1297,6 +1305,11 @@ def init_agent(
     # continuation row that must remain open after the helper is torn down;
     # those callers explicitly set this flag to False.
     agent._end_session_on_close = True
+    # Session lease owner id (Task4): pid:tid:agent-instance — used by
+    # claim/touch/release to fence multi-agent races on the same session
+    # row. Populated lazily on first turn prologue (needs a real pid) so
+    # non-session-DB agents never reach for it.
+    agent._lease_owner_id = None
     # When True, this agent NEVER persists to the canonical session store
     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
     # background skill/memory review fork so its harness turn can't leak into

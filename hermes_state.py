@@ -809,6 +809,14 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_leases (
+    session_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS agent_operations (
     operation_id TEXT NOT NULL PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -2495,6 +2503,185 @@ class SessionDB:
         if row is None:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Session leases
+    # ──────────────────────────────────────────────────────────────────────
+    # Conservative ownership claim on a session row, time-bounded by TTL.
+    # Reclamation is end-only (no live takeover): reconciliation ends
+    # EXPIRED lease rows and marks the session as ``abandoned``. Unleased
+    # open sessions are untouched. There is no background heartbeat thread
+    # — agents touch on every turn, and reconciliation runs synchronously
+    # from explicit callers (startup sweep, before/after flush, etc.).
+    def claim_session_lease(
+        self,
+        session_id: str,
+        owner_id: str,
+        ttl_seconds: float,
+    ) -> bool:
+        """Claim the session lease for ``owner_id`` if no live lease exists.
+
+        Returns True when ``owner_id`` now owns the lease (either inserted
+        fresh or reclaimed from an EXPIRED row). Returns False when a
+        live lease is held by someone else. Also returns False when the
+        session row does not exist (no FK target to lease against).
+        """
+        if not session_id or not owner_id or ttl_seconds <= 0:
+            return False
+        now = time.time()
+        expires_at = now + ttl_seconds
+
+        def _do(conn):
+            # Reclaim expired rows first so the INSERT below can race-free
+            # acquire the slot. Mirrors try_acquire_compression_lock.
+            conn.execute(
+                "DELETE FROM session_leases "
+                "WHERE session_id = ? AND expires_at < ?",
+                (session_id, now),
+            )
+            # Verify the session row exists — FK is enforced on cascade
+            # but we want claim() to return False for unknown ids, not
+            # raise IntegrityError.
+            exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if exists is None:
+                return False
+            conn.execute(
+                "INSERT OR IGNORE INTO session_leases "
+                "(session_id, owner_id, acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, owner_id, now, expires_at),
+            )
+            row = conn.execute(
+                "SELECT owner_id FROM session_leases WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None and (
+                row["owner_id"] if isinstance(row, sqlite3.Row) else row[0]
+            ) == owner_id
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "claim_session_lease(%s, %s) failed: %s",
+                session_id, owner_id, exc,
+            )
+            return False
+
+    def touch_session_lease(
+        self,
+        session_id: str,
+        owner_id: str,
+        ttl_seconds: float,
+    ) -> bool:
+        """Extend the session lease TTL iff ``owner_id`` still owns it.
+
+        Returns True on a successful extension, False otherwise (no lease,
+        wrong owner, DB error). Fail-open callers (run_conversation
+        prologue) just skip — the lease is informational, not blocking.
+        """
+        if not session_id or not owner_id or ttl_seconds <= 0:
+            return False
+        now = time.time()
+        expires_at = now + ttl_seconds
+
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE session_leases SET expires_at = ? "
+                "WHERE session_id = ? AND owner_id = ? AND expires_at >= ?",
+                (expires_at, session_id, owner_id, now),
+            )
+            return cur.rowcount > 0
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "touch_session_lease(%s, %s) failed: %s",
+                session_id, owner_id, exc,
+            )
+            return False
+
+    def release_session_lease(self, session_id: str, owner_id: str) -> bool:
+        """Release the session lease iff ``owner_id`` owns it.
+
+        Returns True if a row was deleted, False if no matching lease
+        existed (idempotent — release of an already-released or never-
+        claimed session is a no-op success on the caller's side).
+        """
+        if not session_id or not owner_id:
+            return False
+
+        def _do(conn):
+            cur = conn.execute(
+                "DELETE FROM session_leases "
+                "WHERE session_id = ? AND owner_id = ?",
+                (session_id, owner_id),
+            )
+            return cur.rowcount > 0
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "release_session_lease(%s, %s) failed: %s",
+                session_id, owner_id, exc,
+            )
+            return False
+
+    def reconcile_expired_session_leases(
+        self,
+        now: Optional[float] = None,
+    ) -> int:
+        """End only EXPIRED lease rows; mark their sessions ``abandoned``.
+
+        Conservative: unleased open sessions are untouched, and sessions
+        already ended for another reason (compression, agent_close, ...)
+        are NOT overwritten — lease reclamation only marks live sessions.
+
+        Returns the number of lease rows reclaimed. Runs synchronously —
+        callers (startup sweep, before/after flush) decide cadence.
+        """
+        if now is None:
+            now = time.time()
+
+        def _do(conn):
+            expired = conn.execute(
+                "SELECT session_id, expires_at FROM session_leases "
+                "WHERE expires_at < ?",
+                (now,),
+            ).fetchall()
+            if not expired:
+                return 0
+            ids = [row["session_id"] for row in expired]
+            ph = ",".join("?" * len(ids))
+            # End the live sessions with reason 'abandoned', pinned to
+            # expires_at (not `now`) so the ended_at reflects the actual
+            # TTL expiry rather than the reconciliation wall clock. Only
+            # sessions that are still open are touched — already-ended
+            # sessions keep their original end_reason.
+            pairs = [
+                (row["expires_at"], row["session_id"]) for row in expired
+            ]
+            for expires_at, sid in pairs:
+                conn.execute(
+                    "UPDATE sessions SET ended_at = ?, end_reason = 'abandoned' "
+                    "WHERE id = ? AND ended_at IS NULL",
+                    (expires_at, sid),
+                )
+            conn.execute(
+                f"DELETE FROM session_leases WHERE session_id IN ({ph})",
+                ids,
+            )
+            return len(ids)
+
+        try:
+            return int(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("reconcile_expired_session_leases failed: %s", exc)
+            return 0
 
     def update_session_meta(
         self,
