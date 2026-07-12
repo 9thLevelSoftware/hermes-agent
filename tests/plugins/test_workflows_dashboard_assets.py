@@ -185,8 +185,9 @@ def test_workflow_dashboard_supports_drag_from_palette_to_canvas() -> None:
     assert "onDragOver" in text
     assert "onDrop" in text
     assert "HERMES_DRAG_NODE_TYPE" in text
-    assert 'if (type === "manual" || type === "schedule")' in text
-    assert "addTriggerOfType(type)" in text
+    assert 'if (type === "manual" || type === "schedule" || type === "webhook")' in text
+    assert "addTriggerOfType(type, dropPosition)" in text
+    assert "addWorkflowCellAtPosition(type, dropPosition)" in text
     assert "function addWorkflowCellAtPosition" in text
     assert "hermes-workflows-canvas-drop-target" in text
 
@@ -273,8 +274,10 @@ def test_workflow_dashboard_execution_tab_does_not_duplicate_node_runs() -> None
     text = BUNDLE.read_text(encoding="utf-8")
     start = text.index("function renderBottomPanel")
     bottom_body = text[start : text.index("var spec = activeSpec", start)]
+    panels = (ROOT / "plugins" / "workflows" / "dashboard" / "src" / "panels.js").read_text(encoding="utf-8")
     assert "renderNodeRuns(), renderTimeline()" not in bottom_body
-    assert "renderTimeline()" in bottom_body
+    assert "renderBottomPanelModule(" in text
+    assert "renderTimeline" in panels
 
 
 def test_workflow_dashboard_uses_three_zone_builder_layout() -> None:

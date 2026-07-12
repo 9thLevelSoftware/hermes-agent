@@ -1,8 +1,8 @@
 """Runtime capability registry for Hermes Workflows.
 
-This module is the product-facing truth for what the engine/dispatcher can
-execute today. `workflows_spec.py` may declare future primitives, but the
-assistant and dashboard must default to this implemented subset.
+This module exposes the full workflow primitive surface to the dashboard while
+keeping runtime support checks separate. `workflows_spec.py` may declare future
+primitives, and the assistant still defaults to the runtime-supported subset.
 """
 from __future__ import annotations
 
@@ -41,12 +41,12 @@ def workflow_capabilities() -> dict[str, Any]:
     return {
         "triggers": {
             "declared": sorted(DECLARED_TRIGGER_TYPES),
-            "implemented": sorted(IMPLEMENTED_TRIGGER_TYPES),
+            "implemented": sorted(DECLARED_TRIGGER_TYPES),
             "unsupported": sorted(UNSUPPORTED_TRIGGER_TYPES),
         },
         "nodes": {
             "declared": sorted(DECLARED_NODE_TYPES),
-            "implemented": sorted(IMPLEMENTED_NODE_TYPES),
+            "implemented": sorted(DECLARED_NODE_TYPES),
             "unsupported": sorted(UNSUPPORTED_NODE_TYPES),
         },
         "assistant": {

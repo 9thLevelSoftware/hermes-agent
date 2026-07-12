@@ -16,6 +16,41 @@ function isMode(value) {
   return WORKSPACE_MODES.indexOf(value) !== -1;
 }
 
+export function snapFlowPosition(position, gridSize = 20) {
+  const size = Number.isFinite(gridSize) && gridSize > 0 ? gridSize : 20;
+  const x = Number.isFinite(position && position.x) ? position.x : 0;
+  const y = Number.isFinite(position && position.y) ? position.y : 0;
+  return { x: Math.round(x / size) * size, y: Math.round(y / size) * size };
+}
+
+export function centeredFlowPosition(viewport, nodeSize = { width: 160, height: 88 }) {
+  const view = viewport && typeof viewport === "object" ? viewport : {};
+  const size = nodeSize && typeof nodeSize === "object" ? nodeSize : {};
+  const zoom = Number.isFinite(view.zoom) && view.zoom > 0 ? view.zoom : 1;
+  const x = Number.isFinite(view.x) ? view.x : 0;
+  const y = Number.isFinite(view.y) ? view.y : 0;
+  const width = Number.isFinite(view.width) ? view.width : 0;
+  const height = Number.isFinite(view.height) ? view.height : 0;
+  const nodeWidth = Number.isFinite(size.width) ? size.width : 160;
+  const nodeHeight = Number.isFinite(size.height) ? size.height : 88;
+  return snapFlowPosition({
+    x: x + (width - nodeWidth) / (2 * zoom),
+    y: y + (height - nodeHeight) / (2 * zoom),
+  });
+}
+
+export function libraryGroups(categories) {
+  if (!Array.isArray(categories)) return [];
+  return categories.map(function (category) {
+    const nodes = category && Array.isArray(category.nodes) ? category.nodes : [];
+    return {
+      name: category && category.name,
+      color: category && category.color,
+      types: nodes.filter(Array.isArray).map(function (node) { return node[0]; }),
+    };
+  });
+}
+
 function trimSlashes(value) {
   return String(value || "").replace(/^\/+|\/+$/g, "");
 }
