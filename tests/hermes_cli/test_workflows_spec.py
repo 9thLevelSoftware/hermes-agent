@@ -500,6 +500,25 @@ def test_schedule_trigger_accepts_valid_cron_and_expr_alias():
     validate_graph(WorkflowSpec.model_validate(spec))
 
 
+@pytest.mark.parametrize("path", [None, "", "   "])
+def test_webhook_trigger_requires_non_blank_path(path):
+    raw = _minimal_spec()
+    raw["triggers"] = [{"type": "webhook", "path": path}]
+
+    with pytest.raises(ValueError, match="webhook trigger requires path"):
+        validate_graph(WorkflowSpec.model_validate(raw))
+
+
+def test_webhook_and_kanban_event_triggers_validate():
+    raw = _minimal_spec()
+    raw["triggers"] = [
+        {"type": "webhook", "path": "/events"},
+        {"type": "kanban_event"},
+    ]
+
+    validate_graph(WorkflowSpec.model_validate(raw))
+
+
 def test_unknown_workflow_field_rejected_with_suggestion():
     from hermes_cli.workflows_spec import reject_unknown_spec_fields
 

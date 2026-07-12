@@ -77,6 +77,7 @@ class TriggerSpec(BaseModel):
     cron: str | None = None
     schedule: str | None = None
     expr: str | None = None
+    path: str | None = None
     input: dict[str, Any] = Field(default_factory=dict)
     input_schema: dict[str, InputFieldSpec] = Field(default_factory=dict)
     intake: TriggerIntakeSpec = Field(default_factory=TriggerIntakeSpec)
@@ -430,6 +431,8 @@ def validate_graph(spec: WorkflowSpec) -> None:
                 raise ValueError(
                     f"invalid cron expression on trigger {trigger_label!r}: {expr!r} ({exc})"
                 ) from exc
+        if trigger.type == "webhook" and not (trigger.path or "").strip():
+            raise ValueError("webhook trigger requires path")
 
     if not spec.nodes:
         raise ValueError("workflow must define at least one node")
