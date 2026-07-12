@@ -496,6 +496,7 @@ class AIAgent:
         load_soul_identity: bool = False,
         skip_memory: bool = False,
         session_db=None,
+        owns_session_db: bool = False,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
@@ -573,6 +574,7 @@ class AIAgent:
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
             session_db=session_db,
+            owns_session_db=owns_session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
             fallback_model=fallback_model,
@@ -3595,14 +3597,32 @@ class AIAgent:
         # must leave it open). end_session() is first-reason-wins and no-ops on
         # an already-ended row, so this never clobbers a 'compression' /
         # 'cron_complete' / 'cli_close' reason set by an earlier terminal path.
-        try:
-            if getattr(self, "_end_session_on_close", True):
-                session_db = getattr(self, "_session_db", None)
-                session_id = getattr(self, "session_id", None)
-                if session_db and session_id:
-                    session_db.end_session(session_id, "agent_close")
-        except Exception:
-            pass
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "session_id", None)
+        if (
+            getattr(self, "_end_session_on_close", True)
+            and not getattr(self, "_session_end_called", False)
+            and session_db is not None
+            and session_id
+        ):
+            try:
+                session_db.end_session(session_id, "agent_close")
+            except Exception:
+                pass
+            finally:
+                self._session_end_called = True
+
+        if (
+            getattr(self, "_owns_session_db", False)
+            and not getattr(self, "_session_db_closed", False)
+            and session_db is not None
+        ):
+            try:
+                session_db.close()
+            except Exception:
+                pass
+            finally:
+                self._session_db_closed = True
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """

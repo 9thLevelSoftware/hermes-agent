@@ -435,6 +435,33 @@ class TestDelegateTask(unittest.TestCase):
 
         self.assertIs(mock_child._print_fn, sink)
 
+    def test_child_forks_parent_session_db_and_owns_handle(self):
+        parent = _make_mock_parent(depth=0)
+        parent_db = MagicMock()
+        child_db = MagicMock()
+        parent_db.fork.return_value = child_db
+        parent._session_db = parent_db
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Isolate database ownership",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+            _, kwargs = MockAgent.call_args
+
+        parent_db.fork.assert_called_once_with()
+        self.assertIs(kwargs["session_db"], child_db)
+        self.assertTrue(kwargs["owns_session_db"])
+
     def test_child_uses_thinking_callback_when_progress_callback_available(self):
         parent = _make_mock_parent(depth=0)
         parent.tool_progress_callback = MagicMock()

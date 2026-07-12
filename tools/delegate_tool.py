@@ -1317,6 +1317,13 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
+    parent_session_db = getattr(parent_agent, "_session_db", None)
+    child_session_db = None
+    child_owns_session_db = False
+    if parent_session_db is not None:
+        child_session_db = parent_session_db.fork()
+        child_owns_session_db = True
+
     child = AIAgent(
         base_url=effective_base_url,
         api_key=effective_api_key,
@@ -1339,7 +1346,8 @@ def _build_child_agent(
         skip_memory=True,
         clarify_callback=None,
         thinking_callback=child_thinking_cb,
-        session_db=getattr(parent_agent, "_session_db", None),
+        session_db=child_session_db,
+        owns_session_db=child_owns_session_db,
         parent_session_id=getattr(parent_agent, "session_id", None),
         providers_allowed=child_providers_allowed,
         providers_ignored=child_providers_ignored,

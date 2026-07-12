@@ -1016,6 +1016,10 @@ class SessionDB:
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
 
+    def fork(self):
+        """Open an independently-owned handle to the same database."""
+        return type(self)(db_path=self.db_path, read_only=self.read_only)
+
     # ── Core write helper ──
 
     @staticmethod

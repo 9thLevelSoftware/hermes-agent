@@ -321,6 +321,7 @@ def init_agent(
     load_soul_identity: bool = False,
     skip_memory: bool = False,
     session_db=None,
+    owns_session_db: bool = False,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
     fallback_model: Dict[str, Any] = None,
@@ -1283,6 +1284,9 @@ def init_agent(
     
     # SQLite session store (optional -- provided by CLI or gateway)
     agent._session_db = session_db
+    agent._owns_session_db = bool(owns_session_db)
+    agent._session_db_closed = False
+    agent._session_end_called = False
     agent._parent_session_id = parent_session_id
     agent._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
     agent._session_db_created = False  # DB row deferred to run_conversation()
