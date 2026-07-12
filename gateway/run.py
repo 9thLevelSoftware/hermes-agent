@@ -2919,9 +2919,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
         self._adapter_state_lock = threading.Lock()
-        # ponytail: fatal adapters are rare; retain identities to dedup callbacks
-        # without holding the lock across adapter teardown.
-        self._fatal_adapter_claims: set[int] = set()
+        # ponytail: fatal adapters are rare; weak claims dedup callbacks without
+        # retaining disconnected adapter instances.
+        self._fatal_adapter_claims: _weakref.WeakSet[BasePlatformAdapter] = _weakref.WeakSet()
         self._runtime_health = RuntimeHealthRegistry()
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
@@ -4090,6 +4090,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("Failed to sync gateway session model metadata", exc_info=True)
 
+    def _resolve_adapter_owner(
+        self, adapter: BasePlatformAdapter
+    ) -> Optional[Dict[Platform, BasePlatformAdapter]]:
+        """Return the registry currently owning ``adapter``, if any."""
+        if self.adapters.get(adapter.platform) is adapter:
+            return self.adapters
+        for profile_adapters in getattr(self, "_profile_adapters", {}).values():
+            if profile_adapters.get(adapter.platform) is adapter:
+                return profile_adapters
+        return None
+
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
 
@@ -4102,15 +4113,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._adapter_state_lock = lock
         claims = getattr(self, "_fatal_adapter_claims", None)
         if claims is None:
-            claims = set()
+            claims = _weakref.WeakSet()
             self._fatal_adapter_claims = claims
 
         # Atomically claim the adapter before recording health or awaiting
-        # teardown. Primary-profile adapters are removed here; secondary-profile
-        # adapters are still allowed through when they are not in self.adapters.
+        # teardown. Scan both primary and secondary registries so same-platform
+        # adapters in different profiles do not look stale to one another.
         with lock:
-            existing = self.adapters.get(adapter.platform)
-            if existing is not None and existing is not adapter:
+            owner = self._resolve_adapter_owner(adapter)
+            if owner is None and (
+                self.adapters.get(adapter.platform) is not None
+                or any(
+                    profile_adapters.get(adapter.platform) is not None
+                    for profile_adapters in getattr(self, "_profile_adapters", {}).values()
+                )
+            ):
                 logger.debug(
                     "Ignoring stale fatal error from a superseded %s adapter instance: %s",
                     adapter.platform.value,
@@ -4118,19 +4135,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
 
-            adapter_id = id(adapter)
-            if adapter_id in claims:
+            if adapter in claims:
                 logger.debug(
                     "Ignoring repeated fatal error from %s adapter instance: %s",
                     adapter.platform.value,
                     adapter.fatal_error_code or "unknown",
                 )
                 return
-            claims.add(adapter_id)
-            owns_primary_slot = existing is adapter
-            if owns_primary_slot:
-                self.adapters.pop(adapter.platform, None)
-                self.delivery_router.adapters = self.adapters
+            claims.add(adapter)
+            owns_adapter_slot = owner is not None
+            if owns_adapter_slot:
+                owner.pop(adapter.platform, None)
+                if owner is self.adapters:
+                    self.delivery_router.adapters = self.adapters
 
         failure_error = (
             adapter.fatal_error_message
@@ -4168,7 +4185,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             error_message=adapter.fatal_error_message,
         )
 
-        if owns_primary_slot:
+        if owns_adapter_slot:
             # Disconnect outside the lock so adapter teardown can yield safely.
             await adapter.disconnect()
 

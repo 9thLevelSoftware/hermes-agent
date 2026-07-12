@@ -207,3 +207,45 @@ def test_collect_runtime_readiness_strips_platform_secrets_and_raw_errors(tmp_pa
             "suppressed_failures": 1,
         }
     }
+
+
+def test_collect_runtime_readiness_prefers_live_health_over_stale_runtime_status(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        "gateway.readiness._live_platform_health",
+        lambda: {
+            "telegram": {
+                "health_state": "degraded",
+                "next_probe_at": 42.0,
+                "suppressed_failures": 2,
+            }
+        },
+    )
+
+    result = collect_runtime_readiness(
+        configured_model="model",
+        runtime_status={
+            "gateway_state": "running",
+            "platforms": {
+                "telegram": {
+                    "state": "connected",
+                    "health_state": "healthy",
+                    "next_probe_at": 0.0,
+                    "suppressed_failures": 0,
+                }
+            },
+        },
+    )
+
+    gateway = result["checks"]["gateway"]
+    assert result["status"] == "degraded"
+    assert gateway["degraded"] == 1
+    assert gateway["platform_health"]["telegram"] == {
+        "health_state": "degraded",
+        "next_probe_at": 42.0,
+        "suppressed_failures": 2,
+    }

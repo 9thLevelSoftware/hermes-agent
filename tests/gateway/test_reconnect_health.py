@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import weakref
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -48,7 +49,7 @@ def _make_runner(registry: RuntimeHealthRegistry | None = None) -> GatewayRunner
     runner._runtime_health = registry or RuntimeHealthRegistry()
     runner._running = True
     runner._adapter_state_lock = threading.Lock()
-    runner._fatal_adapter_claims = set()
+    runner._fatal_adapter_claims = weakref.WeakSet()
     runner._failed_platforms = {
         Platform.TELEGRAM: {
             "config": PlatformConfig(enabled=True, token="test"),
@@ -215,3 +216,25 @@ async def test_concurrent_fatal_notifications_record_health_and_disconnect_once(
     assert len([record for record in caplog.records if "Fatal telegram adapter error" in record.message]) == 1
     assert disconnect_calls == 1
     assert Platform.TELEGRAM not in runner.adapters
+
+
+@pytest.mark.asyncio
+async def test_secondary_profile_fatal_is_handled_when_primary_owns_same_platform():
+    runner = _make_runner()
+    primary = _Adapter()
+    secondary = _Adapter()
+    secondary._set_fatal_error("telegram_runtime", "secondary outage", retryable=True)
+    runner.adapters = {Platform.TELEGRAM: primary}
+    runner._profile_adapters = {"secondary": {Platform.TELEGRAM: secondary}}
+    runner.delivery_router.adapters = runner.adapters
+    runner.stop = AsyncMock()
+    secondary.disconnect = AsyncMock()
+    primary.disconnect = AsyncMock()
+
+    await runner._handle_adapter_fatal_error(secondary)
+
+    secondary.disconnect.assert_awaited_once_with()
+    primary.disconnect.assert_not_awaited()
+    assert Platform.TELEGRAM not in runner._profile_adapters["secondary"]
+    assert Platform.TELEGRAM in runner.adapters
+    runner.stop.assert_not_awaited()

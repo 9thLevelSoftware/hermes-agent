@@ -93,7 +93,7 @@ def _probe_gateway(runtime_status: dict[str, Any]) -> dict[str, Any]:
             if platform_state in {"connected", "running", "ok"}:
                 connected += 1
             live = live_health.get(str(name), {})
-            health_state = str(value.get("health_state") or live.get("health_state") or "").lower()
+            health_state = str(live.get("health_state") or value.get("health_state") or "").lower()
             if health_state not in {"healthy", "degraded", "open_circuit", "probing"}:
                 health_state = "healthy" if platform_state in {"connected", "running", "ok"} else "degraded"
             elif health_state == "healthy" and platform_state not in {"connected", "running", "ok"}:
@@ -101,14 +101,14 @@ def _probe_gateway(runtime_status: dict[str, Any]) -> dict[str, Any]:
                 # fail closed while a platform is retrying or otherwise down.
                 health_state = "degraded"
             try:
-                next_probe_at = float(value.get("next_probe_at", live.get("next_probe_at", 0.0)))
+                next_probe_at = float(live.get("next_probe_at", value.get("next_probe_at", 0.0)))
                 if not math.isfinite(next_probe_at) or next_probe_at < 0:
                     next_probe_at = 0.0
             except (TypeError, ValueError):
                 next_probe_at = 0.0
             try:
                 suppressed_failures = max(
-                    0, int(value.get("suppressed_failures", live.get("suppressed_failures", 0)))
+                    0, int(live.get("suppressed_failures", value.get("suppressed_failures", 0)))
                 )
             except (TypeError, ValueError):
                 suppressed_failures = 0
