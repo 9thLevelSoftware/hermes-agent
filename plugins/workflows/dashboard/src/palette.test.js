@@ -1,6 +1,9 @@
 import { createRequire } from "node:module";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { renderPalette, renderWorkflowOnboarding } from "./palette.js";
+import { renderPalette, renderWorkflowOnboarding, renderWorkflowRail } from "./palette.js";
 
 const require = createRequire(import.meta.url);
 const reactDomRequire = createRequire(require.resolve("react-dom/client"));
@@ -12,6 +15,9 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const h = (tag, props, ...children) => ({ tag, props, children });
 const noop = () => {};
 const fakeReact = { Fragment: "Fragment", useState: (initial) => [initial, noop] };
+
+const sourceDir = path.dirname(fileURLToPath(import.meta.url));
+const cssSource = fs.readFileSync(path.join(sourceDir, "style.css"), "utf8");
 
 function props(overrides = {}) {
   return Object.assign({
@@ -40,6 +46,8 @@ function props(overrides = {}) {
     loadExecution: () => Promise.resolve(),
     addTriggerOfType: noop,
     addWorkflowCellOfType: noop,
+    libraryGroups: [],
+    openNodePalette: noop,
   }, overrides);
 }
 
@@ -128,5 +136,103 @@ describe("renderPalette", () => {
       act(() => root.unmount());
       container.remove();
     }
+  });
+});
+
+describe("renderWorkflowRail", () => {
+  it("returns an element with the rail class", () => {
+    const node = renderWorkflowRail(props({ variant: "rail" }));
+    expect(node.props.className).toContain("hermes-workflows-rail");
+  });
+
+  it("renders Workflows / Executions / Library sections with disclosure buttons", () => {
+    const node = renderWorkflowRail(props({
+      variant: "rail",
+      libraryGroups: [
+        { name: "Triggers", color: "trigger", types: ["manual"] },
+        { name: "AI & Logic", color: "agent_task", types: ["agent_task"] },
+      ],
+    }));
+    expect(contains(node, (value) => value === "Workflows")).toBe(true);
+    expect(contains(node, (value) => value === "Executions")).toBe(true);
+    expect(contains(node, (value) => value === "Library")).toBe(true);
+    const disclosures = [];
+    contains(node, (n) => {
+      if (n && typeof n === "object" && n.tag === "button" && n.props && n.props["aria-expanded"] !== undefined) {
+        disclosures.push(n);
+      }
+      return false;
+    });
+    expect(disclosures.length).toBeGreaterThanOrEqual(3);
+    for (const disclosure of disclosures) {
+      expect(disclosure.props["aria-expanded"]).toMatch(/true|false/);
+      expect(disclosure.props["aria-controls"]).toBeTruthy();
+    }
+  });
+
+  it("calls openNodePalette with the group name when a library group is clicked", () => {
+    let captured = null;
+    const openNodePalette = (name) => { captured = name; };
+    const node = renderWorkflowRail(props({
+      variant: "rail",
+      openNodePalette,
+      libraryGroups: [
+        { name: "Triggers", color: "trigger", types: ["manual"] },
+        { name: "Actions", color: "send_message", types: ["send_message"] },
+      ],
+    }));
+    // Find the Triggers group disclosure button and click it
+    let triggersButton = null;
+    contains(node, (n) => {
+      if (n && typeof n === "object" && n.tag === "button" && n.props && n.props["aria-controls"] === "rail-library-group-triggers") {
+        triggersButton = n;
+      }
+      return false;
+    });
+    expect(triggersButton).not.toBeNull();
+    triggersButton.props.onClick();
+    expect(captured).toBe("Triggers");
+  });
+
+  it("still shows definitions and executions when hideWorkflowForm is true", () => {
+    const node = renderWorkflowRail(props({
+      variant: "rail",
+      hideWorkflowForm: true,
+      definitions: [{ id: "existing", name: "Existing workflow", enabled: true }],
+      executions: [{ id: "execution-1", status: "succeeded" }],
+    }));
+    const json = JSON.stringify(node);
+    expect(json).not.toContain("Generate From Prompt");
+    expect(json).toContain("Existing workflow");
+    expect(json).toContain("Executions");
+  });
+
+  it("keeps the AI-first Draft/Refine controls when hideWorkflowForm is false", () => {
+    const node = renderWorkflowRail(props({
+      variant: "rail",
+      activeSpec: null,
+      hideWorkflowForm: false,
+    }));
+    const json = JSON.stringify(node);
+    expect(json).toContain("Generate From Prompt");
+    expect(json).toContain("Start From Scratch");
+  });
+});
+
+describe("workflow rail CSS contract", () => {
+  it("makes .hermes-workflows-rail the sole scroll container", () => {
+    expect(cssSource).toMatch(/\.hermes-workflows-rail\s*\{[^}]*overflow-y:\s*auto/s);
+    expect(cssSource).toMatch(/\.hermes-workflows-rail\s*\{[^}]*overscroll-behavior:\s*contain/s);
+    expect(cssSource).toMatch(/\.hermes-workflows-rail\s*\{[^}]*min-height:\s*0/s);
+  });
+
+  it("resets child overflow inside the rail", () => {
+    expect(cssSource).toMatch(/\.hermes-workflows-rail\s+\.hermes-workflows-palette-panel\s*\{[^}]*overflow:\s*visible/s);
+  });
+
+  it("hides the legacy palette tabs that are not part of the rail", () => {
+    // The old Workflows/Nodes tab buttons must not be reachable from the rail.
+    // Either the class is display:none or the parent that owns it is hidden.
+    expect(cssSource).toMatch(/\.hermes-workflows-palette-tabs\s*\{[^}]*display:\s*none/s);
   });
 });

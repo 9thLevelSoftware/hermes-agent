@@ -1416,8 +1416,7 @@
 }
 
 .hermes-workflows .hermes-workflows-palette-tabs {
-  display: flex;
-  border-bottom: 1px solid var(--color-border);
+  display: none;
 }
 
 .hermes-workflows .hermes-workflows-palette-tab {
@@ -1464,6 +1463,98 @@
 
 .hermes-workflows .hermes-workflows-palette-category:first-child {
   margin-top: 0.25rem;
+}
+
+/* Compact workflow rail: single scroll container, three disclosures. */
+.hermes-workflows .hermes-workflows-rail {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.hermes-workflows .hermes-workflows-rail .hermes-workflows-palette-panel {
+  overflow: visible;
+}
+
+.hermes-workflows .hermes-workflows-rail-section {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.hermes-workflows .hermes-workflows-rail-section:last-child {
+  border-bottom: none;
+}
+
+.hermes-workflows .hermes-workflows-rail-disclosure {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0.35rem 0;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-muted-foreground);
+  cursor: pointer;
+}
+
+.hermes-workflows .hermes-workflows-rail-disclosure-caret {
+  transition: transform 0.15s;
+}
+
+.hermes-workflows .hermes-workflows-rail-disclosure:not(.is-expanded) .hermes-workflows-rail-disclosure-caret {
+  transform: rotate(-90deg);
+}
+
+.hermes-workflows .hermes-workflows-rail-library-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.hermes-workflows .hermes-workflows-rail-library-group-button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: 0.4rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.82rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.hermes-workflows .hermes-workflows-rail-library-group-button:hover {
+  background: color-mix(in srgb, var(--color-border) 30%, transparent);
+}
+
+.hermes-workflows .hermes-workflows-rail-library-group-count {
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+}
+
+.hermes-workflows .hermes-workflows-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .hermes-workflows .hermes-workflows-rf-node-header {

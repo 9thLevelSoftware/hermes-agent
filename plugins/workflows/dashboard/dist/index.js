@@ -964,6 +964,7 @@
 		return props.createElement("div", { className: "hermes-workflows-onboarding-form" }, renderWorkflowForm(props.createElement, props));
 	}
 	function renderPalette(props) {
+		if (props && props.variant === "rail") return renderWorkflowRail(props);
 		const h = props.createElement;
 		const React = props.React || {};
 		const useState = React.useState || function(initial) {
@@ -1098,6 +1099,103 @@
 			role: "tabpanel",
 			"aria-label": "Workflows"
 		}, props.hideWorkflowForm ? null : renderWorkflowForm(h, props), renderDefinitions(), renderExecutions()));
+	}
+	function renderWorkflowRail(props) {
+		const h = props.createElement;
+		const useState = (props.React || {}).useState || function(initial) {
+			return [initial, function() {}];
+		};
+		const definitions = Array.isArray(props.definitions) ? props.definitions : [];
+		const executions = Array.isArray(props.executions) ? props.executions : [];
+		const groups = Array.isArray(props.libraryGroups) ? props.libraryGroups : [];
+		const call = function(handler) {
+			if (typeof handler === "function") return handler.apply(null, Array.prototype.slice.call(arguments, 1));
+		};
+		const workflowsExpandedState = useState(true);
+		const executionsExpandedState = useState(true);
+		const libraryExpandedState = useState(true);
+		const [workflowsExpanded, setWorkflowsExpanded] = workflowsExpandedState;
+		const [executionsExpanded, setExecutionsExpanded] = executionsExpandedState;
+		const [libraryExpanded, setLibraryExpanded] = libraryExpandedState;
+		function disclosure(label, controlsId, expanded, setExpanded) {
+			return h("button", {
+				type: "button",
+				className: "hermes-workflows-rail-disclosure" + (expanded ? " is-expanded" : ""),
+				"aria-expanded": expanded ? "true" : "false",
+				"aria-controls": controlsId,
+				onClick: function() {
+					setExpanded(!expanded);
+				}
+			}, h("span", { className: "hermes-workflows-rail-disclosure-label" }, label), h("span", {
+				className: "hermes-workflows-rail-disclosure-caret",
+				"aria-hidden": "true"
+			}, "▾"));
+		}
+		const workflowsSection = h("section", { className: "hermes-workflows-rail-section hermes-workflows-rail-workflows" }, disclosure("Workflows", "hermes-workflows-rail-workflows-panel", workflowsExpanded, setWorkflowsExpanded), workflowsExpanded ? h("div", {
+			id: "hermes-workflows-rail-workflows-panel",
+			className: "hermes-workflows-palette-panel"
+		}, props.hideWorkflowForm ? null : renderWorkflowForm(h, props), definitions.length ? h("div", { className: "hermes-workflows-sidebar-list" }, definitions.map(function(definition) {
+			const id = definition.workflow_id || definition.id;
+			const key = selectionKey(definition);
+			return h("button", {
+				key,
+				type: "button",
+				className: "hermes-workflows-sidebar-item" + (key === selectionKey(props.selectedDefinition) ? " is-selected" : ""),
+				onClick: function() {
+					call(props.loadDefinition, id, definition.version);
+				}
+			}, h("span", { className: "hermes-workflows-sidebar-item-title" }, safeString$1(definition.name || id)), h("span", { className: "hermes-workflows-sidebar-badge" + (definition.enabled ? " is-enabled" : "") }, definition.enabled ? "on" : "off"));
+		})) : h("p", { className: "hermes-workflows-muted" }, "No workflows deployed.")) : null);
+		const executionsSection = h("section", { className: "hermes-workflows-rail-section hermes-workflows-rail-executions" }, disclosure("Executions", "hermes-workflows-rail-executions-panel", executionsExpanded, setExecutionsExpanded), executionsExpanded ? h("div", {
+			id: "hermes-workflows-rail-executions-panel",
+			className: "hermes-workflows-palette-panel"
+		}, executions.length ? h("div", { className: "hermes-workflows-sidebar-list" }, executions.slice(0, 20).map(function(execution) {
+			const id = safeString$1(execution.execution_id || execution.id);
+			const status = safeString$1(execution.status);
+			const statusClass = status === "succeeded" ? " is-succeeded" : status === "failed" ? " is-failed" : "";
+			return h("button", {
+				key: id,
+				type: "button",
+				className: "hermes-workflows-sidebar-item",
+				onClick: function() {
+					call(props.loadExecution, id);
+				}
+			}, h("span", { className: "hermes-workflows-sidebar-item-title" }, id.slice(0, 16)), h("span", { className: "hermes-workflows-sidebar-badge" + statusClass }, status));
+		})) : h("p", { className: "hermes-workflows-muted" }, "No executions yet.")) : null);
+		function safeId(name) {
+			return safeString$1(name).replace(/[^a-z0-9_-]+/gi, "-").toLowerCase();
+		}
+		const libraryGroupsContent = groups.length ? h("div", { className: "hermes-workflows-rail-library-groups" }, groups.map(function(group) {
+			const label = safeString$1(group && group.name);
+			const controlsId = "rail-library-group-" + safeId(label);
+			const color = group && group.color || "inherit";
+			const types = Array.isArray(group && group.types) ? group.types : [];
+			return h("div", {
+				key: label,
+				className: "hermes-workflows-rail-library-group"
+			}, h("button", {
+				type: "button",
+				className: "hermes-workflows-rail-library-group-button",
+				"aria-expanded": "false",
+				"aria-controls": controlsId,
+				onClick: function() {
+					call(props.openNodePalette, label);
+				}
+			}, h("span", {
+				className: "hermes-workflows-rail-library-group-name",
+				style: { color: NODE_COLORS[color] || "inherit" }
+			}, label), h("span", {
+				className: "hermes-workflows-rail-library-group-count",
+				"aria-hidden": "true"
+			}, String(types.length))), h("span", {
+				id: controlsId,
+				className: "hermes-workflows-sr-only"
+			}, types.join(", ")));
+		})) : h("p", { className: "hermes-workflows-muted" }, "No node library loaded.");
+		return h("aside", { className: "hermes-workflows-sidebar hermes-workflows-rail" }, workflowsSection, executionsSection, h("section", { className: "hermes-workflows-rail-section hermes-workflows-rail-library" }, disclosure("Library", "hermes-workflows-rail-library-panel", libraryExpanded, setLibraryExpanded), libraryExpanded ? h("div", {
+			id: "hermes-workflows-rail-library-panel",
+			className: "hermes-workflows-palette-panel"
+		}, libraryGroupsContent) : null));
 	}
 	//#endregion
 	//#region ../plugins/workflows/dashboard/src/inspector.js
