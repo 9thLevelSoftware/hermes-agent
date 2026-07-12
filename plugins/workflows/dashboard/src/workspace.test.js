@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   WORKSPACE_MODES,
+  centeredFlowPosition,
+  libraryGroups,
   locationForMode,
   modeForLocation,
   renderWorkflowSummary,
   renderWorkspaceTabs,
+  snapFlowPosition,
 } from "./workspace.js";
 
 // ---- URL routing round-trips (plan lines 696–710) ----------------------------
@@ -56,6 +59,20 @@ describe("workspace routing", () => {
     expect(locationForMode("demo", "history", { feed: "wffeed_1", execution: "wfexec_1" }))
       .toBe("/workflows/demo/history?execution=wfexec_1");
   });
+});
+
+it("snaps a point to the configured flow grid", () => {
+  expect(snapFlowPosition({ x: 109, y: 51 }, 20)).toEqual({ x: 100, y: 60 });
+});
+
+it("centers a new node in the current flow viewport", () => {
+  expect(centeredFlowPosition({ x: 100, y: 50, width: 800, height: 600, zoom: 2 }))
+    .toEqual({ x: 260, y: 178 });
+});
+
+it("makes rail groups from the existing node categories without node descriptions", () => {
+  expect(libraryGroups([{ name: "Triggers", color: "trigger", nodes: [["manual", "Manual", ""]] }]))
+    .toEqual([{ name: "Triggers", color: "trigger", types: ["manual"] }]);
 });
 
 // ---- Tab semantics + mode isolation -----------------------------------------
