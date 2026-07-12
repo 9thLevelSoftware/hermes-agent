@@ -2,7 +2,6 @@
 
 import json
 import sqlite3
-import time
 from dataclasses import FrozenInstanceError, is_dataclass
 
 import pytest
@@ -116,6 +115,30 @@ def test_create_rejects_conflicting_identity(db):
     assert journal.get("op-1").destination == "one"
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("operation_id", None),
+        ("operation_id", ""),
+        ("operation_id", 123),
+        ("kind", None),
+        ("kind", ""),
+        ("kind", 123),
+    ],
+)
+def test_create_rejects_invalid_identity_before_db_write(db, field, value):
+    journal = _journal(db)
+    identity = {"operation_id": "op-1", "kind": "tool"}
+    identity[field] = value
+
+    with pytest.raises(ValueError):
+        journal.create(**identity)
+
+    assert db._conn.execute(
+        "SELECT COUNT(*) FROM agent_operations"
+    ).fetchone()[0] == 0
+
+
 def test_valid_transition_serializes_result_and_invalid_or_stale_leaves_row_unchanged(db):
     journal = _journal(db)
     journal.create(operation_id="op-1", kind="tool")
@@ -189,6 +212,82 @@ def test_transition_rejects_invalid_state_and_effect(db):
     assert journal.get("op-1").state == "pending"
 
 
+def test_transition_rejects_contradictory_state_effect_pairs(db):
+    journal = _journal(db)
+    operation_ids = ("cancelled", "running", "dispatched", "confirmed", "unknown")
+    for operation_id in operation_ids:
+        journal.create(operation_id=operation_id, kind="tool")
+    for operation_id in ("dispatched", "confirmed", "unknown"):
+        journal.transition(
+            operation_id,
+            from_states={"pending"},
+            to_state="running",
+            effect_disposition="none",
+        )
+
+    invalid = [
+        ("cancelled", {"pending"}, "cancelled", "landed"),
+        ("running", {"pending"}, "running", "unknown"),
+        ("dispatched", {"running"}, "dispatched", "none"),
+        ("confirmed", {"running"}, "confirmed", "unknown"),
+        ("unknown", {"running"}, "unknown", "none"),
+    ]
+    for operation_id, from_states, to_state, effect_disposition in invalid:
+        before = journal.get(operation_id)
+        with pytest.raises(ValueError):
+            journal.transition(
+                operation_id,
+                from_states=from_states,
+                to_state=to_state,
+                effect_disposition=effect_disposition,
+            )
+        assert journal.get(operation_id) == before
+
+
+def test_transition_accepts_representative_state_effect_pairs(db):
+    journal = _journal(db)
+    for operation_id in ("running", "dispatched", "confirmed", "failed", "unknown", "cancelled"):
+        journal.create(operation_id=operation_id, kind="tool")
+    journal.transition(
+        "running",
+        from_states={"pending"},
+        to_state="running",
+        effect_disposition="none",
+    )
+    for operation_id in ("dispatched", "confirmed", "failed", "unknown"):
+        journal.transition(
+            operation_id,
+            from_states={"pending"},
+            to_state="running",
+            effect_disposition="none",
+        )
+
+    for operation_id, to_state, effect_disposition in (
+        ("dispatched", "dispatched", "unknown"),
+        ("confirmed", "confirmed", "none"),
+        ("failed", "failed", "none"),
+        ("unknown", "unknown", "unknown"),
+    ):
+        record = journal.transition(
+            operation_id,
+            from_states={"running"},
+            to_state=to_state,
+            effect_disposition=effect_disposition,
+        )
+        assert (record.state, record.effect_disposition) == (
+            to_state,
+            effect_disposition,
+        )
+
+    cancelled = journal.transition(
+        "cancelled",
+        from_states={"pending"},
+        to_state="cancelled",
+        effect_disposition="none",
+    )
+    assert (cancelled.state, cancelled.effect_disposition) == ("cancelled", "none")
+
+
 def test_reconcile_marks_inflight_unknown_without_retrying(db):
     journal = _journal(db)
     journal.create(operation_id="pending", kind="tool")
@@ -215,7 +314,7 @@ def test_reconcile_marks_inflight_unknown_without_retrying(db):
         "dispatched",
         from_states={"running"},
         to_state="dispatched",
-        effect_disposition="none",
+        effect_disposition="unknown",
     )
     journal.transition(
         "confirmed",
@@ -290,7 +389,7 @@ def test_acknowledge_only_terminal_and_is_idempotent(db):
         "op-1",
         from_states={"running"},
         to_state="dispatched",
-        effect_disposition="none",
+        effect_disposition="unknown",
     )
     assert journal.acknowledge("op-1") is False
     journal.transition(
@@ -306,12 +405,11 @@ def test_acknowledge_only_terminal_and_is_idempotent(db):
     assert journal.get("op-1").acknowledged_at is not None
 
 
-def test_list_unacknowledged_filters_kind_and_orders_created_at(db):
+def test_list_unacknowledged_filters_kind_and_orders_created_at(db, monkeypatch):
     journal = _journal(db)
+    monkeypatch.setattr("agent.operation_journal.time.time", lambda: 1.0)
     journal.create(operation_id="first", kind="tool")
-    time.sleep(0.002)
     journal.create(operation_id="second", kind="delivery")
-    time.sleep(0.002)
     journal.create(operation_id="third", kind="tool")
     journal.transition(
         "third",
@@ -331,6 +429,15 @@ def test_list_unacknowledged_filters_kind_and_orders_created_at(db):
 
 
 def test_database_checks_states_and_effects(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        db._execute_write(
+            lambda conn: conn.execute(
+                "INSERT INTO agent_operations "
+                "(operation_id, kind, state, effect_disposition, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (None, "tool", "pending", "none", 1.0, 1.0),
+            )
+        )
     with pytest.raises(sqlite3.IntegrityError):
         db._execute_write(
             lambda conn: conn.execute(

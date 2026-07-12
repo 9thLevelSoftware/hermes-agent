@@ -810,7 +810,7 @@ CREATE TABLE IF NOT EXISTS compression_locks (
 );
 
 CREATE TABLE IF NOT EXISTS agent_operations (
-    operation_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL PRIMARY KEY,
     kind TEXT NOT NULL,
     session_id TEXT NOT NULL DEFAULT '',
     turn_id TEXT NOT NULL DEFAULT '',

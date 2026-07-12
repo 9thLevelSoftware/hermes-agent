@@ -1,4 +1,8 @@
-"""Durable operation journal backed by the profile-local state database."""
+"""Durable operation journal backed by the profile-local state database.
+
+This is a library primitive; production integration and startup reconciliation
+belong to higher-level callers.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +18,15 @@ _STATES = frozenset(
     {"pending", "running", "dispatched", "confirmed", "failed", "unknown", "cancelled"}
 )
 _EFFECTS = frozenset({"none", "landed", "unknown"})
+_EFFECTS_BY_STATE = {
+    "pending": frozenset({"none"}),
+    "running": frozenset({"none"}),
+    "dispatched": frozenset({"unknown"}),
+    "confirmed": frozenset({"none", "landed"}),
+    "failed": frozenset({"none", "unknown"}),
+    "unknown": frozenset({"unknown"}),
+    "cancelled": frozenset({"none"}),
+}
 _TERMINAL_STATES = frozenset({"confirmed", "failed", "unknown", "cancelled"})
 _TRANSITIONS = {
     "pending": frozenset({"running", "cancelled", "failed"}),
@@ -68,6 +81,8 @@ class OperationJournal:
             raise ValueError("invalid operation target state")
         if effect_disposition not in _EFFECTS:
             raise ValueError("invalid operation effect disposition")
+        if effect_disposition not in _EFFECTS_BY_STATE[to_state]:
+            raise ValueError("invalid operation state/effect pair")
         if any(to_state not in _TRANSITIONS[state] for state in from_states):
             raise ValueError("invalid operation state transition")
 
@@ -82,6 +97,10 @@ class OperationJournal:
         destination: str = "",
         payload_hash: str = "",
     ) -> OperationRecord:
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("operation_id must be a non-empty string")
+        if not isinstance(kind, str) or not kind:
+            raise ValueError("kind must be a non-empty string")
         identity = (
             kind,
             session_id,
