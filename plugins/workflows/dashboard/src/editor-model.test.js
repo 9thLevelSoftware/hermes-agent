@@ -17,8 +17,8 @@ import {
 describe("supportedEditorCoverage", () => {
   it("returns exact expected coverage", () => {
     expect(supportedEditorCoverage()).toEqual({
-      triggers: ["manual", "schedule"],
-      nodes: ["agent_task", "fail", "join", "parallel", "pass", "switch", "wait"],
+      triggers: ["manual", "schedule", "webhook", "kanban_event"],
+      nodes: ["agent_task", "fail", "join", "parallel", "pass", "send_message", "subworkflow", "switch", "wait"],
       intakeModes: ["continuous", "single"],
     });
   });
@@ -333,10 +333,6 @@ describe("unsupported scope", () => {
       "document_upload",
       "split_strategy",
       "item_source",
-      "webhook",
-      "kanban_event",
-      "send_message",
-      "subworkflow",
       "loop",
     ];
     const allSupported = [...coverage.triggers, ...coverage.nodes, ...coverage.intakeModes];
