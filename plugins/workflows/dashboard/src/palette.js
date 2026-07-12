@@ -1,7 +1,7 @@
 import { NODE_COLORS, NODE_ICONS } from "./canvas-nodes.js";
 import { SUPPORTED_NODES, SUPPORTED_TRIGGERS } from "./editor-model.js";
 
-const NODE_CATEGORIES = [
+export const NODE_CATEGORIES = [
   {
     name: "Triggers",
     color: "trigger",
@@ -264,11 +264,15 @@ export function renderPalette(props) {
   );
 }
 
-// ponytail: rail is the new default; the legacy sidebar wrapper above stays so
-// existing tests keep working until app.js wires `variant: "rail"` everywhere.
+// ponytail: keep the legacy sidebar wrapper for existing callers; app.js uses
+// WorkflowRail directly so its hooks run under React.
 // Three disclosures, single scroll container, library groups delegate to the
-// host's openNodePalette — UI for "Add Node" lives in Task 4.
+// host's openNodePalette; the floating NodePaletteOverlay owns manual authoring.
 export function renderWorkflowRail(props) {
+  return WorkflowRail(props);
+}
+
+export function WorkflowRail(props) {
   const h = props.createElement;
   const React = props.React || {};
   const useState = React.useState || function (initial) { return [initial, function () {}]; };
@@ -381,5 +385,91 @@ export function renderWorkflowRail(props) {
     workflowsSection,
     executionsSection,
     librarySection
+  );
+}
+
+export function NodePaletteOverlay(props) {
+  const h = props.createElement;
+  const React = props.React || {};
+  const useState = React.useState || function (initial) { return [initial, function () {}]; };
+  const searchState = useState("");
+  const search = searchState[0];
+  const setSearch = searchState[1];
+  if (!props.isOpen) return null;
+
+  const groupName = safeString(props.nodePaletteGroup).trim().toLowerCase();
+  const needle = safeString(search).trim().toLowerCase();
+  const categories = (Array.isArray(props.categories) ? props.categories : NODE_CATEGORIES).map(function (category) {
+    const nodes = Array.isArray(category && category.nodes) ? category.nodes.filter(function (node) {
+      const type = safeString(node && node[0]).toLowerCase();
+      const label = safeString(node && node[1]).toLowerCase();
+      return (!needle || type.includes(needle) || label.includes(needle)) && isSupported(type, category && category.name === "Triggers");
+    }) : [];
+    return Object.assign({}, category, { nodes: nodes });
+  }).filter(function (category) {
+    return (!groupName || safeString(category && category.name).trim().toLowerCase() === groupName) && category.nodes.length > 0;
+  });
+
+  function call(handler) {
+    if (typeof handler === "function") return handler.apply(null, Array.prototype.slice.call(arguments, 1));
+  }
+
+  function dragProps(type) {
+    return {
+      draggable: true,
+      onDragStart: function (event) {
+        if (event.dataTransfer && event.dataTransfer.setData) event.dataTransfer.setData("text/plain", type);
+        if (typeof window !== "undefined") window.__HERMES_DRAG_NODE_TYPE = type;
+      },
+    };
+  }
+
+  function selectNode(type, trigger) {
+    if (typeof props.onSelectNode === "function") return props.onSelectNode(type, trigger);
+    if (trigger) return call(props.addTriggerOfType, type);
+    return call(props.addWorkflowCellAtPosition, type);
+  }
+
+  function renderTile(category, node) {
+    const type = node[0];
+    const trigger = category.name === "Triggers";
+    return h("button", Object.assign({
+      key: type,
+      type: "button",
+      className: "hermes-workflows-palette-card hermes-workflows-node-palette-tile",
+      "aria-label": "Add " + node[1],
+      onClick: function () { selectNode(type, trigger); },
+      style: { "--wf-palette-color": NODE_COLORS[category.color] || "inherit" },
+    }, dragProps(type)),
+      h("span", { className: "hermes-workflows-palette-icon", "aria-hidden": "true" }, NODE_ICONS[type] || "•"),
+      h("span", { className: "hermes-workflows-palette-text" },
+        h("span", { className: "hermes-workflows-palette-title" }, node[1]),
+        h("span", { className: "hermes-workflows-palette-desc" }, node[2])
+      )
+    );
+  }
+
+  const Fragment = React.Fragment || "div";
+  return h("div", { className: "hermes-workflows-node-palette-overlay", role: "dialog", "aria-label": "Add workflow node" },
+    h("div", { className: "hermes-workflows-node-palette-panel" },
+      h("div", { className: "hermes-workflows-node-palette-header" },
+        h("h2", null, "Add Node"),
+        h("button", { type: "button", "aria-label": "Close", onClick: props.closeNodePalette }, "Close")
+      ),
+      h("input", {
+        type: "search",
+        className: "hermes-workflows-palette-search-input",
+        placeholder: "Search nodes...",
+        "aria-label": "Search nodes",
+        value: search,
+        onChange: function (event) { setSearch(event.target.value); },
+      }),
+      categories.length ? categories.map(function (category) {
+        return h(Fragment, { key: category.name },
+          h("h3", { className: "hermes-workflows-palette-category", style: { color: NODE_COLORS[category.color] || "inherit" } }, category.name),
+          h("div", { className: "hermes-workflows-node-palette" }, category.nodes.map(function (node) { return renderTile(category, node); }))
+        );
+      }) : h("p", { className: "hermes-workflows-muted" }, "No nodes match the current filter.")
+    )
   );
 }

@@ -3,7 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { renderPalette, renderWorkflowOnboarding, renderWorkflowRail } from "./palette.js";
+import {
+  NodePaletteOverlay,
+  renderPalette,
+  renderWorkflowOnboarding,
+  renderWorkflowRail,
+} from "./palette.js";
 
 const require = createRequire(import.meta.url);
 const reactDomRequire = createRequire(require.resolve("react-dom/client"));
@@ -216,6 +221,48 @@ describe("renderWorkflowRail", () => {
     const json = JSON.stringify(node);
     expect(json).toContain("Generate From Prompt");
     expect(json).toContain("Start From Scratch");
+  });
+});
+
+describe("NodePaletteOverlay", () => {
+  it("renders visible manual node choices and writes drag payloads", () => {
+    const node = NodePaletteOverlay(props({ isOpen: true }));
+    const json = JSON.stringify(node);
+    expect(json).toContain("Add Node");
+    expect(json).toContain("Manual Trigger");
+    expect(json).toContain("AI Agent Task");
+
+    let manualTile = null;
+    contains(node, (candidate) => {
+      if (candidate && typeof candidate === "object" && candidate.tag === "button" && candidate.props && candidate.props.draggable === true && candidate.props["aria-label"] === "Add Manual Trigger") {
+        manualTile = candidate;
+      }
+      return false;
+    });
+    expect(manualTile).not.toBeNull();
+    let payload = null;
+    manualTile.props.onDragStart({
+      dataTransfer: { setData: (format, value) => { payload = { format, value }; } },
+    });
+    expect(payload).toEqual({ format: "text/plain", value: "manual" });
+  });
+
+  it("filters by library group and keeps click-to-add tiles available", () => {
+    const node = NodePaletteOverlay(props({ isOpen: true, nodePaletteGroup: "Triggers" }));
+    const json = JSON.stringify(node);
+    expect(json).toContain("Manual Trigger");
+    expect(json).not.toContain("AI Agent Task");
+    let tile = null;
+    contains(node, (candidate) => {
+      if (candidate && typeof candidate === "object" && candidate.tag === "button" && candidate.props && candidate.props.draggable === true) tile = candidate;
+      return false;
+    });
+    expect(tile).not.toBeNull();
+    expect(tile.props.onClick).toBeTypeOf("function");
+  });
+
+  it("returns null when closed", () => {
+    expect(NodePaletteOverlay(props({ isOpen: false }))).toBeNull();
   });
 });
 
