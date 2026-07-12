@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -46,6 +47,8 @@ def _make_runner(registry: RuntimeHealthRegistry | None = None) -> GatewayRunner
     )
     runner._runtime_health = registry or RuntimeHealthRegistry()
     runner._running = True
+    runner._adapter_state_lock = threading.Lock()
+    runner._fatal_adapter_claims = set()
     runner._failed_platforms = {
         Platform.TELEGRAM: {
             "config": PlatformConfig(enabled=True, token="test"),
@@ -175,3 +178,40 @@ async def test_scheduler_does_not_gate_due_retry_on_registry_probe_window():
     assert Platform.TELEGRAM in runner.adapters
     registry.should_probe.assert_not_called()
     registry.record_success.assert_called_once_with("platform:telegram")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_fatal_notifications_record_health_and_disconnect_once(caplog):
+    registry = RuntimeHealthRegistry()
+    record_failure = MagicMock(side_effect=registry.record_failure)
+    registry.record_failure = record_failure
+    runner = _make_runner(registry)
+    adapter = _Adapter()
+    adapter._set_fatal_error("telegram_runtime", "same outage", retryable=True)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.delivery_router.adapters = runner.adapters
+
+    disconnect_started = asyncio.Event()
+    release_disconnect = asyncio.Event()
+    disconnect_calls = 0
+
+    async def slow_disconnect():
+        nonlocal disconnect_calls
+        disconnect_calls += 1
+        disconnect_started.set()
+        await release_disconnect.wait()
+
+    adapter.disconnect = slow_disconnect
+
+    with caplog.at_level("ERROR", logger="gateway.run"):
+        first = asyncio.create_task(runner._handle_adapter_fatal_error(adapter))
+        await disconnect_started.wait()
+        second = asyncio.create_task(runner._handle_adapter_fatal_error(adapter))
+        await asyncio.sleep(0)
+        release_disconnect.set()
+        await asyncio.gather(first, second)
+
+    assert record_failure.call_count == 1
+    assert len([record for record in caplog.records if "Fatal telegram adapter error" in record.message]) == 1
+    assert disconnect_calls == 1
+    assert Platform.TELEGRAM not in runner.adapters

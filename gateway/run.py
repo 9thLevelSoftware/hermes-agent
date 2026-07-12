@@ -2918,6 +2918,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        self._adapter_state_lock = threading.Lock()
+        # ponytail: fatal adapters are rare; retain identities to dedup callbacks
+        # without holding the lock across adapter teardown.
+        self._fatal_adapter_claims: set[int] = set()
         self._runtime_health = RuntimeHealthRegistry()
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
@@ -4092,22 +4096,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         If the error is retryable (e.g. network blip, DNS failure), queue the
         platform for background reconnection instead of giving up permanently.
         """
-        # Snapshot the current owner of this platform slot before doing
-        # anything else. If it's neither this adapter nor empty, a different
-        # adapter has already taken over (e.g. this is a delayed notification
-        # from a background retry chain that raced with, and lost to, a
-        # reconnect that already succeeded). Acting on a stale notification
-        # would overwrite an already-healthy platform's runtime status and
-        # incorrectly re-queue it for reconnection, so bail out before any of
-        # that happens.
-        existing = self.adapters.get(adapter.platform)
-        if existing is not None and existing is not adapter:
-            logger.debug(
-                "Ignoring stale fatal error from a superseded %s adapter instance: %s",
-                adapter.platform.value,
-                adapter.fatal_error_code or "unknown",
-            )
-            return
+        # Atomically claim the adapter before recording health or awaiting
+        # teardown. Primary-profile adapters are removed here; secondary-profile
+        # adapters are still allowed through when they are not in self.adapters.
+        with self._adapter_state_lock:
+            existing = self.adapters.get(adapter.platform)
+            if existing is not None and existing is not adapter:
+                logger.debug(
+                    "Ignoring stale fatal error from a superseded %s adapter instance: %s",
+                    adapter.platform.value,
+                    adapter.fatal_error_code or "unknown",
+                )
+                return
+
+            adapter_id = id(adapter)
+            if adapter_id in self._fatal_adapter_claims:
+                logger.debug(
+                    "Ignoring repeated fatal error from %s adapter instance: %s",
+                    adapter.platform.value,
+                    adapter.fatal_error_code or "unknown",
+                )
+                return
+            self._fatal_adapter_claims.add(adapter_id)
+            owns_primary_slot = existing is adapter
+            if owns_primary_slot:
+                self.adapters.pop(adapter.platform, None)
+                self.delivery_router.adapters = self.adapters
 
         failure_error = (
             adapter.fatal_error_message
@@ -4145,14 +4159,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             error_message=adapter.fatal_error_message,
         )
 
-        if existing is adapter:
-            # Claim this adapter for teardown before awaiting disconnect() —
-            # a second fatal-error notification for the same adapter (e.g.
-            # from a concurrent recovery path) would otherwise still see
-            # itself as "existing" during the await below and disconnect()
-            # the same object twice.
-            self.adapters.pop(adapter.platform, None)
-            self.delivery_router.adapters = self.adapters
+        if owns_primary_slot:
+            # Disconnect outside the lock so adapter teardown can yield safely.
             await adapter.disconnect()
 
         # Queue retryable failures for background reconnection

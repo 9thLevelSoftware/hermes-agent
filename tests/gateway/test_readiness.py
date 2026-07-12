@@ -147,6 +147,32 @@ def test_collect_runtime_readiness_reports_platform_health_aggregate(tmp_path, m
     }
 
 
+def test_collect_runtime_readiness_fails_closed_for_retrying_healthy_platform(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    result = collect_runtime_readiness(
+        configured_model="model",
+        runtime_status={
+            "gateway_state": "running",
+            "platforms": {
+                "telegram": {
+                    "state": "retrying",
+                    "health_state": "healthy",
+                }
+            },
+        },
+    )
+
+    gateway = result["checks"]["gateway"]
+    assert result["status"] == "degraded"
+    assert gateway["status"] == "degraded"
+    assert gateway["connected"] == 0
+    assert gateway["degraded"] == 1
+    assert gateway["platform_health"]["telegram"]["health_state"] == "degraded"
+
+
 def test_collect_runtime_readiness_strips_platform_secrets_and_raw_errors(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
