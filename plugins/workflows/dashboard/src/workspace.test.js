@@ -65,9 +65,29 @@ it("snaps a point to the configured flow grid", () => {
   expect(snapFlowPosition({ x: 109, y: 51 }, 20)).toEqual({ x: 100, y: 60 });
 });
 
+it("snaps invalid coordinates with a non-positive grid to the origin", () => {
+  expect(snapFlowPosition({ x: Infinity, y: NaN }, 0)).toEqual({ x: 0, y: 0 });
+});
+
 it("centers a new node in the current flow viewport", () => {
   expect(centeredFlowPosition({ x: 100, y: 50, width: 800, height: 600, zoom: 2 }))
     .toEqual({ x: 260, y: 180 });
+});
+
+it("snaps centered positions for custom node sizes", () => {
+  expect(centeredFlowPosition(
+    { x: 0, y: 0, width: 400, height: 300, zoom: 1 },
+    { width: 100, height: 60 },
+  )).toEqual({ x: 160, y: 120 });
+});
+
+it("makes empty rail groups safe for null categories and nodes", () => {
+  expect(libraryGroups([null, { name: "Empty", color: "pass", nodes: null }]))
+    .toEqual([
+      { name: null, color: null, types: [] },
+      { name: "Empty", color: "pass", types: [] },
+    ]);
+  expect(libraryGroups(null)).toEqual([]);
 });
 
 it("makes rail groups from the existing node categories without node descriptions", () => {
