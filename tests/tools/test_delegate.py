@@ -540,6 +540,74 @@ class TestDelegateTask(unittest.TestCase):
 
         child_db.close.assert_called_once_with()
 
+    def test_child_closes_forked_db_when_request_overrides_conversion_fails(self):
+        parent = _make_mock_parent(depth=0)
+        parent_db = MagicMock()
+        child_db = MagicMock()
+        parent_db.fork.return_value = child_db
+        parent._session_db = parent_db
+
+        class ExplodingOverrides:
+            def __iter__(self):
+                raise RuntimeError("request overrides conversion failed")
+
+        parent.request_overrides = ExplodingOverrides()
+
+        with patch("run_agent.AIAgent"):
+            with self.assertRaisesRegex(RuntimeError, "request overrides conversion failed"):
+                _build_child_agent(
+                    task_index=0,
+                    goal="Close the fork after kwargs construction fails",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        child_db.close.assert_called_once_with()
+
+    def test_partial_constructor_does_not_double_close_owned_session_db(self):
+        from run_agent import AIAgent
+
+        class NonIdempotentDB:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_calls > 1:
+                    raise AssertionError("session DB closed twice")
+
+        parent = _make_mock_parent(depth=0)
+        parent_db = MagicMock()
+        child_db = NonIdempotentDB()
+        parent_db.fork.return_value = child_db
+        parent._session_db = parent_db
+
+        def partial_init(agent, *args, **kwargs):
+            agent._session_db = kwargs["session_db"]
+            agent._owns_session_db = kwargs["owns_session_db"]
+            agent._session_db_closed = False
+            agent._end_session_on_close = False
+            raise RuntimeError("init failed after session DB ownership")
+
+        with patch("agent.agent_init.init_agent", side_effect=partial_init):
+            with self.assertRaisesRegex(RuntimeError, "init failed after session DB ownership"):
+                _build_child_agent(
+                    task_index=0,
+                    goal="Close an owned DB exactly once",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        self.assertEqual(child_db.close_calls, 1)
+
     def test_partial_constructor_closes_client_after_init_failure(self):
         from run_agent import AIAgent
 
