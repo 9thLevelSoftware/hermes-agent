@@ -59,4 +59,16 @@ describe("workflow canvas workspace layout", () => {
     expect(canvasSource).not.toContain("renderPalette({");
     expect(canvasSource).toContain("renderCanvasOnboarding(\"hermes-workflows-canvas-onboarding hermes-workflows-simple-canvas-onboarding\")");
   });
+
+  it("Node Configuration inspector exposes tablist, tabpanels, sticky header, and per-field wrappers", () => {
+    expect(cssSource).toMatch(/\.hermes-workflows\s+\.hermes-workflows-inspector-sticky-header[\s\S]*?position:\s*sticky/);
+    expect(cssSource).toContain(".hermes-workflows .hermes-workflows-tabs");
+    expect(cssSource).toMatch(/\.hermes-workflows\s+\.hermes-workflows-tab[^\{]*\{/);
+    expect(cssSource).toContain(".hermes-workflows-tab.is-active");
+    expect(cssSource).toContain(".hermes-workflows-field");
+    expect(cssSource).toContain(".hermes-workflows-field-row");
+    expect(cssSource).toMatch(/\.hermes-workflows-field-row[\s\S]*?grid-template-columns/);
+    expect(cssSource).toContain(".hermes-workflows-section-panel");
+    expect(cssSource).toContain(".hermes-workflows-node-message");
+  });
 });
