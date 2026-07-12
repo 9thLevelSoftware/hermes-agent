@@ -60,6 +60,9 @@ export function renderPalette(props) {
   const tabState = useState("workflows");
   const activeTab = tabState[0];
   const setActiveTab = tabState[1];
+  const searchState = useState("");
+  const search = searchState[0];
+  const setSearch = searchState[1];
   const definitions = Array.isArray(props.definitions) ? props.definitions : [];
   const executions = Array.isArray(props.executions) ? props.executions : [];
 
@@ -183,14 +186,38 @@ export function renderPalette(props) {
 
   function renderNodes() {
     const Fragment = React.Fragment || "div";
+    const needle = String(search || "").trim().toLowerCase();
+    const visibleCategories = needle
+      ? NODE_CATEGORIES.map(function (category) {
+          return {
+            name: category.name,
+            color: category.color,
+            nodes: category.nodes.filter(function (node) {
+              const type = String(node[0] || "").toLowerCase();
+              const label = String(node[1] || "").toLowerCase();
+              return type.includes(needle) || label.includes(needle);
+            }),
+          };
+        }).filter(function (category) { return category.nodes.length > 0; })
+      : NODE_CATEGORIES;
     return h("div", { className: "hermes-workflows-palette-panel hermes-workflows-node-library", role: "tabpanel", "aria-label": "Nodes" },
       h("p", { className: "hermes-workflows-muted" }, "Drag a node onto the canvas, or click to add it."),
-      NODE_CATEGORIES.map(function (category) {
-        return h(Fragment, { key: category.name },
-          h("h3", { className: "hermes-workflows-palette-category", style: { color: NODE_COLORS[category.color] || "inherit" } }, category.name),
-          h("div", { className: "hermes-workflows-node-palette" }, category.nodes.map(renderNodeCard))
-        );
-      })
+      h("input", {
+        type: "search",
+        className: "hermes-workflows-palette-search-input",
+        placeholder: "Search nodes...",
+        "aria-label": "Search nodes",
+        value: search,
+        onChange: function (event) { setSearch(event.target.value); },
+      }),
+      visibleCategories.length
+        ? visibleCategories.map(function (category) {
+            return h(Fragment, { key: category.name },
+              h("h3", { className: "hermes-workflows-palette-category", style: { color: NODE_COLORS[category.color] || "inherit" } }, category.name),
+              h("div", { className: "hermes-workflows-node-palette" }, category.nodes.map(renderNodeCard))
+            );
+          })
+        : h("p", { className: "hermes-workflows-muted" }, "No nodes match \u201c" + String(search) + "\u201d.")
     );
   }
 
