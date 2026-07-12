@@ -263,6 +263,7 @@ class TestDelegateTask(unittest.TestCase):
     def test_batch_construction_closes_already_built_children_on_failure(self):
         parent = _make_mock_parent()
         first_child = MagicMock()
+        parent._active_children.append(first_child)
         creds = {
             "model": None,
             "provider": None,
@@ -290,6 +291,7 @@ class TestDelegateTask(unittest.TestCase):
                 )
 
         first_child.close.assert_called_once_with()
+        self.assertEqual(parent._active_children, [])
 
     @patch("tools.delegate_tool._run_single_child")
     @patch("tools.delegate_tool._build_child_agent")
@@ -537,6 +539,34 @@ class TestDelegateTask(unittest.TestCase):
                 )
 
         child_db.close.assert_called_once_with()
+
+    def test_partial_constructor_closes_client_after_init_failure(self):
+        from run_agent import AIAgent
+
+        parent = _make_mock_parent(depth=0)
+        client = MagicMock()
+
+        def partial_init(agent, *args, **kwargs):
+            agent.client = client
+            raise RuntimeError("init failed after client creation")
+
+        with (
+            patch("agent.agent_init.init_agent", side_effect=partial_init),
+            patch.object(AIAgent, "_force_close_tcp_sockets", return_value=0),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "init failed after client creation"):
+                _build_child_agent(
+                    task_index=0,
+                    goal="Close a client from a partial constructor",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        client.close.assert_called_once_with()
 
     def test_child_uses_thinking_callback_when_progress_callback_available(self):
         parent = _make_mock_parent(depth=0)

@@ -1324,49 +1324,60 @@ def _build_child_agent(
         child_session_db = parent_session_db.fork()
         child_owns_session_db = True
 
+    child_kwargs: Dict[str, Any] = dict(
+        base_url=effective_base_url,
+        api_key=effective_api_key,
+        model=effective_model,
+        provider=effective_provider,
+        api_mode=effective_api_mode,
+        acp_command=effective_acp_command,
+        acp_args=effective_acp_args,
+        max_iterations=max_iterations,
+        reasoning_config=child_reasoning,
+        prefill_messages=getattr(parent_agent, "prefill_messages", None),
+        fallback_model=parent_fallback,
+        enabled_toolsets=child_toolsets,
+        quiet_mode=True,
+        ephemeral_system_prompt=child_prompt,
+        log_prefix=f"[subagent-{task_index}]",
+        platform="subagent",
+        skip_context_files=True,
+        skip_memory=True,
+        clarify_callback=None,
+        thinking_callback=child_thinking_cb,
+        session_db=child_session_db,
+        owns_session_db=child_owns_session_db,
+        parent_session_id=getattr(parent_agent, "session_id", None),
+        providers_allowed=child_providers_allowed,
+        providers_ignored=child_providers_ignored,
+        providers_order=child_providers_order,
+        provider_sort=child_provider_sort,
+        provider_require_parameters=child_provider_require_parameters,
+        provider_data_collection=child_provider_data_collection,
+        request_overrides=(
+            dict(override_request_overrides or {})
+            if override_provider
+            else dict(getattr(parent_agent, "request_overrides", {}) or {})
+        ),
+        openrouter_min_coding_score=child_openrouter_min_coding_score,
+        tool_progress_callback=child_progress_cb,
+        iteration_budget=None,
+        **child_optional_kwargs,
+    )
+    child = None
     try:
-        child = AIAgent(
-            base_url=effective_base_url,
-            api_key=effective_api_key,
-            model=effective_model,
-            provider=effective_provider,
-            api_mode=effective_api_mode,
-            acp_command=effective_acp_command,
-            acp_args=effective_acp_args,
-            max_iterations=max_iterations,
-
-            reasoning_config=child_reasoning,
-            prefill_messages=getattr(parent_agent, "prefill_messages", None),
-            fallback_model=parent_fallback,
-            enabled_toolsets=child_toolsets,
-            quiet_mode=True,
-            ephemeral_system_prompt=child_prompt,
-            log_prefix=f"[subagent-{task_index}]",
-            platform="subagent",
-            skip_context_files=True,
-            skip_memory=True,
-            clarify_callback=None,
-            thinking_callback=child_thinking_cb,
-            session_db=child_session_db,
-            owns_session_db=child_owns_session_db,
-            parent_session_id=getattr(parent_agent, "session_id", None),
-            providers_allowed=child_providers_allowed,
-            providers_ignored=child_providers_ignored,
-            providers_order=child_providers_order,
-            provider_sort=child_provider_sort,
-            provider_require_parameters=child_provider_require_parameters,
-            provider_data_collection=child_provider_data_collection,
-            request_overrides=(
-                dict(override_request_overrides or {})
-                if override_provider
-                else dict(getattr(parent_agent, "request_overrides", {}) or {})
-            ),
-            openrouter_min_coding_score=child_openrouter_min_coding_score,
-            tool_progress_callback=child_progress_cb,
-            iteration_budget=None,  # fresh budget per subagent
-            **child_optional_kwargs,
-        )
+        if isinstance(AIAgent, type):
+            child = AIAgent.__new__(AIAgent)
+            AIAgent.__init__(child, **child_kwargs)
+        else:
+            # Keep patched constructor doubles working in unit tests.
+            child = AIAgent(**child_kwargs)
     except Exception:
+        try:
+            if child is not None:
+                child.close()
+        except Exception:
+            pass
         if child_session_db is not None:
             try:
                 child_session_db.close()
@@ -2555,6 +2566,19 @@ def delegate_task(
     except Exception:
         for _, _, child in children:
             try:
+                if hasattr(parent_agent, "_active_children"):
+                    lock = getattr(parent_agent, "_active_children_lock", None)
+                    if lock:
+                        with lock:
+                            try:
+                                parent_agent._active_children.remove(child)
+                            except ValueError:
+                                pass
+                    else:
+                        try:
+                            parent_agent._active_children.remove(child)
+                        except ValueError:
+                            pass
                 child.close()
             except Exception:
                 pass

@@ -3600,30 +3600,37 @@ class AIAgent:
         # 'cron_complete' / 'cli_close' reason set by an earlier terminal path.
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "session_id", None)
-        if (
-            getattr(self, "_end_session_on_close", True)
-            and not getattr(self, "_session_end_called", False)
-            and session_db is not None
-            and session_id
-        ):
-            try:
-                session_db.end_session(session_id, "agent_close")
-            except Exception:
-                pass
-            else:
-                self._session_end_called = True
+        session_db_close_lock = getattr(self, "_session_db_close_lock", None)
+        if session_db_close_lock is None:
+            session_db_close_lock = threading.Lock()
+            self._session_db_close_lock = session_db_close_lock
+        with session_db_close_lock:
+            session_end_failed = False
+            if (
+                getattr(self, "_end_session_on_close", True)
+                and not getattr(self, "_session_end_called", False)
+                and session_db is not None
+                and session_id
+            ):
+                try:
+                    session_db.end_session(session_id, "agent_close")
+                except Exception:
+                    session_end_failed = True
+                else:
+                    self._session_end_called = True
 
-        if (
-            getattr(self, "_owns_session_db", False)
-            and not getattr(self, "_session_db_closed", False)
-            and session_db is not None
-        ):
-            try:
-                session_db.close()
-            except Exception:
-                pass
-            else:
-                self._session_db_closed = True
+            if (
+                not session_end_failed
+                and getattr(self, "_owns_session_db", False)
+                and not getattr(self, "_session_db_closed", False)
+                and session_db is not None
+            ):
+                try:
+                    session_db.close()
+                except Exception:
+                    pass
+                else:
+                    self._session_db_closed = True
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
