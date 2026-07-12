@@ -1435,6 +1435,7 @@ _lock = threading.Lock()
 # only the compatibility ordering used by session-only /approve and /deny.
 _pending: dict[str, dict] = {}
 _pending_by_session: dict[str, list[str]] = {}
+_pending_loaded_home: Optional[str] = None
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
@@ -1549,23 +1550,85 @@ def _approval_identity_matches(request: dict, expected_identity: Optional[dict])
     return True
 
 
+def _pending_path():
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "approval_requests.json"
+
+
+def _load_pending_locked() -> None:
+    """Load unresolved fallback approvals for the active profile once."""
+    global _pending_loaded_home
+    path = _pending_path()
+    home = str(path.parent)
+    if _pending_loaded_home == home:
+        return
+    _pending.clear()
+    _pending_by_session.clear()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    for request in payload.get("requests", []):
+        if not isinstance(request, dict) or request.get("status") not in {"pending", "resolved"}:
+            continue
+        request_id = str(request.get("request_id") or "")
+        session_key = str(request.get("session_key") or "")
+        if not request_id or not session_key:
+            continue
+        _pending[request_id] = request
+        _pending_by_session.setdefault(session_key, []).append(request_id)
+    _pending_loaded_home = home
+
+
+def _persist_pending_locked() -> None:
+    """Persist unresolved fallback approvals without raw tool arguments."""
+    from utils import atomic_json_write
+
+    safe_fields = {
+        "request_id", "session_key", "created_at", "expires_at",
+        "argument_hash", "operation", "tool_name", "policy_key",
+        "pattern_key", "pattern_keys", "requester", "channel", "status",
+        "resolution", "resolution_reason", "resolved_at", "resolution_mode",
+        "allow_permanent", "description",
+    }
+    records = [
+        {key: copy.deepcopy(value) for key, value in request.items() if key in safe_fields}
+        for request in _pending.values()
+        if request.get("status") in {"pending", "resolved"}
+    ]
+    atomic_json_write(
+        _pending_path(),
+        {"requests": records},
+        mode=0o600,
+        default=str,
+    )
+
+
 def _prune_pending_locked() -> None:
     """Drop terminal fallback records and repair the session index.
 
     Callers hold ``_lock``. A just-expired record is left in place until the
     next safe-point call so legacy inspection can still report its status.
     """
+    _load_pending_locked()
+    changed = False
     for request_id, request in list(_pending.items()):
         status = request.get("status")
         if status in {"pending", "resolved"}:
             try:
                 if time.time() >= float(request["expires_at"]):
                     request["status"] = "expired"
+                    changed = True
             except (KeyError, TypeError, ValueError):
                 request["status"] = "stale"
+                changed = True
             continue
         if status in {"consumed", "expired", "stale"}:
             _pending.pop(request_id, None)
+            changed = True
     for session_key, request_ids in list(_pending_by_session.items()):
         kept = [
             request_id for request_id in request_ids
@@ -1573,9 +1636,14 @@ def _prune_pending_locked() -> None:
             and _pending[request_id].get("session_key") == session_key
         ]
         if kept:
+            if kept != request_ids:
+                changed = True
             _pending_by_session[session_key] = kept
         else:
             _pending_by_session.pop(session_key, None)
+            changed = True
+    if changed:
+        _persist_pending_locked()
 
 
 def _mark_expired(request: dict) -> bool:
@@ -1621,6 +1689,7 @@ def _resolve_fallback_approval(
                 )
                 return 0
             if not _mark_expired(request):
+                _persist_pending_locked()
                 logger.warning(
                     "approval_resolution outcome=stale resolution_mode=exact "
                     "request_id=%s session_key=%s",
@@ -1629,6 +1698,7 @@ def _resolve_fallback_approval(
                 return 0
             if request_hash and request_hash != request.get("argument_hash"):
                 request["status"] = "stale"
+                _persist_pending_locked()
                 logger.warning(
                     "approval_resolution outcome=changed resolution_mode=exact "
                     "request_id=%s session_key=%s",
@@ -1661,6 +1731,7 @@ def _resolve_fallback_approval(
                 "request_id=%s session_key=%s choice=%s",
                 resolution_mode, request["request_id"], session_key, choice,
             )
+        _persist_pending_locked()
         return len(targets)
 
 
@@ -1749,13 +1820,16 @@ def consume_pending_approval(
         try:
             if time.time() >= float(request["expires_at"]):
                 request["status"] = "expired"
+                _persist_pending_locked()
                 return None
         except (KeyError, TypeError, ValueError):
             request["status"] = "stale"
+            _persist_pending_locked()
             return None
         stored_hash = request.get("argument_hash")
         if not request_hash or not stored_hash or request_hash != stored_hash:
             request["status"] = "stale"
+            _persist_pending_locked()
             logger.warning(
                 "approval_resolution outcome=changed resolution_mode=consume "
                 "request_id=%s session_key=%s",
@@ -1811,6 +1885,7 @@ def submit_pending(session_key: str, approval: dict) -> Optional[dict]:
         })
         _pending[request_id] = request
         _pending_by_session.setdefault(session_key, []).append(request_id)
+        _persist_pending_locked()
         return copy.deepcopy(request)
 
 
