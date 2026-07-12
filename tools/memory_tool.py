@@ -127,11 +127,17 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        archive_on_overflow: bool = False,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.archive_on_overflow = archive_on_overflow
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
         # Per-turn counter of failed at-capacity consolidation attempts; reset
@@ -333,6 +339,11 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    @staticmethod
+    def _archive_path(target: str) -> Path:
+        filename = "USER.md" if target == "user" else "MEMORY.md"
+        return get_memory_dir() / "archive" / filename
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -363,6 +374,21 @@ class MemoryStore:
             # Calculate what the new total would be
             new_entries = entries + [content]
             new_total = len(ENTRY_DELIMITER.join(new_entries))
+            archived_entries = 0
+
+            if new_total > limit and self.archive_on_overflow and len(content) <= limit:
+                working = list(entries)
+                archived: List[str] = []
+                while working and len(ENTRY_DELIMITER.join(working + [content])) > limit:
+                    archived.append(working.pop(0))
+                if len(ENTRY_DELIMITER.join(working + [content])) <= limit:
+                    archive_path = self._archive_path(target)
+                    archive_path.parent.mkdir(parents=True, exist_ok=True)
+                    prior_archive = self._read_file(archive_path)
+                    self._write_file(archive_path, prior_archive + archived)
+                    entries = working
+                    archived_entries = len(archived)
+                    new_total = len(ENTRY_DELIMITER.join(entries + [content]))
 
             if new_total > limit:
                 current = self._char_count(target)
@@ -383,7 +409,11 @@ class MemoryStore:
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry added.")
+        response = self._success_response(target, "Entry added.")
+        if archived_entries:
+            response["archived_entries"] = archived_entries
+            response["archive_path"] = str(self._archive_path(target))
+        return response
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
@@ -803,18 +833,21 @@ def load_on_disk_store() -> "MemoryStore":
     """
     memory_char_limit = 2200
     user_char_limit = 1375
+    archive_on_overflow = False
     try:
         from hermes_cli.config import load_config
 
         mem_cfg = (load_config() or {}).get("memory", {}) or {}
         memory_char_limit = int(mem_cfg.get("memory_char_limit", memory_char_limit))
         user_char_limit = int(mem_cfg.get("user_char_limit", user_char_limit))
+        archive_on_overflow = bool(mem_cfg.get("archive_on_overflow", False))
     except Exception:
         pass  # config optional — fall back to defaults rather than break /memory
 
     store = MemoryStore(
         memory_char_limit=memory_char_limit,
         user_char_limit=user_char_limit,
+        archive_on_overflow=archive_on_overflow,
     )
     store.load_from_disk()
     return store
