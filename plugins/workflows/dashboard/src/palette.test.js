@@ -1,0 +1,55 @@
+import { describe, expect, it } from "vitest";
+import { renderPalette } from "./palette.js";
+
+const h = (tag, props, ...children) => ({ tag, props, children });
+const noop = () => {};
+const React = { Fragment: "Fragment", useState: (initial) => [initial, noop] };
+
+function props(overrides = {}) {
+  return Object.assign({
+    createElement: h,
+    React,
+    activeSpec: null,
+    goalText: "",
+    setGoalText: noop,
+    newWorkflowName: "",
+    setNewWorkflowName: noop,
+    draftFromGoal: noop,
+    drafting: false,
+    startBlankWorkflow: noop,
+    refineWorkflow: noop,
+    refining: false,
+    refineText: "",
+    setRefineText: noop,
+    draftResult: null,
+    candidateSource: null,
+    acceptDraftCandidate: noop,
+    rejectDraftCandidate: noop,
+    definitions: [],
+    selectedDefinition: null,
+    loadDefinition: () => Promise.resolve(),
+    executions: [],
+    loadExecution: () => Promise.resolve(),
+    addTriggerOfType: noop,
+    addWorkflowCellOfType: noop,
+  }, overrides);
+}
+
+function contains(node, predicate) {
+  if (Array.isArray(node)) return node.some((child) => contains(child, predicate));
+  if (!node || typeof node !== "object") return predicate(node);
+  return predicate(node) || contains(node.children, predicate);
+}
+
+describe("renderPalette", () => {
+  it("returns an element with a palette class", () => {
+    const node = renderPalette(props());
+    expect(node.props.className).toContain("palette");
+  });
+
+  it("shows the workflow creation form when no workflow is active", () => {
+    const node = renderPalette(props({ activeSpec: null }));
+    expect(contains(node, (value) => value === "Generate From Prompt")).toBe(true);
+    expect(contains(node, (value) => value === "Start From Scratch")).toBe(true);
+  });
+});

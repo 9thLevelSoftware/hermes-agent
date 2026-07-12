@@ -31,8 +31,10 @@ import {
   triggerIntakeFromForm,
   readyPathFromTrigger,
   changeNodeType,
+  defaultTriggerForType,
 } from "./editor-model.js";
 import { makeWorkflowNode } from "./canvas-nodes.js";
+import { renderPalette } from "./palette.js";
 import { renderInspector } from "./inspector.js";
 
 (function () {
@@ -57,7 +59,7 @@ import { renderInspector } from "./inspector.js";
   const applyEdgeChanges = FlowSDK.applyEdgeChanges;
   const API = "/api/plugins/workflows";
   const DEFINITIONS_API = "/api/plugins/workflows/definitions";
-  const NODE_KIND_LIST = ["trigger", "pass", "switch", "agent_task", "wait", "parallel", "join", "fail"];
+  const NODE_KIND_LIST = ["trigger", "pass", "switch", "agent_task", "wait", "parallel", "join", "fail", "send_message", "subworkflow"];
   const FALLBACK_IMPLEMENTED_TRIGGER_TYPES = ["manual", "schedule"];
   const FALLBACK_IMPLEMENTED_NODE_TYPES = ["pass", "switch", "agent_task", "wait", "parallel", "join", "fail"];
   const EXAMPLE_DEFINITION = [
@@ -841,10 +843,10 @@ import { renderInspector } from "./inspector.js";
 
   function addSpecTrigger(spec, triggerId, triggerType, scheduleText) {
     const next = cloneSpec(spec || newWorkflowSpec("Workflow Draft"));
-    const type = triggerType === "schedule" ? "schedule" : "manual";
+    const type = triggerType === "schedule" || triggerType === "webhook" ? triggerType : "manual";
     const id = uniqueWorkflowId(next, triggerId || type || "trigger");
-    const trigger = { id: id, type: type };
-    if (type === "schedule") trigger.schedule = String(scheduleText || "0 9 * * *").trim() || "0 9 * * *";
+    const trigger = defaultTriggerForType(type, id);
+    if (type === "schedule") trigger.schedule = String(scheduleText || trigger.schedule || "0 9 * * *").trim() || "0 9 * * *";
     next.triggers = asArray(next.triggers).filter(function (existing) {
       return String((existing && (existing.id || existing.name)) || "") !== id;
     });
@@ -2239,7 +2241,6 @@ import { renderInspector } from "./inspector.js";
           delete nextNode.cases;
           delete nextNode.default;
         }
-      }
         if (nextType === "send_message") {
           const platform = ["auto", "discord", "telegram", "slack"].indexOf(sendMessagePlatform) !== -1 ? sendMessagePlatform : "auto";
           if (sendMessageTarget.trim()) nextNode.target = sendMessageTarget.trim();
@@ -2354,7 +2355,7 @@ import { renderInspector } from "./inspector.js";
     }
 
     function addTriggerOfType(type) {
-      const safeType = type === "schedule" ? "schedule" : "manual";
+      const safeType = type === "schedule" || type === "webhook" ? type : "manual";
       const baseSpec = activeSpec() || newWorkflowSpec(newWorkflowName || goalText || "Workflow Draft");
       const nextSpec = addSpecTrigger(baseSpec, safeType, safeType, newTriggerSchedule);
       setActiveDraftSpec(nextSpec, "Added " + safeString(safeType) + " trigger.");
@@ -2959,7 +2960,7 @@ import { renderInspector } from "./inspector.js";
             event.preventDefault();
             setIsDragOver(false);
             const type = (event.dataTransfer && event.dataTransfer.getData("text/plain")) || window.__HERMES_DRAG_NODE_TYPE || "";
-            if (type === "manual" || type === "schedule") {
+            if (type === "manual" || type === "schedule" || type === "webhook") {
               addTriggerOfType(type);
             } else if (type) {
               addWorkflowCellAtPosition(type);
@@ -3482,7 +3483,6 @@ import { renderInspector } from "./inspector.js";
         className: "hermes-workflows-build-mode",
       },
         h("div", { className: "hermes-workflows-canvas-area" },
-          renderBuilderToolbar(activeSpec()),
           h("div", { className: "hermes-workflows-canvas-main" },
             h("div", { className: "hermes-workflows-canvas-wrap" },
               activeSpec() ? renderReactFlowGraph(activeSpec()) : h("div", { className: "hermes-workflows-muted", style: {padding: "2rem", textAlign: "center"} }, "No workflow loaded. Use the sidebar to draft a new workflow or select an existing one.")
@@ -3702,7 +3702,33 @@ import { renderInspector } from "./inspector.js";
           ) : null
         ) : null,
         h("div", { className: "hermes-workflows-body" },
-          renderSidebar(),
+          renderPalette({
+            createElement: h,
+            React: React,
+            activeSpec: spec,
+            goalText: goalText,
+            setGoalText: setGoalText,
+            newWorkflowName: newWorkflowName,
+            setNewWorkflowName: setNewWorkflowName,
+            draftFromGoal: draftFromGoal,
+            drafting: drafting,
+            startBlankWorkflow: startBlankWorkflow,
+            refineWorkflow: refineWorkflow,
+            refining: refining,
+            refineText: refineText,
+            setRefineText: setRefineText,
+            draftResult: draftResult,
+            candidateSource: candidateSource,
+            acceptDraftCandidate: acceptDraftCandidate,
+            rejectDraftCandidate: rejectDraftCandidate,
+            definitions: definitions,
+            selectedDefinition: selectedDefinition,
+            loadDefinition: loadDefinition,
+            executions: executions,
+            loadExecution: loadExecution,
+            addTriggerOfType: addTriggerOfType,
+            addWorkflowCellOfType: addWorkflowCellOfType,
+          }),
           renderActiveMode(),
           workspaceMode === "build" ? renderBottomPanelModule({
             createElement: h,
