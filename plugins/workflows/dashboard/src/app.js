@@ -2990,7 +2990,7 @@ import { renderInspector } from "./inspector.js";
       }
 
       if (!ReactFlow || !ReactFlowProvider) {
-        return spec ? renderSimpleGraph(spec) : renderCanvasOnboarding("hermes-workflows-simple-canvas-onboarding");
+        return spec ? renderSimpleGraph(spec) : renderCanvasOnboarding("hermes-workflows-canvas-onboarding hermes-workflows-simple-canvas-onboarding");
       }
       const nodes = spec ? flowNodes : [];
       const edges = spec ? flowEdges : [];

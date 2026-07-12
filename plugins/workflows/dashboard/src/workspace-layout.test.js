@@ -43,6 +43,6 @@ describe("workflow canvas workspace layout", () => {
     const canvasSource = appSource.slice(canvasStart, canvasEnd);
     expect(canvasSource).toContain("renderWorkflowOnboarding(");
     expect(canvasSource).not.toContain("renderPalette({");
-    expect(canvasSource).toContain("hermes-workflows-simple-canvas-onboarding");
+    expect(canvasSource).toContain("renderCanvasOnboarding(\"hermes-workflows-canvas-onboarding hermes-workflows-simple-canvas-onboarding\")");
   });
 });

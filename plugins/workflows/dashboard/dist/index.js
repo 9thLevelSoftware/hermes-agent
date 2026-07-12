@@ -4153,7 +4153,7 @@
 						rejectDraftCandidate
 					})));
 				}
-				if (!ReactFlow || !ReactFlowProvider) return spec ? renderSimpleGraph(spec) : renderCanvasOnboarding("hermes-workflows-simple-canvas-onboarding");
+				if (!ReactFlow || !ReactFlowProvider) return spec ? renderSimpleGraph(spec) : renderCanvasOnboarding("hermes-workflows-canvas-onboarding hermes-workflows-simple-canvas-onboarding");
 				return h("div", { className: "hermes-workflows-flow-surface" }, h("div", {
 					className: "hermes-workflows-canvas" + (isDragOver ? " hermes-workflows-canvas-drop-target" : ""),
 					onDragOver: function(event) {
