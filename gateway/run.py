@@ -4096,10 +4096,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         If the error is retryable (e.g. network blip, DNS failure), queue the
         platform for background reconnection instead of giving up permanently.
         """
+        lock = getattr(self, "_adapter_state_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._adapter_state_lock = lock
+        claims = getattr(self, "_fatal_adapter_claims", None)
+        if claims is None:
+            claims = set()
+            self._fatal_adapter_claims = claims
+
         # Atomically claim the adapter before recording health or awaiting
         # teardown. Primary-profile adapters are removed here; secondary-profile
         # adapters are still allowed through when they are not in self.adapters.
-        with self._adapter_state_lock:
+        with lock:
             existing = self.adapters.get(adapter.platform)
             if existing is not None and existing is not adapter:
                 logger.debug(
@@ -4110,14 +4119,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
 
             adapter_id = id(adapter)
-            if adapter_id in self._fatal_adapter_claims:
+            if adapter_id in claims:
                 logger.debug(
                     "Ignoring repeated fatal error from %s adapter instance: %s",
                     adapter.platform.value,
                     adapter.fatal_error_code or "unknown",
                 )
                 return
-            self._fatal_adapter_claims.add(adapter_id)
+            claims.add(adapter_id)
             owns_primary_slot = existing is adapter
             if owns_primary_slot:
                 self.adapters.pop(adapter.platform, None)
