@@ -30,4 +30,9 @@ describe("workflow canvas workspace layout", () => {
     expect(appSource).toContain("addWorkflowCellAtPosition(type, dropPosition)");
     expect(appSource).toContain("function addWorkflowCellAtPosition(type, position)");
   });
+
+  it("keeps the React Flow canvas mounted while onboarding has no workflow", () => {
+    expect(appSource).toContain("renderReactFlowGraph(activeSpec())");
+    expect(appSource).not.toContain("No workflow loaded. Use the sidebar to draft a new workflow or select an existing one.");
+  });
 });

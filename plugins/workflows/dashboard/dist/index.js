@@ -1063,6 +1063,7 @@
 				}, category.name), h("div", { className: "hermes-workflows-node-palette" }, category.nodes.map(renderNodeCard)));
 			}) : h("p", { className: "hermes-workflows-muted" }, "No nodes match “" + String(search) + "”."));
 		}
+		if (props.variant === "onboarding") return h("div", { className: "hermes-workflows-onboarding-form" }, renderWorkflowForm());
 		return h("aside", { className: "hermes-workflows-sidebar hermes-workflows-palette" }, h("div", {
 			className: "hermes-workflows-palette-tabs",
 			role: "tablist",
@@ -4142,8 +4143,8 @@
 						delete window.__HERMES_DRAG_NODE_TYPE;
 					}
 				}, h(ReactFlowProvider, null, h(ReactFlow, {
-					nodes: flowNodes,
-					edges: flowEdges,
+					nodes: spec ? flowNodes : [],
+					edges: spec ? flowEdges : [],
 					nodeTypes: NODE_TYPES,
 					fitView: false,
 					nodesDraggable: true,
@@ -4219,7 +4220,27 @@
 							});
 						}
 					}
-				}, Controls ? h(Controls, null) : null)), contextMenu.visible ? h(React.Fragment, null, h("div", {
+				}, Controls ? h(Controls, null) : null)), !spec ? h("div", { className: "hermes-workflows-canvas-onboarding" }, h("div", { className: "hermes-workflows-canvas-onboarding-card" }, renderPalette({
+					variant: "onboarding",
+					createElement: h,
+					React,
+					activeSpec: null,
+					goalText,
+					setGoalText,
+					newWorkflowName,
+					setNewWorkflowName,
+					draftFromGoal,
+					drafting,
+					startBlankWorkflow,
+					refineWorkflow,
+					refining,
+					refineText,
+					setRefineText,
+					draftResult,
+					candidateSource,
+					acceptDraftCandidate,
+					rejectDraftCandidate
+				}))) : null, contextMenu.visible ? h(React.Fragment, null, h("div", {
 					className: "hermes-workflows-context-menu-overlay",
 					style: {
 						position: "fixed",
@@ -4297,13 +4318,7 @@
 					role: "tabpanel",
 					"aria-label": "Build workflow",
 					className: "hermes-workflows-build-mode"
-				}, h("div", { className: "hermes-workflows-canvas-area" }, h("div", { className: "hermes-workflows-canvas-main" }, h("div", { className: "hermes-workflows-canvas-wrap" }, activeSpec() ? renderReactFlowGraph(activeSpec()) : h("div", {
-					className: "hermes-workflows-muted",
-					style: {
-						padding: "2rem",
-						textAlign: "center"
-					}
-				}, "No workflow loaded. Use the sidebar to draft a new workflow or select an existing one.")))));
+				}, h("div", { className: "hermes-workflows-canvas-area" }, h("div", { className: "hermes-workflows-canvas-main" }, h("div", { className: "hermes-workflows-canvas-wrap" }, renderReactFlowGraph(activeSpec())))));
 			}
 			function renderRunMode() {
 				return h("section", {

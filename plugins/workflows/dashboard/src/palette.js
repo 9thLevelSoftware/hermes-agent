@@ -223,6 +223,10 @@ export function renderPalette(props) {
     );
   }
 
+  if (props.variant === "onboarding") {
+    return h("div", { className: "hermes-workflows-onboarding-form" }, renderWorkflowForm());
+  }
+
   return h("aside", { className: "hermes-workflows-sidebar hermes-workflows-palette" },
     h("div", { className: "hermes-workflows-palette-tabs", role: "tablist", "aria-label": "Workflow palette" },
       h("button", {

@@ -2964,6 +2964,8 @@ import { renderInspector } from "./inspector.js";
 
     function renderReactFlowGraph(spec) {
       if (!ReactFlow || !ReactFlowProvider) return renderSimpleGraph(spec);
+      const nodes = spec ? flowNodes : [];
+      const edges = spec ? flowEdges : [];
       return h("div", { className: "hermes-workflows-flow-surface" },
         h("div", {
           className: "hermes-workflows-canvas" + (isDragOver ? " hermes-workflows-canvas-drop-target" : ""),
@@ -2987,8 +2989,8 @@ import { renderInspector } from "./inspector.js";
         },
           h(ReactFlowProvider, null,
             h(ReactFlow, {
-              nodes: flowNodes,
-              edges: flowEdges,
+              nodes: nodes,
+              edges: edges,
               nodeTypes: NODE_TYPES,
               fitView: false,
               nodesDraggable: true,
@@ -3061,6 +3063,31 @@ import { renderInspector } from "./inspector.js";
               Controls ? h(Controls, null) : null
             )
           ),
+          !spec ? h("div", { className: "hermes-workflows-canvas-onboarding" },
+            h("div", { className: "hermes-workflows-canvas-onboarding-card" },
+              renderPalette({
+                variant: "onboarding",
+                createElement: h,
+                React: React,
+                activeSpec: null,
+                goalText: goalText,
+                setGoalText: setGoalText,
+                newWorkflowName: newWorkflowName,
+                setNewWorkflowName: setNewWorkflowName,
+                draftFromGoal: draftFromGoal,
+                drafting: drafting,
+                startBlankWorkflow: startBlankWorkflow,
+                refineWorkflow: refineWorkflow,
+                refining: refining,
+                refineText: refineText,
+                setRefineText: setRefineText,
+                draftResult: draftResult,
+                candidateSource: candidateSource,
+                acceptDraftCandidate: acceptDraftCandidate,
+                rejectDraftCandidate: rejectDraftCandidate,
+              })
+            )
+          ) : null,
           contextMenu.visible ? h(React.Fragment, null,
             h("div", {
               className: "hermes-workflows-context-menu-overlay",
@@ -3525,7 +3552,7 @@ import { renderInspector } from "./inspector.js";
         h("div", { className: "hermes-workflows-canvas-area" },
           h("div", { className: "hermes-workflows-canvas-main" },
             h("div", { className: "hermes-workflows-canvas-wrap" },
-              activeSpec() ? renderReactFlowGraph(activeSpec()) : h("div", { className: "hermes-workflows-muted", style: {padding: "2rem", textAlign: "center"} }, "No workflow loaded. Use the sidebar to draft a new workflow or select an existing one.")
+              renderReactFlowGraph(activeSpec())
             )
           )
         )

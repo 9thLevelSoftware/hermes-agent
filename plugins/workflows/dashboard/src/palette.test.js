@@ -52,4 +52,12 @@ describe("renderPalette", () => {
     expect(contains(node, (value) => value === "Generate From Prompt")).toBe(true);
     expect(contains(node, (value) => value === "Start From Scratch")).toBe(true);
   });
+
+  it("renders the prompt-first onboarding variant without duplicating the form", () => {
+    const node = renderPalette(props({ variant: "onboarding", activeSpec: null }));
+    expect(node.props.className).toContain("hermes-workflows-onboarding-form");
+    const json = JSON.stringify(node);
+    expect(json).toContain("Generate From Prompt");
+    expect(json).toContain("Start From Scratch");
+  });
 });

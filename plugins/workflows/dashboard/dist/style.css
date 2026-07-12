@@ -384,6 +384,53 @@
   border-radius: 0;
 }
 
+.hermes-workflows .hermes-workflows-canvas-onboarding {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  overflow: auto;
+  pointer-events: none;
+}
+
+.hermes-workflows .hermes-workflows-canvas-onboarding-card {
+  width: min(100%, 34rem);
+  max-height: calc(100% - 1rem);
+  overflow: auto;
+  padding: 1.25rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius, 0.75rem);
+  background: color-mix(in srgb, var(--color-card) 96%, transparent);
+  box-shadow: 0 16px 40px color-mix(in srgb, var(--color-background) 70%, transparent);
+  pointer-events: auto;
+}
+
+.hermes-workflows .hermes-workflows-onboarding-form input,
+.hermes-workflows .hermes-workflows-onboarding-form textarea {
+  width: 100%;
+  border: 1px solid var(--color-border);
+  border-radius: 0.4rem;
+  background: var(--color-input, var(--color-card));
+  color: var(--color-foreground);
+  padding: 0.55rem 0.65rem;
+  font: inherit;
+}
+
+.hermes-workflows .hermes-workflows-onboarding-form textarea {
+  min-height: 7rem;
+  resize: vertical;
+}
+
+.hermes-workflows .hermes-workflows-onboarding-form input:focus,
+.hermes-workflows .hermes-workflows-onboarding-form textarea:focus {
+  border-color: var(--color-primary, var(--color-foreground));
+  outline: 2px solid color-mix(in srgb, var(--color-primary, var(--color-foreground)) 28%, transparent);
+  outline-offset: 1px;
+}
+
 .hermes-workflows .hermes-workflows-canvas-wrap .react-flow {
   height: 100%;
 }
