@@ -162,3 +162,46 @@ def test_owned_session_db_retries_failed_close():
     session_db.end_session.assert_called_once_with("session-under-test", "agent_close")
     assert session_db.close.call_count == 2
     assert agent._session_db_closed is True
+
+
+def test_owned_session_db_close_that_raises_after_side_effect_is_not_retried():
+    """A close() that performs its side effect (sets _conn=None) and then
+    raises must be treated as closed: _session_db_closed flips True,
+    and a follow-up agent.close() must NOT issue another close() call
+    against a non-idempotent DB.
+    """
+
+    class NonIdempotentConn:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls > 1:
+                raise AssertionError("session DB closed twice")
+
+    class PartialCloseDB:
+        def __init__(self):
+            self._conn = NonIdempotentConn()
+
+        def end_session(self, session_id, reason):
+            return None
+
+        def close(self):
+            self._conn = None
+            raise RuntimeError("close failed after side effect")
+
+    session_db = PartialCloseDB()
+    agent = _make_agent(session_db, owns_session_db=True)
+
+    agent.close()
+
+    # Close() raised, but the side effect happened: _conn is None, so the
+    # agent's _session_db_closed flag must reflect observed state.
+    assert session_db._conn is None
+    assert agent._session_db_closed is True
+
+    # A second close() must observe the flag and skip — the partial close
+    # is durable; we don't get to retry a non-idempotent operation.
+    agent.close()
+    assert agent._session_db_closed is True

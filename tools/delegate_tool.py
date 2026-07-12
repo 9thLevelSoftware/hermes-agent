@@ -1377,13 +1377,22 @@ def _build_child_agent(
         try:
             if child is not None:
                 child.close()
+                # ponytail: close() may have torn down _conn and then
+                # raised. Observe the post-attempt state to decide
+                # whether the fallback path is even needed — calling
+                # close() again on a non-idempotent DB that already
+                # dropped its connection would double-close.
                 child_cleanup_closed_db = (
                     getattr(child, "_session_db", None) is child_session_db
                     and bool(getattr(child, "_session_db_closed", False))
-                )
+                ) or getattr(child_session_db, "_conn", "missing") is None
         except Exception:
             pass
-        if child_session_db is not None and not child_cleanup_closed_db:
+        if (
+            child_session_db is not None
+            and not child_cleanup_closed_db
+            and getattr(child_session_db, "_conn", "missing") is not None
+        ):
             try:
                 child_session_db.close()
             except Exception:

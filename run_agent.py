@@ -3625,11 +3625,18 @@ class AIAgent:
                 and not getattr(self, "_session_db_closed", False)
                 and session_db is not None
             ):
+                # ponytail: detect partial close after raise — close() may
+                # have torn down _conn and then raised; treat the observed
+                # state as authoritative so a non-idempotent DB isn't
+                # closed twice on a follow-up agent.close(). The DB is
+                # considered closed if close() returned without raising OR
+                # if its observed _conn is None post-attempt.
+                close_raised = False
                 try:
                     session_db.close()
                 except Exception:
-                    pass
-                else:
+                    close_raised = True
+                if not close_raised or getattr(session_db, "_conn", "missing") is None:
                     self._session_db_closed = True
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:

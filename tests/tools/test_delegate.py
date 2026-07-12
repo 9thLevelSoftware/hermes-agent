@@ -608,6 +608,68 @@ class TestDelegateTask(unittest.TestCase):
 
         self.assertEqual(child_db.close_calls, 1)
 
+    def test_close_raises_after_side_effect_does_not_cause_fallback_double_close(self):
+        """child.close() may set _conn=None and then raise — the fallback
+        path in _build_child_agent's except branch must observe the
+        post-attempt state and skip its own close() instead of double-
+        closing a non-idempotent DB.
+        """
+        from run_agent import AIAgent
+
+        class NonIdempotentConn:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_calls > 1:
+                    raise AssertionError("session DB closed twice")
+
+        class PartialCloseDB:
+            def __init__(self):
+                self.close_calls = 0
+                self._conn = NonIdempotentConn()
+
+            def close(self):
+                # Simulate a DB whose close() performs the actual side
+                # effect (closes _conn) and THEN raises — leaving the
+                # caller thinking the close failed even though _conn is
+                # already gone.
+                self._conn = None
+                self.close_calls += 1
+                raise RuntimeError("close failed after side effect")
+
+        parent = _make_mock_parent(depth=0)
+        parent_db = MagicMock()
+        child_db = PartialCloseDB()
+        parent_db.fork.return_value = child_db
+        parent._session_db = parent_db
+
+        def partial_init(agent, *args, **kwargs):
+            agent._session_db = kwargs["session_db"]
+            agent._owns_session_db = kwargs["owns_session_db"]
+            agent._session_db_closed = False
+            agent._end_session_on_close = False
+            raise RuntimeError("init failed after session DB ownership")
+
+        with patch("agent.agent_init.init_agent", side_effect=partial_init):
+            with self.assertRaisesRegex(RuntimeError, "init failed after session DB ownership"):
+                _build_child_agent(
+                    task_index=0,
+                    goal="Close an owned DB exactly once even after a raise",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        # The DB performed its side effect on the only call; the fallback
+        # path must observe _conn is None and NOT issue a second close().
+        self.assertEqual(child_db.close_calls, 1)
+        self.assertIsNone(child_db._conn)
+
     def test_partial_constructor_closes_client_after_init_failure(self):
         from run_agent import AIAgent
 
