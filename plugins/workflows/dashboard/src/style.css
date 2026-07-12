@@ -1204,14 +1204,20 @@
 
 .hermes-workflows .hermes-workflows-canvas-zone {
   grid-column: 2;
+  overflow: hidden;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .hermes-workflows .hermes-workflows-inspector-zone {
   grid-column: 3;
+  overflow-y: auto;
 }
 
 .hermes-workflows .hermes-workflows-bottom-zone {
   grid-column: 1 / -1;
+  overflow: hidden;
 }
 
 .hermes-workflows .hermes-workflows-rf-node.is-trigger {

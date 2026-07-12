@@ -3041,7 +3041,8 @@ import { renderInspector } from "./inspector.js";
                 }
               },
             },
-              Controls ? h(Controls, null) : null
+              Controls ? h(Controls, null) : null,
+              Background ? h(Background, { color: "var(--color-border)", gap: 16, size: 1 }) : null
             )
           ),
           contextMenu.visible ? h(React.Fragment, null,
