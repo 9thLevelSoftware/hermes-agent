@@ -18,7 +18,7 @@ describe("supportedEditorCoverage", () => {
   it("returns exact expected coverage", () => {
     expect(supportedEditorCoverage()).toEqual({
       triggers: ["manual", "schedule", "webhook", "kanban_event"],
-      nodes: ["agent_task", "fail", "join", "parallel", "pass", "send_message", "subworkflow", "switch", "wait"],
+      nodes: ["agent_task", "fail", "join", "parallel", "pass", "switch", "wait", "send_message", "subworkflow"],
       intakeModes: ["continuous", "single"],
     });
   });

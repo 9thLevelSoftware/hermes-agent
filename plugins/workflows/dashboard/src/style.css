@@ -103,9 +103,11 @@
   margin-top: 0.75rem;
 }
 
-/* Main body: left sidebar + canvas center */
+/* Canvas-first workspace: palette | graph | selected-node inspector. */
 .hermes-workflows .hermes-workflows-body {
-  display: flex;
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr) 0;
+  grid-template-rows: minmax(0, 1fr) auto;
   flex: 1;
   min-height: 0;
   gap: 0;
@@ -113,6 +115,10 @@
   border-radius: var(--radius, 0.75rem);
   background: color-mix(in srgb, var(--color-card) 88%, transparent);
   overflow: hidden;
+}
+
+.hermes-workflows .hermes-workflows-body.has-inspector {
+  grid-template-columns: 300px minmax(0, 1fr) 320px;
 }
 
 /* Left sidebar: workflow list, execution list, goal builder (collapsible) */
@@ -1188,14 +1194,10 @@
 
 /* ===== WORKFLOW BUILDER V2 LAYOUT PRIMITIVES ===== */
 
-.hermes-workflows .hermes-workflows-body {
-  display: grid;
-  grid-template-columns: 240px 1fr 280px;
-  grid-template-rows: 1fr auto;
-}
-
+/* Grid zones deliberately occupy the first row; the bottom drawer owns row two. */
 .hermes-workflows .hermes-workflows-palette-zone {
   grid-column: 1;
+  grid-row: 1;
   overflow: hidden;
   min-height: 0;
   display: flex;
@@ -1204,7 +1206,9 @@
 
 .hermes-workflows .hermes-workflows-canvas-zone {
   grid-column: 2;
+  grid-row: 1;
   overflow: hidden;
+  min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -1212,12 +1216,55 @@
 
 .hermes-workflows .hermes-workflows-inspector-zone {
   grid-column: 3;
-  overflow-y: auto;
+  grid-row: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .hermes-workflows .hermes-workflows-bottom-zone {
   grid-column: 1 / -1;
+  grid-row: 2;
   overflow: hidden;
+}
+
+.hermes-workflows .hermes-workflows-palette-zone > .hermes-workflows-sidebar {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+  height: 100%;
+  border-right: 0;
+}
+
+.hermes-workflows .hermes-workflows-canvas-zone > .hermes-workflows-build-mode,
+.hermes-workflows .hermes-workflows-canvas-zone .hermes-workflows-canvas-area,
+.hermes-workflows .hermes-workflows-canvas-zone .hermes-workflows-canvas-main,
+.hermes-workflows .hermes-workflows-canvas-zone .hermes-workflows-canvas-wrap,
+.hermes-workflows .hermes-workflows-canvas-zone .hermes-workflows-flow-surface,
+.hermes-workflows .hermes-workflows-canvas-zone .hermes-workflows-canvas {
+  flex: 1 1 auto;
+  height: 100%;
+  min-height: 0;
+}
+
+.hermes-workflows .hermes-workflows-canvas-zone > .hermes-workflows-build-mode {
+  min-height: 0;
+}
+
+.hermes-workflows .hermes-workflows-inspector-zone > .hermes-workflows-inspector {
+  height: 100%;
+  overflow-y: auto;
+  border: 0;
+  border-left: 1px solid var(--color-border);
+  border-radius: 0;
+}
+
+.hermes-workflows .hermes-workflows-canvas-zone .react-flow__pane {
+  background-color: color-mix(in srgb, var(--color-background) 92%, #00110d);
+  background-image:
+    linear-gradient(to right, color-mix(in srgb, var(--color-border) 72%, transparent) 1px, transparent 1px),
+    linear-gradient(to bottom, color-mix(in srgb, var(--color-border) 72%, transparent) 1px, transparent 1px);
+  background-size: 20px 20px;
 }
 
 .hermes-workflows .hermes-workflows-rf-node.is-trigger {

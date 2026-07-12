@@ -50,7 +50,6 @@ import { renderInspector } from "./inspector.js";
   const FlowSDK = SDK.ReactFlow || SDK.reactFlow || {};
   const ReactFlow = FlowSDK.ReactFlow;
   const ReactFlowProvider = FlowSDK.ReactFlowProvider;
-  const Background = FlowSDK.Background;
   const Controls = FlowSDK.Controls;
   const MiniMap = FlowSDK.MiniMap;
   const MarkerType = FlowSDK.MarkerType || { ArrowClosed: "arrowclosed" };
@@ -2344,23 +2343,22 @@ import { renderInspector } from "./inspector.js";
     }
 
     function addWorkflowCellOfType(type) {
-      const safeType = type || "pass";
-      const baseSpec = activeSpec() || newWorkflowSpec(newWorkflowName || goalText || "Workflow Draft");
-      const after = selectedNode && selectedNode.specKind !== "trigger" ? selectedNode.id : "";
-      const nextSpec = addSpecNodeAfter(baseSpec, safeType, safeType, after);
-      setActiveDraftSpec(nextSpec, "Added " + safeString(safeType) + " cell. Select it on the canvas to configure Properties.");
-      const id = Object.keys(nextSpec.nodes || {}).slice(-1)[0];
-      const node = findSpecNode(nextSpec, id);
-      if (node) selectNodeForInspector(node);
+      addWorkflowCellAtPosition(type, null);
     }
 
-    function addTriggerOfType(type) {
+    function addTriggerOfType(type, position) {
       const safeType = type === "schedule" || type === "webhook" ? type : "manual";
       const baseSpec = activeSpec() || newWorkflowSpec(newWorkflowName || goalText || "Workflow Draft");
       const nextSpec = addSpecTrigger(baseSpec, safeType, safeType, newTriggerSchedule);
-      setActiveDraftSpec(nextSpec, "Added " + safeString(safeType) + " trigger.");
       const trigger = asArray(nextSpec.triggers).slice(-1)[0];
-      if (trigger) selectNodeForInspector(Object.assign({}, trigger, { id: trigger.id || trigger.name, specKind: "trigger", trigger_type: trigger.type }));
+      const triggerId = trigger && (trigger.id || trigger.name);
+      if (triggerId && position) {
+        setNodePositions(function (previous) {
+          return Object.assign({}, previous, { [triggerId]: position });
+        });
+      }
+      setActiveDraftSpec(nextSpec, "Added " + safeString(safeType) + " trigger.");
+      if (trigger) selectNodeForInspector(Object.assign({}, trigger, { id: triggerId, specKind: "trigger", trigger_type: trigger.type }));
     }
 
     function addSwitchCaseFromUi() {
@@ -2379,15 +2377,29 @@ import { renderInspector } from "./inspector.js";
       setSwitchCaseEquals("");
     }
 
-    function addWorkflowCellAtPosition(type) {
+    function addWorkflowCellAtPosition(type, position) {
       const safeType = type || "pass";
       const baseSpec = activeSpec() || newWorkflowSpec(newWorkflowName || goalText || "Workflow Draft");
       const after = selectedNode && selectedNode.specKind !== "trigger" ? selectedNode.id : "";
       const nextSpec = addSpecNodeAfter(baseSpec, safeType, safeType, after);
-      setActiveDraftSpec(nextSpec, "Added " + safeString(safeType) + " cell. Configure it in the inspector.");
       const id = Object.keys(nextSpec.nodes || {}).slice(-1)[0];
+      if (id && position) {
+        setNodePositions(function (previous) {
+          return Object.assign({}, previous, { [id]: position });
+        });
+      }
+      setActiveDraftSpec(nextSpec, "Added " + safeString(safeType) + " cell. Configure it in the inspector.");
       const node = findSpecNode(nextSpec, id);
       if (node) selectNodeForInspector(node);
+    }
+
+    function flowPositionFromDropEvent(event) {
+      const clientPosition = { x: event.clientX, y: event.clientY };
+      const instance = flowInstanceRef.current;
+      if (instance && typeof instance.screenToFlowPosition === "function") {
+        return instance.screenToFlowPosition(clientPosition);
+      }
+      return clientPosition;
     }
 
     function deleteSelectedCell() {
@@ -2960,10 +2972,11 @@ import { renderInspector } from "./inspector.js";
             event.preventDefault();
             setIsDragOver(false);
             const type = (event.dataTransfer && event.dataTransfer.getData("text/plain")) || window.__HERMES_DRAG_NODE_TYPE || "";
+            const dropPosition = flowPositionFromDropEvent(event);
             if (type === "manual" || type === "schedule" || type === "webhook") {
-              addTriggerOfType(type);
+              addTriggerOfType(type, dropPosition);
             } else if (type) {
-              addWorkflowCellAtPosition(type);
+              addWorkflowCellAtPosition(type, dropPosition);
             }
             delete window.__HERMES_DRAG_NODE_TYPE;
           },
@@ -3041,8 +3054,7 @@ import { renderInspector } from "./inspector.js";
                 }
               },
             },
-              Controls ? h(Controls, null) : null,
-              Background ? h(Background, { color: "var(--color-border)", gap: 16, size: 1 }) : null
+              Controls ? h(Controls, null) : null
             )
           ),
           contextMenu.visible ? h(React.Fragment, null,
@@ -3718,7 +3730,7 @@ import { renderInspector } from "./inspector.js";
             h("button", { type: "button", className: "hermes-workflows-banner-close", "aria-label": "Dismiss alert", onClick: clearBanners }, "×")
           ) : null
         ) : null,
-        h("div", { className: "hermes-workflows-body" },
+        h("div", { className: "hermes-workflows-body" + (workspaceMode === "build" && selectedNode ? " has-inspector" : "") },
           h("div", { className: "hermes-workflows-palette-zone" },
             renderPalette({
             createElement: h,
@@ -3750,8 +3762,8 @@ import { renderInspector } from "./inspector.js";
           h("div", { className: "hermes-workflows-canvas-zone" },
             renderActiveMode()
           ),
-          workspaceMode === "build" ? h("div", { className: "hermes-workflows-inspector-zone" },
-            activeSpec() ? renderInspector(inspectorProps) : null
+          workspaceMode === "build" && selectedNode ? h("div", { className: "hermes-workflows-inspector-zone" },
+            renderInspector(inspectorProps)
           ) : null,
           h("div", { className: "hermes-workflows-bottom-zone" },
             workspaceMode === "build" ? renderBottomPanelModule({

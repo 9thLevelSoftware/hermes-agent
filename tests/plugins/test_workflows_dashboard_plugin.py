@@ -2103,8 +2103,9 @@ def test_dashboard_bundle_is_prompt_first_not_yaml_first():
     assert "Generate From Prompt" in bundle
     assert "Advanced YAML" in bundle or "YAML" in bundle
     assert "Validate / deploy definition" not in bundle
-    # In the 3-zone layout, goal builder is in the sidebar which renders before the canvas
-    assert render_tree.index("renderSidebar()") < render_tree.index(
+    # AI-first creation remains in the palette, which renders before the
+    # extracted bottom drawer in the canvas-first layout.
+    assert render_tree.index("renderPalette(") < render_tree.index(
         "renderBottomPanelModule("
     )
     assert bundle.index("New workflow") < bundle.index("renderBuilderToolbar")
@@ -2252,8 +2253,11 @@ def test_dashboard_bundle_contains_visual_editor_markers():
     bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     assert "SDK.ReactFlow" in bundle or "SDK.reactFlow" in bundle
     assert "ReactFlowProvider" in bundle
-    for marker in ["Background", "Controls", "MiniMap", "Handle", "Position"]:
+    for marker in ["Controls", "MiniMap", "Handle", "Position"]:
         assert marker in bundle
+    css = (PLUGIN_DIR / "style.css").read_text(encoding="utf-8") if (PLUGIN_DIR / "style.css").exists() else (PLUGIN_DIR / "src" / "style.css").read_text(encoding="utf-8")
+    assert "react-flow__pane" in css
+    assert "linear-gradient(to right" in css
     for marker in ["upsertSpecEdge", "Connection added to workflow draft"]:
         assert marker in bundle
 
