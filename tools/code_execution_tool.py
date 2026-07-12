@@ -208,8 +208,12 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
 
 
 def check_sandbox_requirements() -> bool:
-    """Code execution sandbox requires a POSIX OS for Unix domain sockets."""
+    """Code execution sandbox requires a POSIX OS for Unix domain sockets
+    and a working terminal backend (execute_code dispatches through it)."""
     if not SANDBOX_AVAILABLE:
+        return False
+    from tools.terminal_tool import check_terminal_requirements
+    if not check_terminal_requirements():
         return False
     return True
 
