@@ -8,15 +8,20 @@ Routes messages to the appropriate destination based on:
 - Local (always saved to files)
 """
 
+import hashlib
+import json
 import logging
 import os
 import re
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
+
+if TYPE_CHECKING:  # pragma: no cover - type-only
+    from agent.operation_journal import OperationJournal
 
 logger = logging.getLogger(__name__)
 
@@ -228,20 +233,60 @@ class DeliveryRouter:
     """
     
     def __init__(self, config: GatewayConfig, adapters: Dict[Platform, Any] = None,
-                 dead_targets: Optional[DeadTargetRegistry] = None):
+                 dead_targets: Optional[DeadTargetRegistry] = None,
+                 journal: Optional["OperationJournal"] = None):
         """
         Initialize the delivery router.
-        
+
         Args:
             config: Gateway configuration
             adapters: Dict mapping platforms to their adapter instances
             dead_targets: Optional shared registry of confirmed-unreachable
                 targets.  When omitted, a profile-local registry is created.
+            journal: Optional OperationJournal for durable delivery
+                tracking.  When set, callers MUST pass a stable
+                ``metadata["delivery_id"]`` so re-runs after a crash can
+                dedupe (Task 9).  Omit for legacy / non-cron callers.
         """
         self.config = config
         self.adapters = adapters or {}
         self.output_dir = get_hermes_home() / "cron" / "output"
         self.dead_targets = dead_targets or DeadTargetRegistry()
+        self.journal = journal
+
+    @staticmethod
+    def _payload_hash(content: str) -> str:
+        """SHA-256 hex of the outbound payload — used as the OperationJournal
+        identity component for dedup.  ``hashlib.sha256`` is stdlib and
+        collision-resistant enough that a re-send with the same hash is
+        safe to treat as the same operation."""
+        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def _journal_receipt(self, target: DeliveryTarget, result: Any) -> Dict[str, Any]:
+        """Build the bounded receipt metadata for a successful send.
+
+        Stores ONLY the fields needed to recover from a crash (message_id,
+        platform, success flag, target chat).  NEVER stores the full
+        content, NEVER stores credentials or adapter kwargs.  This is the
+        durable proof-of-flight row.
+        """
+        receipt: Dict[str, Any] = {
+            "platform": target.platform.value,
+            "chat_id": target.chat_id,
+            "success": True,
+        }
+        if result is not None:
+            message_id = getattr(result, "message_id", None)
+            if message_id is None and isinstance(result, dict):
+                message_id = result.get("message_id")
+            if message_id is not None:
+                receipt["message_id"] = str(message_id)
+            continuation = getattr(result, "continuation_message_ids", None)
+            if continuation:
+                receipt["continuation_message_ids"] = [
+                    str(m) for m in continuation
+                ]
+        return receipt
     
     async def deliver(
         self,
@@ -391,15 +436,138 @@ class DeliveryRouter:
         content: str,
         metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Deliver content to a messaging platform."""
+        """Deliver content to a messaging platform.
+
+        When the router was constructed with a ``journal``, this method
+        records each send as an ``agent_operations`` row (kind=
+        ``outbound_delivery``) so a process restart cannot double-send.
+        Caller must supply a stable ``metadata["delivery_id"]``; the
+        content is hashed to detect identity reuse (same id, different
+        payload) which is a programmer error and raises.
+        """
+        # ── Journal preamble ────────────────────────────────────────────
+        # Local/file delivery is not a transport round-trip; no journal row.
+        # Without a journal, behavior is byte-identical to legacy callers.
+        delivery_id: Optional[str] = None
+        if self.journal is not None and target.platform != Platform.LOCAL:
+            delivery_id = (metadata or {}).get("delivery_id")
+            if not delivery_id or not isinstance(delivery_id, str):
+                raise ValueError(
+                    "DeliveryRouter with a journal requires a stable "
+                    "metadata['delivery_id'] (got "
+                    f"{delivery_id!r}) for {target.platform.value}:"
+                    f"{target.chat_id}"
+                )
+            destination = (
+                f"{target.platform.value}:{target.chat_id}"
+                f"{':' + target.thread_id if target.thread_id else ''}"
+            )
+            payload_hash = self._payload_hash(content)
+            existing = self.journal.get(delivery_id)
+            if existing is not None:
+                if (
+                    existing.kind != "outbound_delivery"
+                    or existing.destination != destination
+                    or existing.payload_hash != payload_hash
+                ):
+                    raise ValueError(
+                        f"delivery_id {delivery_id!r} already identifies "
+                        "a different operation "
+                        f"(kind={existing.kind}, destination="
+                        f"{existing.destination}, payload_hash="
+                        f"{existing.payload_hash[:12]}…)"
+                    )
+                # Same identity — if already terminal, short-circuit so a
+                # restart-reattempt does not duplicate the wire send.
+                if existing.state in ("confirmed", "failed", "unknown", "cancelled"):
+                    logger.info(
+                        "Skipping outbound delivery %s — already %s",
+                        delivery_id, existing.state,
+                    )
+                    dedup_result: Dict[str, Any] = {
+                        "success": True,
+                        "deduped": True,
+                        "delivery_id": delivery_id,
+                        "state": existing.state,
+                    }
+                    # Surface the prior message_id when we know it, so the
+                    # caller's response payload is byte-comparable to a
+                    # fresh send.
+                    if existing.result_json:
+                        try:
+                            prior = json.loads(existing.result_json)
+                            if isinstance(prior, dict) and prior.get("message_id"):
+                                dedup_result["message_id"] = prior["message_id"]
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return dedup_result
+                # In-flight on disk from before this process started: the
+                # boot-time reconcile_after_restart() should have flipped
+                # it to unknown. If a caller forgot to reconcile, treat it
+                # as unknown here too — never auto-resume mid-flight.
+                self.journal.transition(
+                    delivery_id,
+                    from_states={"running", "dispatched"},
+                    to_state="unknown",
+                    effect_disposition="unknown",
+                    error="resume attempted without reconcile_after_restart",
+                )
+                return {
+                    "success": True,
+                    "deduped": True,
+                    "delivery_id": delivery_id,
+                    "state": "unknown",
+                }
+            # Brand-new delivery — create the row in pending state, then
+            # advance to running (an in-memory-only state useful for crash
+            # forensics; the on-wire dispatch happens next).
+            self.journal.create(
+                operation_id=delivery_id,
+                kind="outbound_delivery",
+                destination=destination,
+                payload_hash=payload_hash,
+            )
+            self.journal.transition(
+                delivery_id,
+                from_states={"pending"},
+                to_state="running",
+                effect_disposition="none",
+            )
+            journal = self.journal
+        else:
+            journal = None
+
         adapter = self.adapters.get(target.platform)
-        
+
+        # ── Pre-dispatch failure path ──────────────────────────────────
+        # If the failure happens BEFORE we hand the content to the adapter,
+        # we know it never flew — record ``failed/none`` so the caller
+        # (or a restart) can deterministically know.
+        def _record_pre_dispatch_failed(err: str) -> None:
+            if journal is None or delivery_id is None:
+                return
+            try:
+                journal.transition(
+                    delivery_id,
+                    from_states={"running"},
+                    to_state="failed",
+                    effect_disposition="none",
+                    error=err,
+                )
+            except Exception as journal_exc:  # noqa: BLE001 — never crash the caller
+                logger.warning(
+                    "journal transition to failed/none failed for %s: %s",
+                    delivery_id, journal_exc,
+                )
+
         if not adapter:
+            _record_pre_dispatch_failed(f"no adapter for {target.platform.value}")
             raise ValueError(f"No adapter configured for {target.platform.value}")
-        
+
         if not target.chat_id:
+            _record_pre_dispatch_failed(f"no chat_id for {target.platform.value}")
             raise ValueError(f"No chat ID for {target.platform.value} delivery")
-        
+
         # Guard: handle oversized cron output.
         #
         # Two independent decisions:
@@ -465,6 +633,25 @@ class DeliveryRouter:
                 target.chat_id,
                 content[:40],
             )
+            # The filter is a deterministic, known outcome: the message never
+            # flies. Record ``confirmed/none`` so the caller / restart does not
+            # redeliver. The bounded receipt captures the filter decision and
+            # nothing more — no content, no credentials.
+            if journal is not None and delivery_id is not None:
+                try:
+                    journal.transition(
+                        delivery_id,
+                        from_states={"running"},
+                        to_state="confirmed",
+                        effect_disposition="none",
+                        result={"filtered": "silence_narration"},
+                    )
+                except Exception as journal_exc:  # noqa: BLE001
+                    logger.warning(
+                        "journal transition to confirmed/none (silence) failed "
+                        "for %s: %s",
+                        delivery_id, journal_exc,
+                    )
             return {
                 "success": True,
                 "filtered": "silence_narration",
@@ -524,7 +711,53 @@ class DeliveryRouter:
                 send_metadata["telegram_dm_topic_reply_fallback"] = True
             elif "thread_id" not in send_metadata and "message_thread_id" not in send_metadata and not has_explicit_direct_topic:
                 send_metadata["thread_id"] = target_thread_id
-        result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+
+        # ── On-wire dispatch (journaled) ───────────────────────────────
+        # transition to ``dispatched`` BEFORE the adapter call so a crash
+        # mid-send leaves the row recoverable: ``reconcile_after_restart``
+        # flips dispatched→unknown on the next boot.
+        if journal is not None and delivery_id is not None:
+            try:
+                journal.transition(
+                    delivery_id,
+                    from_states={"running"},
+                    to_state="dispatched",
+                    effect_disposition="unknown",
+                )
+            except Exception as journal_exc:  # noqa: BLE001
+                logger.warning(
+                    "journal transition to dispatched/unknown failed for %s: %s",
+                    delivery_id, journal_exc,
+                )
+
+        try:
+            result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+        except BaseException as dispatch_exc:
+            # CancelledError / KeyboardInterrupt / generic exception: we
+            # did NOT get a confirmed response from the adapter, so we
+            # cannot claim success. Record ``unknown/unknown`` so a
+            # subsequent restart cannot auto-retry (which would risk a
+            # duplicate). The bounded error captures the dispatch path,
+            # not the content.
+            if journal is not None and delivery_id is not None:
+                try:
+                    err_text = type(dispatch_exc).__name__
+                    if getattr(dispatch_exc, "args", None):
+                        err_text = f"{err_text}: {dispatch_exc}"
+                    journal.transition(
+                        delivery_id,
+                        from_states={"dispatched"},
+                        to_state="unknown",
+                        effect_disposition="unknown",
+                        error=err_text,
+                    )
+                except Exception as journal_exc:  # noqa: BLE001
+                    logger.warning(
+                        "journal transition to unknown/unknown failed for %s: %s",
+                        delivery_id, journal_exc,
+                    )
+            raise
+
         if _send_result_failed(result):
             if (
                 is_named_telegram_private_topic
@@ -549,7 +782,43 @@ class DeliveryRouter:
                 send_metadata["telegram_dm_topic_created_for_send"] = True
                 result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
             if _send_result_failed(result):
-                raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
+                # Adapter explicitly reported failure — ``failed/none`` is
+                # honest: it didn't fly, but we know it didn't fly.
+                if journal is not None and delivery_id is not None:
+                    try:
+                        journal.transition(
+                            delivery_id,
+                            from_states={"dispatched"},
+                            to_state="failed",
+                            effect_disposition="none",
+                            error=_send_result_error(result) or "send failed",
+                        )
+                    except Exception as journal_exc:  # noqa: BLE001
+                        logger.warning(
+                            "journal transition to failed/none failed for %s: %s",
+                            delivery_id, journal_exc,
+                        )
+                raise RuntimeError(
+                    _send_result_error(result) or f"{target.platform.value} delivery failed"
+                )
+
+        # Success path — record ``confirmed/landed`` with a bounded
+        # receipt (message_id + platform + chat_id; never the content
+        # or any credentials).
+        if journal is not None and delivery_id is not None:
+            try:
+                journal.transition(
+                    delivery_id,
+                    from_states={"dispatched"},
+                    to_state="confirmed",
+                    effect_disposition="landed",
+                    result=self._journal_receipt(target, result),
+                )
+            except Exception as journal_exc:  # noqa: BLE001
+                logger.warning(
+                    "journal transition to confirmed/landed failed for %s: %s",
+                    delivery_id, journal_exc,
+                )
         return result
 
 

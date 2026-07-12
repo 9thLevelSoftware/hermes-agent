@@ -1677,6 +1677,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
+            # Task 9: stable per-fire delivery identity for the
+            # OperationJournal (kind=outbound_delivery). The router keys
+            # dedup off this; a restart re-attempt with the same id+hash
+            # is short-circuited.  ``int(time.time())`` is the fire
+            # timestamp — one tick of cron = one id.  Multiple targets on
+            # the same fire get their own id by suffixing the target key.
+            route_metadata["delivery_id"] = (
+                f"cron:{job['id']}:{int(time.time())}:{platform_name}:{chat_id}"
+            )
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
