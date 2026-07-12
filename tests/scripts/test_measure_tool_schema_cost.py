@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+import json
 from typing import Any
+
+import pytest
 
 
 def _td(name: str, description: str = "tool") -> dict[str, Any]:
@@ -76,16 +80,98 @@ def test_measure_tool_schema_cost_keeps_all_tools_when_threshold_skips(monkeypat
     assert result["saved_tokens"] == 0
 
 
-def test_current_cost_discovers_mcp_before_get_tool_definitions(monkeypatch):
+def test_current_cost_suppresses_discovery_and_shuts_down_after_measurement(
+    monkeypatch, capsys
+):
     from scripts import measure_tool_schema_cost as script
     from tools import tool_search
 
     calls = []
+
+    class SuppressInteractiveOAuth:
+        def __enter__(self):
+            calls.append("suppress_enter")
+            return self
+
+        def __exit__(self, *_exc):
+            calls.append("suppress_exit")
+
     monkeypatch.setattr(
         script,
-        "discover_mcp_tools",
-        lambda: calls.append("discover"),
+        "suppress_interactive_oauth",
+        lambda: SuppressInteractiveOAuth(),
     )
+
+    def discover():
+        print("discover diagnostic")
+        calls.append("discover")
+
+    def get_tool_definitions(**kwargs):
+        print("get diagnostic")
+        calls.append("get_tool_definitions")
+        return []
+
+    def measure(*args, **kwargs):
+        print("measure diagnostic")
+        calls.append("measure")
+        return {}
+
+    def shutdown():
+        print("shutdown diagnostic")
+        calls.append("shutdown")
+
+    monkeypatch.setattr(script, "discover_mcp_tools", discover)
+    monkeypatch.setattr(script, "get_tool_definitions", get_tool_definitions)
+    monkeypatch.setattr(
+        script,
+        "load_config",
+        lambda: tool_search.ToolSearchConfig.from_raw({}),
+    )
+    monkeypatch.setattr(script, "_resolve_active_context_length", lambda: 0)
+    monkeypatch.setattr(script, "measure_tool_schema_cost", measure)
+    monkeypatch.setattr(script, "shutdown_mcp_servers", shutdown)
+
+    assert script._current_cost() == {}
+
+    assert calls == [
+        "suppress_enter",
+        "discover",
+        "get_tool_definitions",
+        "measure",
+        "suppress_exit",
+        "shutdown",
+    ]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_current_cost_shuts_down_when_discovery_raises(monkeypatch):
+    from scripts import measure_tool_schema_cost as script
+
+    calls = []
+    monkeypatch.setattr(script, "suppress_interactive_oauth", nullcontext)
+
+    def fail_discovery():
+        calls.append("discover")
+        raise RuntimeError("discovery failed")
+
+    monkeypatch.setattr(script, "discover_mcp_tools", fail_discovery)
+    monkeypatch.setattr(script, "shutdown_mcp_servers", lambda: calls.append("shutdown"))
+
+    with pytest.raises(RuntimeError, match="discovery failed"):
+        script._current_cost()
+
+    assert calls == ["discover", "shutdown"]
+
+
+def test_current_cost_shuts_down_when_measurement_raises(monkeypatch):
+    from scripts import measure_tool_schema_cost as script
+    from tools import tool_search
+
+    calls = []
+    monkeypatch.setattr(script, "suppress_interactive_oauth", nullcontext)
+    monkeypatch.setattr(script, "discover_mcp_tools", lambda: calls.append("discover"))
     monkeypatch.setattr(
         script,
         "get_tool_definitions",
@@ -97,11 +183,66 @@ def test_current_cost_discovers_mcp_before_get_tool_definitions(monkeypatch):
         lambda: tool_search.ToolSearchConfig.from_raw({}),
     )
     monkeypatch.setattr(script, "_resolve_active_context_length", lambda: 0)
-    monkeypatch.setattr(script, "measure_tool_schema_cost", lambda *args, **kwargs: {})
 
-    script._current_cost()
+    def fail_measurement(*args, **kwargs):
+        calls.append("measure")
+        raise RuntimeError("measurement failed")
 
-    assert calls == ["discover", "get_tool_definitions"]
+    monkeypatch.setattr(script, "measure_tool_schema_cost", fail_measurement)
+    monkeypatch.setattr(script, "shutdown_mcp_servers", lambda: calls.append("shutdown"))
+
+    with pytest.raises(RuntimeError, match="measurement failed"):
+        script._current_cost()
+
+    assert calls == ["discover", "get_tool_definitions", "measure", "shutdown"]
+
+
+def test_main_json_emits_only_measurement_json(monkeypatch, capsys):
+    from scripts import measure_tool_schema_cost as script
+    from tools import tool_search
+
+    result = {
+        "raw_tools": 1,
+        "raw_tokens": 2,
+        "visible_tools": 3,
+        "visible_tokens": 4,
+        "deferred_tools": 5,
+        "saved_tokens": 6,
+    }
+    monkeypatch.setattr(script, "suppress_interactive_oauth", nullcontext)
+    monkeypatch.setattr(script, "discover_mcp_tools", lambda: print("discover diagnostic"))
+    monkeypatch.setattr(
+        script,
+        "get_tool_definitions",
+        lambda **kwargs: print("get diagnostic") or [],
+    )
+    monkeypatch.setattr(
+        script,
+        "load_config",
+        lambda: tool_search.ToolSearchConfig.from_raw({}),
+    )
+    monkeypatch.setattr(script, "_resolve_active_context_length", lambda: 0)
+    monkeypatch.setattr(
+        script,
+        "measure_tool_schema_cost",
+        lambda *args, **kwargs: print("measure diagnostic") or result,
+    )
+    monkeypatch.setattr(script, "shutdown_mcp_servers", lambda: print("shutdown diagnostic"))
+
+    assert script.main(["--json"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload == result
+    assert set(payload) == {
+        "raw_tools",
+        "raw_tokens",
+        "visible_tools",
+        "visible_tokens",
+        "deferred_tools",
+        "saved_tokens",
+    }
 
 
 def test_current_cost_forwards_runtime_context_length(monkeypatch):

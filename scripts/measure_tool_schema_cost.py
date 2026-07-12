@@ -16,7 +16,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from model_tools import _resolve_active_context_length, get_tool_definitions
-from tools.mcp_tool import discover_mcp_tools
+from tools.mcp_oauth import suppress_interactive_oauth
+from tools.mcp_tool import discover_mcp_tools, shutdown_mcp_servers
 from tools.tool_search import (
     ToolSearchConfig,
     assemble_tool_defs,
@@ -65,17 +66,23 @@ def measure_tool_schema_cost(
 
 
 def _current_cost() -> dict[str, int]:
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        discover_mcp_tools()
-        raw_defs = get_tool_definitions(
-            quiet_mode=True,
-            skip_tool_search_assembly=True,
-        )
-    return measure_tool_schema_cost(
-        raw_defs,
-        config=load_config(),
-        context_length=_resolve_active_context_length(),
-    )
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with suppress_interactive_oauth():
+                discover_mcp_tools()
+                raw_defs = get_tool_definitions(
+                    quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                )
+                result = measure_tool_schema_cost(
+                    raw_defs,
+                    config=load_config(),
+                    context_length=_resolve_active_context_length(),
+                )
+                return result
+    finally:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            shutdown_mcp_servers()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
