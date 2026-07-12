@@ -7554,6 +7554,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # idle case where the subagent finishes with no agent turn running.
         asyncio.create_task(self._async_delegation_watcher())
 
+        # Re-cover orphan async delegations from a prior process (Task 8).
+        # The journal reconciles any in-flight rows to 'unknown'; then we
+        # restore every terminal unacknowledged row onto the shared completion
+        # queue so _async_delegation_watcher picks it up the same way it would
+        # a fresh event. journal ack keeps a future restart from re-firing it.
+        try:
+            from agent.operation_journal import OperationJournal
+            from tools.async_delegation import (
+                restore_unacknowledged_delegations,
+            )
+            from tools.process_registry import process_registry as _pr_gw
+
+            _db = (
+                getattr(self._session_db, "_db", None)
+                if self._session_db is not None
+                else None
+            )
+            if _db is not None:
+                _op_journal = OperationJournal(_db)
+                _moved = _op_journal.reconcile_after_restart()
+                _restored = restore_unacknowledged_delegations(
+                    _pr_gw.completion_queue, _pr_gw.completion_queue.put,
+                )
+                if _moved or _restored:
+                    logger.info(
+                        "Async delegation durable journal: reconciled %d in-flight, "
+                        "restored %d unacknowledged terminal rows onto completion queue",
+                        _moved, _restored,
+                    )
+        except Exception as _e:  # noqa: BLE001
+            logger.debug(
+                "Async delegation durable journal startup skipped: %s", _e,
+            )
+
         # Start the scale-to-zero idle watcher ONLY when this instance is opted
         # in (the NAS "Labs" HERMES_SCALE_TO_ZERO stamp), messaging is
         # relay-only/absent, and a wakeUrl is registered (decisions.md D1/D11/
@@ -15761,6 +15795,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await self._inject_watch_notification(synth_text, evt)
                     except Exception as e:
                         logger.error("Async delegation injection error: %s", e)
+                        continue
+                    # Mark the durable row as acknowledged only AFTER a
+                    # successful injection. A failed injection leaves the
+                    # row unacked so the next startup's restore will retry.
+                    try:
+                        from tools.async_delegation import (
+                            acknowledge_async_delegation,
+                        )
+                        acknowledge_async_delegation(
+                            evt.get("delegation_id", ""),
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)

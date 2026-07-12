@@ -36,6 +36,7 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -72,6 +73,166 @@ _records: Dict[str, Dict[str, Any]] = {}
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
+
+
+# ---------------------------------------------------------------------------
+# Durable delegation completion (Task 8)
+# ---------------------------------------------------------------------------
+# Each dispatch gets a row in ``agent_operations`` (kind=async_delegation) so a
+# crashed process leaves the result recoverable: the next process reads
+# terminal unacked rows and re-enqueues them, with consumer-side ack preventing
+# double-injection across restarts. We open the journal lazily and fall back to
+# in-memory only if SessionDB is unavailable (the implementation has to keep
+# working on developer laptops with no profile state).
+
+_KIND = "async_delegation"
+
+# Map a worker-supplied status string → (operation state, effect_disposition).
+# Unknown statuses become state=unknown/effect=unknown — a durable "I don't
+# know what happened" instead of silently dropping the result.
+_STATUS_MAP = {
+    "completed": ("confirmed", "none"),
+    "success":   ("confirmed", "none"),
+    "error":     ("failed", "none"),
+    "failed":    ("failed", "none"),
+    "interrupted": ("cancelled", "none"),
+    "cancelled": ("cancelled", "none"),
+}
+
+_journal: Optional["OperationJournal"] = None
+_journal_lock = threading.Lock()
+# Delegation ids already restored from the durable journal into this process's
+# completion queue. Idempotent within process scope: a second restore call in
+# the same process must not double-enqueue. Cleared on process restart.
+_restored_ids: set = set()
+_restored_lock = threading.Lock()
+
+
+def _open_journal():
+    """Return a process-wide ``OperationJournal`` or None if state.db is down.
+
+    Fail-open by design: callers MUST tolerate None and keep operating
+    in-memory only. The journal is opened against the default profile's
+    state.db; if the underlying ``SessionDB`` open raises (locked file,
+    corrupt schema, missing dependency), we log and return None.
+    """
+    global _journal
+    if _journal is not None:
+        return _journal
+    with _journal_lock:
+        if _journal is not None:
+            return _journal
+        try:
+            from agent.operation_journal import OperationJournal
+            from hermes_state import SessionDB
+
+            _journal = OperationJournal(SessionDB())
+        except Exception as exc:  # noqa: BLE001 — fail-open by spec
+            logger.warning(
+                "Async delegation durable journal unavailable; "
+                "completions will not survive process restart: %s",
+                exc,
+            )
+            _journal = None
+        return _journal
+
+
+def _set_journal_for_tests(journal) -> None:
+    """Test-only: bind a specific journal to bypass lazy open."""
+    global _journal
+    with _journal_lock:
+        _journal = journal
+
+
+def _journal_for_tests():
+    """Test-only: read the current journal handle (may be None)."""
+    return _journal
+
+
+def acknowledge_async_delegation(operation_id: str) -> bool:
+    """Mark a terminal async-delegation operation as consumed.
+
+    Consumer side: call AFTER the completion event has been injected into the
+    originating session so a process restart won't re-enqueue the same result.
+    Returns True iff this call did the ack (False for unknown / not terminal /
+    already acked).
+    """
+    journal = _open_journal()
+    if journal is None:
+        return False
+    try:
+        return bool(journal.acknowledge(operation_id))
+    except Exception as exc:  # noqa: BLE001 — ack must never crash the caller
+        logger.debug("acknowledge_async_delegation(%s) failed: %s", operation_id, exc)
+        return False
+
+
+def restore_unacknowledged_delegations(
+    queue, put_fn
+) -> int:
+    """Re-enqueue terminal unacknowledged delegations onto ``queue`` via ``put_fn``.
+
+    Returns the count enqueued. Call ONCE at process startup (CLI / gateway /
+    TUI) AFTER ``journal.reconcile_after_restart()`` so in-flight rows become
+    ``unknown`` (which is terminal in this journal).
+
+    Idempotent within the current process: ids already restored are skipped
+    on a second call. Idempotent across processes via the ``acknowledged_at``
+    row column, set by the consumer on successful injection.
+    """
+    journal = _open_journal()
+    if journal is None:
+        return 0
+    try:
+        records = journal.list_unacknowledged(kind=_KIND)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("restore_unacknowledged_delegations: list failed: %s", exc)
+        return 0
+
+    enqueued = 0
+    with _restored_lock:
+        for record in records:
+            if record.operation_id in _restored_ids:
+                continue
+            evt = _record_to_event(record)
+            if evt is None:
+                # Defensive: terminal-but-malformed → ack so we don't loop forever.
+                try:
+                    journal.acknowledge(record.operation_id)
+                except Exception:
+                    pass
+                continue
+            try:
+                put_fn(evt)
+            except Exception as exc:  # noqa: BLE001 — never crash the boot path
+                logger.warning(
+                    "restore_unacknowledged_delegations: put failed for %s: %s",
+                    record.operation_id, exc,
+                )
+                continue
+            _restored_ids.add(record.operation_id)
+            enqueued += 1
+    return enqueued
+
+
+def _record_to_event(record) -> Optional[Dict[str, Any]]:
+    """Reconstruct the bounded completion event from a persisted result_json."""
+    if not record.result_json:
+        return None
+    try:
+        evt = json.loads(record.result_json)
+    except Exception:
+        return None
+    if not isinstance(evt, dict):
+        return None
+    # Stamp the canonical fields the formatter and consumer rely on.
+    evt.setdefault("type", "async_delegation")
+    evt.setdefault("delegation_id", record.operation_id)
+    return evt
+
+
+def _terminal_state_for(status: str) -> tuple:
+    return _STATUS_MAP.get(status, ("unknown", "unknown"))
 
 
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
@@ -206,6 +367,31 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
+    # Persistent pending → running row. Fail-open: a missing journal keeps
+    # the in-memory record alive and lets the worker run; we just lose the
+    # crash-recovery safety net for this dispatch.
+    journal = _open_journal()
+    if journal is not None:
+        try:
+            journal.create(
+                operation_id=delegation_id,
+                kind=_KIND,
+                session_id=session_key or "",
+                destination=parent_session_id or "",
+                payload_hash=f"{delegation_id}|{dispatched_at:.6f}",
+            )
+            journal.transition(
+                delegation_id,
+                from_states={"pending"},
+                to_state="running",
+                effect_disposition="none",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Async delegation %s: durable create/running failed: %s",
+                delegation_id, exc,
+            )
+
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -247,7 +433,13 @@ def dispatch_async_delegation(
 
 
 def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
-    """Mark a record complete and push the completion event onto the queue."""
+    """Mark a record complete and push the completion event onto the queue.
+
+    Order matters: persist terminal operation state to the durable journal
+    BEFORE enqueueing, so a crash between enqueue and consumer-side ack does
+    not lose the result. The consumer's acknowledge_async_delegation() then
+    keeps a restart from re-enqueueing the same event.
+    """
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None:
@@ -259,33 +451,22 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         event_record = dict(record)
         _prune_completed_locked()
 
-    _push_completion_event(event_record, result, status)
-
-
-def _push_completion_event(
-    record: Dict[str, Any], result: Dict[str, Any], status: str
-) -> None:
-    """Push a type='async_delegation' event onto the shared completion queue.
-
-    Best-effort: a failure here must not crash the worker, but it WOULD mean a
-    silently-lost result, so we log loudly.
-    """
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s finished but process_registry import failed; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
+    evt = _build_completion_event(event_record, result, status)
+    if evt is None:
         return
+    _persist_completion(delegation_id, evt, status)
+    _push_completion_event(evt)
 
+
+def _build_completion_event(
+    record: Dict[str, Any], result: Dict[str, Any], status: str
+) -> Optional[Dict[str, Any]]:
+    """Build the bounded async_delegation event. Pure / no I/O."""
     summary = result.get("summary")
     error = result.get("error")
     dispatched_at = record.get("dispatched_at") or time.time()
     completed_at = record.get("completed_at") or time.time()
-
-    evt = {
+    return {
         "type": "async_delegation",
         "delegation_id": record.get("delegation_id"),
         # session_key routes the completion back to the originating gateway
@@ -309,13 +490,62 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+
+
+def _persist_completion(
+    delegation_id: str, evt: Dict[str, Any], status: str
+) -> None:
+    """Write the terminal operation state to the journal BEFORE queue publish.
+
+    The event dict itself is stored as ``result_json`` so a process restart
+    can faithfully reconstruct the queue payload via
+    ``restore_unacknowledged_delegations``. Fail-open: a missing/broken
+    journal must never crash the worker — the in-memory record is still
+    pushed to the queue, we just lose crash-recovery for this dispatch.
+    """
+    journal = _open_journal()
+    if journal is not None:
+        to_state, effect = _terminal_state_for(status)
+        try:
+            journal.transition(
+                delegation_id,
+                from_states={"running"},
+                to_state=to_state,
+                effect_disposition=effect,
+                result=evt,
+                error=str(evt.get("error")) if evt.get("error") else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Async delegation %s: durable transition to %s failed: %s",
+                delegation_id, to_state, exc,
+            )
+
+
+def _push_completion_event(evt: Dict[str, Any]) -> None:
+    """Push a type='async_delegation' event onto the shared completion queue.
+
+    Best-effort: a failure here must not crash the worker, but it WOULD mean a
+    silently-lost result, so we log loudly. Terminal state has already been
+    persisted to the journal by ``_persist_completion``; a future restart can
+    recover.
+    """
+    try:
+        from tools.process_registry import process_registry
+    except Exception as exc:  # pragma: no cover
+        logger.error(
+            "Async delegation %s finished but process_registry import failed; "
+            "result lost: %s",
+            evt.get("delegation_id"), exc,
+        )
+        return
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation %s: failed to enqueue completion event; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
+            "result is durable in state.db so a restart will recover it: %s",
+            evt.get("delegation_id"), exc,
         )
 
 
@@ -393,6 +623,28 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
+    journal = _open_journal()
+    if journal is not None:
+        try:
+            journal.create(
+                operation_id=delegation_id,
+                kind=_KIND,
+                session_id=session_key or "",
+                destination=parent_session_id or "",
+                payload_hash=f"{delegation_id}|{dispatched_at:.6f}",
+            )
+            journal.transition(
+                delegation_id,
+                from_states={"pending"},
+                to_state="running",
+                effect_disposition="none",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Async delegation batch %s: durable create/running failed: %s",
+                delegation_id, exc,
+            )
+
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -441,7 +693,11 @@ def dispatch_async_delegation_batch(
 def _finalize_batch(
     delegation_id: str, combined: Dict[str, Any], status: str
 ) -> None:
-    """Mark a batch record complete and push ONE combined completion event."""
+    """Mark a batch record complete and push ONE combined completion event.
+
+    Same ordering contract as ``_finalize``: persist the terminal operation
+    state to the durable journal BEFORE publishing to the completion queue.
+    """
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None:
@@ -451,16 +707,6 @@ def _finalize_batch(
         record["interrupt_fn"] = None
         event_record = dict(record)
         _prune_completed_locked()
-
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s finished but process_registry import "
-            "failed; result lost: %s",
-            delegation_id, exc,
-        )
-        return
 
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
@@ -486,14 +732,8 @@ def _finalize_batch(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
-            delegation_id, exc,
-        )
+    _persist_completion(delegation_id, evt, status)
+    _push_completion_event(evt)
 
 
 def list_async_delegations() -> List[Dict[str, Any]]:
@@ -594,7 +834,7 @@ def interrupt_for_session(
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor."""
-    global _executor, _executor_max_workers
+    global _executor, _executor_max_workers, _journal
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
@@ -602,3 +842,7 @@ def _reset_for_tests() -> None:
         _executor_max_workers = 0
     with _records_lock:
         _records.clear()
+    with _journal_lock:
+        _journal = None
+    with _restored_lock:
+        _restored_ids.clear()

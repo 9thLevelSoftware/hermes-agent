@@ -15162,7 +15162,38 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         spinner_thread = threading.Thread(target=spinner_loop, daemon=True)
         spinner_thread.start()
-        
+
+        # Re-cover orphan async delegations from a prior process (Task 8).
+        # The journal reconciles any in-flight rows to 'unknown', then we
+        # restore every terminal unacknowledged row onto the same completion
+        # queue the process_loop already drains — so consumers don't need a
+        # second path.
+        try:
+            from agent.operation_journal import OperationJournal
+            from hermes_state import SessionDB
+            from tools.async_delegation import (
+                restore_unacknowledged_delegations,
+            )
+            from tools.process_registry import process_registry as _pr_cli
+
+            _op_journal = OperationJournal(SessionDB())
+            _moved = _op_journal.reconcile_after_restart()
+            _restored = restore_unacknowledged_delegations(
+                _pr_cli.completion_queue, _pr_cli.completion_queue.put,
+            )
+            if _moved or _restored:
+                import logging as _logging_cli
+                _logging_cli.getLogger(__name__).info(
+                    "Async delegation durable journal: reconciled %d in-flight, "
+                    "restored %d unacknowledged terminal rows onto completion queue",
+                    _moved, _restored,
+                )
+        except Exception as _e:  # noqa: BLE001 — startup must never crash the CLI
+            import logging as _logging_cli2
+            _logging_cli2.getLogger(__name__).debug(
+                "Async delegation durable journal startup skipped: %s", _e,
+            )
+
         # Background thread to process inputs and run agent
         def process_loop():
             while not self._should_exit:
@@ -15179,9 +15210,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             try:
                                 from tools.process_registry import process_registry
                                 from tools.approval import get_current_session_key
+                                from tools.async_delegation import (
+                                    acknowledge_async_delegation,
+                                )
                                 _drain_sk = get_current_session_key(default="")
                                 for _evt, _synth in process_registry.drain_notifications(session_key=_drain_sk):
                                     self._pending_input.put(_synth)
+                                    # Mark the durable row as acknowledged so a
+                                    # restart does not re-enqueue this same
+                                    # completion (Task 8). Background process
+                                    # completions have no operation row → ack is
+                                    # a no-op for them.
+                                    if _evt.get("type") == "async_delegation":
+                                        try:
+                                            acknowledge_async_delegation(
+                                                _evt.get("delegation_id", ""),
+                                            )
+                                        except Exception:
+                                            pass
                             except Exception:
                                 pass
                         continue
