@@ -63,6 +63,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from hermes_constants import get_hermes_home
+# Imported at module scope so _flush_messages_to_session_db can catch
+# SessionDBClosedError explicitly (and drop _session_db on the first
+# closed-handle failure) without paying an inline import per flush.
+from hermes_state import SessionDBClosedError  # noqa: F401
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -1935,6 +1939,15 @@ class AIAgent:
             # allocated next turn at a recycled address.
             self._flushed_db_message_ids = set()
             self._last_flushed_db_idx = len(messages)
+        except SessionDBClosedError:
+            # Handle was closed mid-flush (gateway disconnect, profile
+            # switch, explicit shutdown). Drop the reference so subsequent
+            # turns degrade cleanly via `if not self._session_db:` instead
+            # of repeatedly tripping the closed handle. Transient sqlite
+            # errors stay in the `except Exception` branch and keep the
+            # handle alive for next-turn retry.
+            self._session_db = None
+            logger.warning("Session DB closed mid-flush; disabling _session_db")
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
 

@@ -428,6 +428,120 @@ def test_list_unacknowledged_filters_kind_and_orders_created_at(db, monkeypatch)
     ]
 
 
+def test_prune_terminal_only_deletes_acknowledged_terminal_older_than_cutoff(db):
+    """Bounded retention: only acknowledged terminal (confirmed/failed/cancelled)
+    rows older than the cutoff may be deleted. Everything else must survive,
+    including unacknowledged terminal, unknown (never prune), and any
+    pending/running/dispatched state regardless of age.
+    """
+    journal = _journal(db)
+
+    now = 1_000_000.0
+    old = now - 31 * 86400
+    fresh = now - 29 * 86400
+
+    def _seed(op_id, path, ts, ack):
+        journal.create(operation_id=op_id, kind="tool")
+        for frm, to, eff in path:
+            journal.transition(op_id, from_states={frm}, to_state=to, effect_disposition=eff)
+        db._conn.execute(
+            "UPDATE agent_operations SET created_at = ?, updated_at = ? WHERE operation_id = ?",
+            (ts, ts, op_id),
+        )
+        if ack:
+            journal.acknowledge(op_id)
+
+    cases = [
+        # Prunable: acknowledged + terminal + older than cutoff
+        ("ack_confirmed_old", [("pending", "running", "none"), ("running", "confirmed", "landed")], old, True),
+        ("ack_failed_old", [("pending", "failed", "unknown")], old, True),
+        ("ack_cancelled_old", [("pending", "cancelled", "none")], old, True),
+
+        # Survives: same shape but newer than cutoff
+        ("ack_confirmed_fresh", [("pending", "running", "none"), ("running", "confirmed", "landed")], fresh, True),
+        ("ack_failed_fresh", [("pending", "failed", "unknown")], fresh, True),
+        ("ack_cancelled_fresh", [("pending", "cancelled", "none")], fresh, True),
+
+        # Survives: terminal but unacknowledged, even when old
+        ("unack_confirmed_old", [("pending", "running", "none"), ("running", "confirmed", "landed")], old, False),
+        ("unack_failed_old", [("pending", "failed", "unknown")], old, False),
+        ("unack_cancelled_old", [("pending", "cancelled", "none")], old, False),
+
+        # Survives: 'unknown' state is never pruned, even when acked and old
+        ("ack_unknown_old", [("pending", "running", "none"), ("running", "unknown", "unknown")], old, True),
+
+        # Survives: non-terminal states, even when old
+        ("running_old", [("pending", "running", "none")], old, False),
+    ]
+
+    for op_id, path, ts, ack in cases:
+        _seed(op_id, path, ts, ack)
+    db._conn.commit()
+
+    seeded = db._conn.execute("SELECT COUNT(*) FROM agent_operations").fetchone()[0]
+    assert seeded == len(cases)
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("agent.operation_journal.time.time", lambda: now)
+        deleted = journal.prune_terminal(older_than_days=30)
+    finally:
+        monkey.undo()
+
+    assert deleted == 3
+
+    survivors = {
+        row["operation_id"]
+        for row in db._conn.execute("SELECT operation_id FROM agent_operations").fetchall()
+    }
+    expected_remaining = {
+        "ack_confirmed_fresh",
+        "ack_failed_fresh",
+        "ack_cancelled_fresh",
+        "unack_confirmed_old",
+        "unack_failed_old",
+        "unack_cancelled_old",
+        "ack_unknown_old",
+        "running_old",
+    }
+    assert survivors == expected_remaining
+
+    # Pruning twice in a row is a no-op the second time.
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr("agent.operation_journal.time.time", lambda: now)
+        assert journal.prune_terminal(older_than_days=30) == 0
+    finally:
+        monkey.undo()
+
+
+def test_prune_terminal_default_cutoff_is_thirty_days(db, monkeypatch):
+    journal = _journal(db)
+    # Default cutoff = 30 days, exclusive (<). A row that's 30d old to the
+    # second is on the boundary and must survive; a row that's 30d + 1s old
+    # falls inside and must be deleted.
+    now = 5_000_000.0
+    boundary = now - 30 * 86400
+    inside = now - (30 * 86400 + 1)
+
+    for op_id, ts in (("boundary", boundary), ("inside", inside)):
+        journal.create(operation_id=op_id, kind="tool")
+        journal.transition(op_id, from_states={"pending"}, to_state="cancelled", effect_disposition="none")
+        db._conn.execute(
+            "UPDATE agent_operations SET created_at = ?, updated_at = ? WHERE operation_id = ?",
+            (ts, ts, op_id),
+        )
+        journal.acknowledge(op_id)
+    db._conn.commit()
+
+    monkeypatch.setattr("agent.operation_journal.time.time", lambda: now)
+    # Default (30d) deletes only the row strictly older than the cutoff;
+    # the boundary row (exactly 30d old) survives.
+    assert journal.prune_terminal() == 1
+    # Idempotent re-run does nothing.
+    assert journal.prune_terminal() == 0
+
+
 def test_database_checks_states_and_effects(db):
     with pytest.raises(sqlite3.IntegrityError):
         db._execute_write(

@@ -251,3 +251,27 @@ class OperationJournal:
             return cursor.rowcount
 
         return self._db._execute_write(_reconcile)
+
+    def prune_terminal(self, older_than_days: float = 30) -> int:
+        """Delete acknowledged confirmed/failed/cancelled rows older than cutoff.
+
+        Bounded retention: only rows that are *all of* terminal (confirmed,
+        failed, or cancelled — never ``unknown``), *acknowledged*, and
+        ``created_at < now - older_than_days`` are removed. Pending,
+        running, dispatched, unknown, and unacknowledged records are
+        preserved unconditionally so we never lose evidence of in-flight or
+        un-reconciled work. Returns the number of rows deleted.
+        """
+        cutoff = time.time() - older_than_days * 86400
+
+        def _prune(conn):
+            cursor = conn.execute(
+                """DELETE FROM agent_operations
+                    WHERE state IN ('confirmed', 'failed', 'cancelled')
+                      AND acknowledged_at IS NOT NULL
+                      AND created_at < ?""",
+                (cutoff,),
+            )
+            return cursor.rowcount
+
+        return self._db._execute_write(_prune)

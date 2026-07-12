@@ -919,6 +919,19 @@ END;
 """
 
 
+class SessionDBClosedError(RuntimeError):
+    """Raised when a SessionDB operation is attempted on a closed handle.
+
+    A ``RuntimeError`` subclass so existing ``except RuntimeError`` callers
+    keep working, and so callers can use ``isinstance`` to distinguish a
+    closed handle (explicit, non-retryable — disable the DB on the agent)
+    from transient SQLite errors (busy / locked / I/O — retryable).
+
+    ponetail: keep the message short — callers surface ``str(exc)`` to logs
+    and route on type, not on message contents.
+    """
+
+
 class SessionDB:
     """
     SQLite-backed session storage with FTS5 search.
@@ -1209,17 +1222,25 @@ class SessionDB:
 
         Returns whatever *fn* returns.
         """
+        # Single chokepoint: fail explicitly when the handle is closed.
+        # Transient sqlite3.OperationalError (busy / locked) is still
+        # retryable below — the chokepoint only filters the explicit,
+        # non-retryable "handle is closed" case so the agent can
+        # distinguish and drop the DB on the first trip.
+        self._require_open()
+        conn = self._conn
+        assert conn is not None, "_require_open did not raise"
         last_err: Optional[Exception] = None
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
                 with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    conn.execute("BEGIN IMMEDIATE")
                     try:
-                        result = fn(self._conn)
-                        self._conn.commit()
+                        result = fn(conn)
+                        conn.commit()
                     except BaseException:
                         try:
-                            self._conn.rollback()
+                            conn.rollback()
                         except Exception:
                             pass
                         raise
@@ -1309,6 +1330,50 @@ class SessionDB:
                     pass
                 self._conn.close()
                 self._conn = None
+
+    @property
+    def is_open(self) -> bool:
+        """True while the underlying connection is alive.
+
+        ``close()`` flips this to False; a failed ``__init__`` may leave
+        it False from the start. Read entrypoints and ``_execute_write``
+        route through :meth:`_require_open` (which uses this) so the
+        agent can ask "do I still have a usable handle?" without
+        touching ``self._conn`` directly.
+        """
+        return self._conn is not None
+
+    def _require_open(self) -> None:
+        """Raise :class:`SessionDBClosedError` if the handle is closed.
+
+        Single shared chokepoint for every public path that needs the
+        underlying connection. Reads, writes, and the closing sequence
+        all bounce through here so a closed handle always surfaces the
+        same explicit error type — never a leaky
+        ``sqlite3.ProgrammingError`` from a closed cursor.
+        """
+        if self._conn is None:
+            raise SessionDBClosedError(
+                "SessionDB is closed (path=%s)" % (self.db_path,)
+            )
+
+    def _execute_read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        """Run *fn* against the connection under :attr:`_lock`, gating on
+        :meth:`_require_open`.
+
+        Companion to :meth:`_execute_write` — both are the *shared
+        chokepoints* for "the handle was closed" failures. Reads that
+        route through here get the same explicit
+        :class:`SessionDBClosedError` semantics as writes; transient
+        errors (busy / locked) still propagate from ``fn`` untouched.
+        """
+        with self._lock:
+            self._require_open()
+            # _require_open either raised or left the conn alive; the
+            # type-checker can't follow the gate so widen explicitly.
+            conn = self._conn
+            assert conn is not None, "_require_open did not raise"
+            return fn(conn)
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
@@ -2839,11 +2904,13 @@ class SessionDB:
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
-        with self._lock:
-            cursor = self._conn.execute(
+        def _do(conn):
+            cursor = conn.execute(
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
             )
-            row = cursor.fetchone()
+            return cursor.fetchone()
+
+        row = self._execute_read(_do)
         return dict(row) if row else None
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
@@ -4035,6 +4102,7 @@ class SessionDB:
             sql += " LIMIT ? OFFSET ?"
             params.extend([-1 if limit is None else limit, offset])
         with self._lock:
+            self._require_open()
             cursor = self._conn.execute(sql, params)
             rows = cursor.fetchall()
         result = []
@@ -6533,6 +6601,7 @@ class SessionDB:
         min_interval_hours: int = 24,
         vacuum: bool = True,
         sessions_dir: Optional[Path] = None,
+        operation_retention_days: int = 30,
     ) -> Dict[str, Any]:
         """Idempotent auto-maintenance: prune old sessions + optional VACUUM.
 
@@ -6544,16 +6613,27 @@ class SessionDB:
         (``.json`` / ``.jsonl`` / ``request_dump_*``) for pruned sessions
         are removed as part of the same sweep (issue #3015).
 
+        Operation-journal retention runs alongside session pruning: only
+        acknowledged terminal rows (confirmed/failed/cancelled) older than
+        ``operation_retention_days`` are deleted. Unacknowledged or
+        in-flight records are never touched.
+
         Never raises. On any failure, logs a warning and returns a dict
         with ``"error"`` set.
 
         Returns a dict with keys:
           - ``"skipped"`` (bool) — true if within min_interval_hours of last run
           - ``"pruned"`` (int)   — number of sessions deleted
+          - ``"operations_pruned"`` (int) — number of operation rows deleted
           - ``"vacuumed"`` (bool) — true if VACUUM ran
           - ``"error"`` (str, optional) — present only on failure
         """
-        result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
+        result: Dict[str, Any] = {
+            "skipped": False,
+            "pruned": 0,
+            "operations_pruned": 0,
+            "vacuumed": False,
+        }
         try:
             # Skip if another process/call did maintenance recently.
             last_raw = self.get_meta("last_auto_prune")
@@ -6573,9 +6653,23 @@ class SessionDB:
             )
             result["pruned"] = pruned
 
+            # Bounded retention of the operation journal: same sweep, same
+            # idempotent interval. Lazy-imported to avoid the operation_journal
+            # -> hermes_state cycle at module load.
+            try:
+                from agent.operation_journal import OperationJournal  # ponytail: local import, avoids hermes_state <-> operation_journal cycle
+
+                ops_pruned = OperationJournal(self).prune_terminal(
+                    older_than_days=operation_retention_days
+                )
+                result["operations_pruned"] = ops_pruned
+            except Exception as exc:
+                logger.warning("operation journal prune failed: %s", exc)
+
             # Only VACUUM if we actually freed rows — VACUUM on a tight DB
             # is wasted I/O. Threshold keeps small DBs from paying the cost.
-            if vacuum and pruned > 0:
+            freed = pruned + result["operations_pruned"]
+            if vacuum and freed > 0:
                 try:
                     self.vacuum()
                     result["vacuumed"] = True
@@ -6586,11 +6680,13 @@ class SessionDB:
             # every startup within the min_interval_hours window.
             self.set_meta("last_auto_prune", str(now))
 
-            if pruned > 0:
+            if freed > 0:
                 logger.info(
-                    "state.db auto-maintenance: pruned %d session(s) older than %d days%s",
+                    "state.db auto-maintenance: pruned %d session(s) and %d operation row(s) older than %d/%d days%s",
                     pruned,
+                    result["operations_pruned"],
                     retention_days,
+                    operation_retention_days,
                     " + VACUUM" if result["vacuumed"] else "",
                 )
         except Exception as exc:
