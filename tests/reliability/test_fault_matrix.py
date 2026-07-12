@@ -4,13 +4,18 @@ These verify the fakes behave predictably: the clock only moves when told,
 faults fire exactly once as scheduled, call counts are exact, and every
 fake resets to a pristine state. Scenario tests that USE these fakes live
 elsewhere; here we only prove the fixtures are trustworthy.
+
+The fixtures themselves live in :mod:`agent.reliability_fakes` so the
+``hermes reliability check`` CLI can reuse them on the readback path —
+the matrix is offline by contract and only touches these fakes plus
+real ``OperationJournal`` state.
 """
 
 from dataclasses import FrozenInstanceError, is_dataclass
 
 import pytest
 
-from tests.reliability.fakes import (
+from agent.reliability_fakes import (
     FakeClock,
     FakeDBClosedError,
     FakeDBHandle,
@@ -18,7 +23,7 @@ from tests.reliability.fakes import (
     FakeFuture,
     FakeProvider,
     RateLimitResponse,
-    ScenarioResult,
+    ScenarioRow,
 )
 
 
@@ -180,50 +185,48 @@ def test_db_handle_reset_reopens_and_zeroes_ops():
     assert handle.execute() == 1
 
 
-# ── ScenarioResult ───────────────────────────────────────────────────────────
+# ── ScenarioRow ────────────────────────────────────────────────────────────
+# The legacy tests/reliability/fakes.ScenarioResult dataclass was a
+# pre-CLI-shape ghost. Its field contract is now the canonical
+# agent.reliability_fakes.ScenarioRow — the CLI's readback dataclass
+# and the matrix's wire shape. These three tests prove it.
 
-def test_scenario_result_is_frozen_dataclass_with_expected_fields():
-    result = ScenarioResult(
-        name="rate_limit_recovery",
+
+def test_scenario_row_is_frozen_dataclass_with_expected_fields():
+    result = ScenarioRow(
+        scenario="rate_limit_recovery",
         passed=True,
-        final_state="delivered",
-        expected_state="delivered",
-        unresolved_count=0,
+        unresolved=False,
         wrong_side_effect_count=0,
         recovery_steps=("retry", "ack"),
     )
     assert is_dataclass(result)
-    assert result.name == "rate_limit_recovery"
+    assert result.scenario == "rate_limit_recovery"
     assert result.passed is True
-    assert result.final_state == result.expected_state
-    assert result.unresolved_count == 0
+    assert result.unresolved is False
     assert result.wrong_side_effect_count == 0
     assert result.recovery_steps == ("retry", "ack")
 
 
-def test_scenario_result_recovery_steps_default_empty():
-    result = ScenarioResult(
-        name="noop",
+def test_scenario_row_recovery_steps_default_empty():
+    result = ScenarioRow(
+        scenario="noop",
         passed=False,
-        final_state="stuck",
-        expected_state="done",
-        unresolved_count=1,
+        unresolved=True,
         wrong_side_effect_count=0,
     )
     assert result.recovery_steps == ()
 
 
-def test_scenario_result_is_immutable():
-    result = ScenarioResult(
-        name="x",
+def test_scenario_row_is_immutable():
+    result = ScenarioRow(
+        scenario="x",
         passed=True,
-        final_state="a",
-        expected_state="a",
-        unresolved_count=0,
+        unresolved=False,
         wrong_side_effect_count=0,
     )
     with pytest.raises(FrozenInstanceError):
-        result.passed = False  # type: ignore[misc]
+        result.passed = False  # type: ignore[misc]  # ponytail: deliberate mutation to verify frozen
 
 
 # ─────────────────────────────────────────────────────────────────────────────

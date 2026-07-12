@@ -61,6 +61,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes webhook` | Manage dynamic webhook subscriptions for event-driven activation. |
 | `hermes hooks` | Inspect, approve, or remove shell-script hooks declared in `config.yaml`. |
 | `hermes doctor` | Diagnose config and dependency issues. |
+| `hermes reliability check` | Offline harness fault matrix — runs eight end-state scenarios and exits 0/1/2 on pass/fail/usage-error. |
 | `hermes security audit` | On-demand supply-chain audit (OSV.dev) for the venv, plugin requirements, and pinned MCP servers. |
 | `hermes dump` | Copy-pasteable setup summary for support/debugging. |
 | `hermes prompt-size` | Show a byte breakdown of the system prompt + tool schemas (skills index, memory, profile). Runs offline. |
@@ -721,6 +722,53 @@ hermes doctor [--fix]
 | Option | Description |
 |--------|-------------|
 | `--fix` | Attempt automatic repairs where possible. |
+
+## `hermes reliability check`
+
+```bash
+hermes reliability check [--json]
+```
+
+Offline harness fault matrix. Runs the eight deterministic end-state
+scenarios from `agent.reliability_scenarios` against in-process
+`OperationJournal`, `FakeDelivery`, and `FakeDBHandle` fixtures — no
+model providers, no network, no wall clock. Designed for CI: every run
+is byte-identical because the fixtures only advance when explicitly
+told.
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | All eight scenarios passed. |
+| `1` | At least one scenario failed or recorded a wrong side effect. |
+| `2` | Invalid usage (missing subcommand, unknown flag). |
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Emit `{summary, scenarios}` JSON instead of the human table. `summary` is the dict produced by `agent.reliability_report.summarize_scenarios()`. |
+
+The eight scenarios exercise:
+
+1. **timeout-before-dispatch** — journal ends at `cancelled`/`none`.
+2. **timeout-after-dispatch** — journal ends at `unknown`/`unknown`.
+3. **late-tool-completion** — a `FakeFuture.cancel()` then `complete()` flip flags a late effect; the terminal `unknown` row must not be overwritten.
+4. **rate-limit-fallback** — two `FakeProvider` 429s then a success, clock advances exactly twice by `retry_after`.
+5. **process-restart** — exactly one in-flight delegation reconciled to `unknown`, the acked delegation stays at `confirmed`.
+6. **closed-db-handle-isolation** — closing one `FakeDBHandle` disables that op but not the forked child.
+7. **changed-approval-arguments** — a SHA-256 payload hash mismatch refuses to dispatch; unknown approval id is fail-closed.
+8. **duplicate-delivery-ack** — `DedupingDelivery` ensures one idempotency key crosses the external boundary on a lost-ack retry.
+
+Run from the repo root after `pip install -e .` (or `uv sync`):
+
+```bash
+hermes reliability check            # human table, exit 0
+hermes reliability check --json      # machine-readable, exits 0/1/2
+```
+
+`hermes reliability check` is hermetic to the local checkout; it never
+calls the model gateway, never touches `~/.hermes/`, and runs in well
+under a second. Use it in CI as a regression gate before merging changes
+that touch `agent/operation_journal.py`, `agent.reliability_report`, the
+dispatcher, or the delivery/approval surfaces.
 
 ## `hermes dump`
 
