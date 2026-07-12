@@ -270,25 +270,24 @@
 
 .hermes-workflows .hermes-workflows-node-palette {
   display: flex;
-  gap: 0.4rem;
-  overflow-x: auto;
-  padding-bottom: 0.1rem;
+  flex-direction: column;
+  gap: 0.35rem;
 }
 
 .hermes-workflows .hermes-workflows-palette-card {
-  min-width: 116px;
-  max-width: 145px;
-  display: grid;
-  grid-template-columns: auto 1fr;
-  grid-template-rows: auto auto;
-  gap: 0.05rem 0.35rem;
-  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.5rem;
+  cursor: grab;
   border: 1px solid var(--color-border);
-  border-radius: 0.55rem;
   background: color-mix(in srgb, var(--color-card) 72%, transparent);
   color: var(--color-foreground);
-  padding: 0.42rem 0.5rem;
-  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  font: inherit;
+  font-size: 0.82rem;
 }
 
 .hermes-workflows .hermes-workflows-palette-card:hover {
@@ -1256,20 +1255,10 @@
   background: var(--wf-node-code-bg);
 }
 
-.hermes-workflows .hermes-workflows-palette-card {
+.hermes-workflows .hermes-workflows-palette-text {
   display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.5rem 0.75rem;
-  border-radius: 0.5rem;
-  cursor: grab;
-  border: 1px solid var(--color-border);
-  background: color-mix(in srgb, var(--color-card) 72%, transparent);
-}
-
-.hermes-workflows .hermes-workflows-palette-card:hover {
-  border-color: var(--color-primary, var(--color-foreground));
-  background: color-mix(in srgb, var(--color-border) 18%, transparent);
+  flex-direction: column;
+  min-width: 0;
 }
 
 .hermes-workflows .hermes-workflows-palette-icon {
@@ -1349,6 +1338,26 @@
   border-radius: var(--radius, 0.5rem);
   background: var(--color-background);
   color: inherit;
+}
+
+.hermes-workflows .hermes-workflows-palette-panel {
+  padding: 0.5rem 0.75rem;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.hermes-workflows .hermes-workflows-palette-category {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 0.75rem 0 0.35rem;
+  padding-left: 0.15rem;
+}
+
+.hermes-workflows .hermes-workflows-palette-category:first-child {
+  margin-top: 0.25rem;
 }
 
 .hermes-workflows .hermes-workflows-rf-node-header {

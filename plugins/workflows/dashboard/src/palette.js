@@ -179,8 +179,10 @@ export function renderPalette(props) {
       },
     }, dragProps(type)),
       h("span", { className: "hermes-workflows-palette-icon", "aria-hidden": "true" }, NODE_ICONS[type] || "•"),
-      h("span", { className: "hermes-workflows-palette-title" }, node[1]),
-      h("span", { className: "hermes-workflows-palette-desc" }, node[2])
+      h("div", { className: "hermes-workflows-palette-text" },
+        h("span", { className: "hermes-workflows-palette-title" }, node[1]),
+        h("span", { className: "hermes-workflows-palette-desc" }, node[2])
+      )
     );
   }
 
