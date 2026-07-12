@@ -40,7 +40,7 @@ class RuntimeHealthRegistry:
         normalized = f"{type(error).__name__}:{message}"
         return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
-    def record_success(self, key: str, now: float | None = None) -> HealthSnapshot:
+    def record_success(self, key: str, *, now: float | None = None) -> HealthSnapshot:
         timestamp = self._timestamp(now)
         with self._lock:
             previous = self._states.get(key)
@@ -61,6 +61,7 @@ class RuntimeHealthRegistry:
         self,
         key: str,
         error: BaseException | str,
+        *,
         now: float | None = None,
     ) -> tuple[HealthSnapshot, bool]:
         timestamp = self._timestamp(now)
@@ -89,7 +90,7 @@ class RuntimeHealthRegistry:
             self._states[key] = snapshot
             return snapshot, changed
 
-    def should_probe(self, key: str, now: float | None = None) -> bool:
+    def should_probe(self, key: str, *, now: float | None = None) -> bool:
         timestamp = self._timestamp(now)
         with self._lock:
             snapshot = self._states.get(key)

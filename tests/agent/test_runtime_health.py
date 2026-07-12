@@ -121,3 +121,16 @@ def test_snapshots_are_immutable_and_returned_as_a_copy():
 
     snapshot.clear()
     assert "tool:search" in registry.snapshot()
+
+
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("record_success", ("key", 0.0)),
+        ("record_failure", ("key", "down", 0.0)),
+        ("should_probe", ("key", 0.0)),
+    ],
+)
+def test_health_timestamps_are_keyword_only(method, args):
+    with pytest.raises(TypeError):
+        getattr(RuntimeHealthRegistry(), method)(*args)
