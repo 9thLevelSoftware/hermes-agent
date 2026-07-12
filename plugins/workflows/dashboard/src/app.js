@@ -3,6 +3,13 @@ import { formatApiError as importedFormatApiError, createApi as buildApi } from 
 import { semanticWorkflowDiff, isDraftDirty, buildApiHelpers } from "./build.js";
 import { feedActions, shouldPollFeed, fieldErrors } from "./run.js";
 import {
+  renderBottomPanel as renderBottomPanelModule,
+  renderRunStartPanel as renderRunStartPanelModule,
+  renderHistoryMode as renderHistoryModeModule,
+  renderInputFeedPanel as renderInputFeedPanelModule,
+  renderDiagnosticsPanel as renderDiagnosticsPanelModule,
+} from "./panels.js";
+import {
   serializeFilters as historySerializeFilters,
   historyListPath,
   detailUrl as historyDetailUrl,
@@ -3441,46 +3448,58 @@ import { makeWorkflowNode } from "./canvas-nodes.js";
         "aria-label": "Run workflow",
         className: "hermes-workflows-run-mode",
       },
-        renderInputFeedPanel(),
-        renderDiagnosticsPanel()
+        renderInputFeedPanelModule({
+          createElement: h,
+          React: React,
+          selectedDefinition: selectedDefinition,
+          workflowIdForDefinition: workflowIdForDefinition,
+          selectedInputTrigger: selectedInputTrigger,
+          inputFieldsForSpec: inputFieldsForSpec,
+          inputFeeds: inputFeeds,
+          selectedFeedId: selectedFeedId,
+          setSelectedFeedId: setSelectedFeedId,
+          openContinuousFeed: openContinuousFeed,
+          setSelectedFeedStatus: setSelectedFeedStatus,
+          feedBusy: feedBusy,
+          loadInputFeedItems: loadInputFeedItems,
+          inputFeedItems: inputFeedItems,
+          updateInputFeedItem: updateInputFeedItem,
+          addItemToFeed: addItemToFeed,
+          feedInputValues: feedInputValues,
+          setFeedInputValues: setFeedInputValues,
+          showAdvancedFeedInputJson: showAdvancedFeedInputJson,
+          setShowAdvancedFeedInputJson: setShowAdvancedFeedInputJson,
+          feedInputText: feedInputText,
+          setFeedInputText: setFeedInputText,
+          feedActions: feedActions,
+        }),
+        renderDiagnosticsPanelModule({
+          createElement: h,
+          React: React,
+          diagnosticsOpen: diagnosticsOpen,
+          setDiagnosticsOpen: setDiagnosticsOpen,
+          renderExecutionStallWarning: renderExecutionStallWarning,
+          ticking: ticking,
+          manualTick: manualTick,
+          loading: loading,
+          refresh: refresh,
+        })
       );
     }
 
     function renderHistoryMode() {
-      return h("section", {
-        id: "hermes-workflows-mode-history",
-        role: "tabpanel",
-        "aria-label": "Workflow execution history",
-        className: "hermes-workflows-history-mode",
-      },
-        h("div", { className: "hermes-workflows-history-toolbar" },
-          h("button", { type: "button", disabled: loading, onClick: function () { refresh(); } }, loading ? "Refreshing…" : "Refresh executions")
-        ),
-        h("div", { className: "hermes-workflows-history-list" },
-          executions.length ? executions.slice(0, 50).map(function (execution) {
-            var eid = safeString(execution.execution_id || execution.id);
-            var execStatus = safeString(execution.status);
-            var statusClass = execStatus === "succeeded" ? " is-succeeded" : execStatus === "failed" ? " is-failed" : "";
-            var isActive = selectedExecution && String(selectedExecution.execution_id || selectedExecution.id || "") === eid;
-            return h("button", {
-              key: eid,
-              type: "button",
-              "data-execution-id": eid,
-              className: "hermes-workflows-history-row" + (isActive ? " is-selected" : ""),
-              onClick: function () {
-                loadExecution(eid).catch(fail);
-                pushMode("history", { execution: eid });
-              },
-            },
-              h("span", { className: "hermes-workflows-history-row-id" }, eid.slice(0, 16)),
-              h("span", { className: "hermes-workflows-history-row-status" + statusClass }, execStatus)
-            );
-          }) : h("p", { className: "hermes-workflows-muted" }, "No executions yet.")
-        ),
-        h("div", { className: "hermes-workflows-history-detail" },
-          renderTimeline()
-        )
-      );
+      return renderHistoryModeModule({
+        createElement: h,
+        React: React,
+        executions: executions,
+        selectedExecution: selectedExecution,
+        loadExecution: loadExecution,
+        refresh: refresh,
+        loading: loading,
+        pushMode: pushMode,
+        renderTimeline: renderTimeline,
+        fail: fail,
+      });
     }
 
     function renderActiveMode() {
@@ -3531,9 +3550,39 @@ import { makeWorkflowNode } from "./canvas-nodes.js";
         h("div", { className: "hermes-workflows-body" },
           renderSidebar(),
           renderActiveMode(),
-          workspaceMode === "build" ? renderBottomPanel() : null
+          workspaceMode === "build" ? renderBottomPanelModule({
+            createElement: h,
+            React: React,
+            bottomCollapsed: bottomCollapsed,
+            setBottomCollapsed: setBottomCollapsed,
+            activeSpec: spec,
+            workflowCapabilities: workflowCapabilities,
+            renderValidationChecklist: renderValidationChecklist,
+          }) : null
         ),
-        renderRunStartPanel(),
+        renderRunStartPanelModule({
+          createElement: h,
+          React: React,
+          runPanelOpen: runPanelOpen,
+          setRunPanelOpen: setRunPanelOpen,
+          runPanelRef: runPanelRef,
+          runWorkflowId: runWorkflowId,
+          definitions: definitions,
+          inputFieldsForSpec: inputFieldsForSpec,
+          runInputSpec: runInputSpec,
+          inputFieldValues: inputFieldValues,
+          setInputFieldValues: setInputFieldValues,
+          showAdvancedInputJson: showAdvancedInputJson,
+          setShowAdvancedInputJson: setShowAdvancedInputJson,
+          runInputText: runInputText,
+          setRunInputText: setRunInputText,
+          running: running,
+          runFieldErrors: runFieldErrors,
+          runWorkflow: runWorkflow,
+          selectedRunVersion: selectedRunVersion,
+          loadDefinition: loadDefinition,
+          fail: fail,
+        }),
         showAdvancedYaml ? renderAdvancedYaml() : null
       )
     );
