@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { renderPalette } from "./palette.js";
+import { renderPalette, renderWorkflowOnboarding } from "./palette.js";
 
 const h = (tag, props, ...children) => ({ tag, props, children });
 const noop = () => {};
@@ -53,11 +53,25 @@ describe("renderPalette", () => {
     expect(contains(node, (value) => value === "Start From Scratch")).toBe(true);
   });
 
-  it("renders the prompt-first onboarding variant without duplicating the form", () => {
-    const node = renderPalette(props({ variant: "onboarding", activeSpec: null }));
+  it("renders hook-free onboarding with visible accessible field labels", () => {
+    const node = renderWorkflowOnboarding(props({ activeSpec: null }));
     expect(node.props.className).toContain("hermes-workflows-onboarding-form");
+    expect(contains(node, (value) => value === "Workflow name")).toBe(true);
+    expect(contains(node, (value) => value === "Describe workflow goal")).toBe(true);
+    expect(contains(node, (value) => value === "Generate From Prompt")).toBe(true);
+    expect(contains(node, (value) => value === "Start From Scratch")).toBe(true);
+  });
+
+  it("hides only the sidebar creation form when requested", () => {
+    const node = renderPalette(props({
+      hideWorkflowForm: true,
+      definitions: [{ id: "existing", name: "Existing workflow", enabled: true }],
+      executions: [{ id: "execution-1", status: "succeeded" }],
+    }));
     const json = JSON.stringify(node);
-    expect(json).toContain("Generate From Prompt");
-    expect(json).toContain("Start From Scratch");
+    expect(json).not.toContain("Generate From Prompt");
+    expect(json).not.toContain("Describe workflow goal");
+    expect(json).toContain("Existing workflow");
+    expect(json).toContain("Executions");
   });
 });

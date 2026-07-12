@@ -905,6 +905,64 @@
 	function isSupported(type, trigger) {
 		return (trigger ? SUPPORTED_TRIGGERS : SUPPORTED_NODES).indexOf(type) !== -1;
 	}
+	function renderWorkflowForm(h, props) {
+		function call(handler) {
+			if (typeof handler === "function") return handler.apply(null, Array.prototype.slice.call(arguments, 1));
+		}
+		const nameId = props.workflowNameInputId || "hermes-workflow-name";
+		const goalId = props.workflowGoalInputId || "hermes-workflow-goal";
+		return h("section", { className: "hermes-workflows-palette-section hermes-workflows-palette-creation" }, h("h3", null, props.activeSpec ? "New workflow / prompt" : "New workflow"), h("p", { className: "hermes-workflows-muted" }, "Describe it or start from blank."), h("form", {
+			className: "hermes-workflows-stack",
+			"aria-label": "Create workflow",
+			onSubmit: props.draftFromGoal
+		}, h("label", { htmlFor: nameId }, "Workflow name"), h("input", {
+			id: nameId,
+			value: props.newWorkflowName || "",
+			onChange: function(event) {
+				call(props.setNewWorkflowName, event.target.value);
+			},
+			placeholder: "Workflow name"
+		}), h("label", { htmlFor: goalId }, "Describe workflow goal"), h("textarea", {
+			id: goalId,
+			"aria-label": "Describe workflow goal",
+			value: props.goalText || "",
+			onChange: function(event) {
+				call(props.setGoalText, event.target.value);
+			},
+			placeholder: "Example: review code changes, run tests, then deploy if approved."
+		}), h("div", { className: "hermes-workflows-row" }, h("button", {
+			type: "submit",
+			disabled: props.drafting,
+			className: "hermes-workflows-primary"
+		}, props.drafting ? "Generating…" : "Generate From Prompt"), h("button", {
+			type: "button",
+			"aria-label": "Start from scratch",
+			onClick: props.startBlankWorkflow
+		}, "Start From Scratch"))), props.activeSpec ? h("form", {
+			className: "hermes-workflows-stack",
+			onSubmit: props.refineWorkflow
+		}, h("textarea", {
+			value: props.refineText || "",
+			onChange: function(event) {
+				call(props.setRefineText, event.target.value);
+			},
+			placeholder: "Refine: add a step, change routing, etc.",
+			"aria-label": "Refine workflow"
+		}), h("button", {
+			type: "submit",
+			disabled: props.refining
+		}, props.refining ? "Refining…" : "Refine")) : null, props.draftResult ? h("div", { className: "hermes-workflows-palette-draft hermes-workflows-stack" }, props.draftResult.summary ? h("p", { className: "hermes-workflows-muted" }, props.draftResult.summary) : null, (props.draftResult.assumptions || []).length ? h("p", null, h("strong", null, "Assumptions: "), props.draftResult.assumptions.join("; ")) : null, (props.draftResult.warnings || []).length ? h("p", { className: "hermes-workflows-muted" }, h("strong", null, "Warnings: "), props.draftResult.warnings.join("; ")) : null, h("div", { className: "hermes-workflows-row" }, h("button", {
+			type: "button",
+			onClick: props.acceptDraftCandidate,
+			className: "hermes-workflows-primary"
+		}, props.candidateSource === "generate" ? "Accept Draft" : "Accept Changes"), h("button", {
+			type: "button",
+			onClick: props.rejectDraftCandidate
+		}, "Reject"))) : null);
+	}
+	function renderWorkflowOnboarding(props) {
+		return props.createElement("div", { className: "hermes-workflows-onboarding-form" }, renderWorkflowForm(props.createElement, props));
+	}
 	function renderPalette(props) {
 		const h = props.createElement;
 		const React = props.React || {};
@@ -930,54 +988,6 @@
 					if (typeof window !== "undefined") window.__HERMES_DRAG_NODE_TYPE = type;
 				}
 			};
-		}
-		function renderWorkflowForm() {
-			return h("section", { className: "hermes-workflows-palette-section hermes-workflows-palette-creation" }, h("h3", null, props.activeSpec ? "New workflow / prompt" : "New workflow"), h("p", { className: "hermes-workflows-muted" }, "Describe it or start from blank."), h("form", {
-				className: "hermes-workflows-stack",
-				"aria-label": "Create workflow",
-				onSubmit: props.draftFromGoal
-			}, h("input", {
-				value: props.newWorkflowName || "",
-				onChange: function(event) {
-					call(props.setNewWorkflowName, event.target.value);
-				},
-				placeholder: "Workflow name"
-			}), h("textarea", {
-				"aria-label": "Describe workflow goal",
-				value: props.goalText || "",
-				onChange: function(event) {
-					call(props.setGoalText, event.target.value);
-				},
-				placeholder: "Example: review code changes, run tests, then deploy if approved."
-			}), h("div", { className: "hermes-workflows-row" }, h("button", {
-				type: "submit",
-				disabled: props.drafting,
-				className: "hermes-workflows-primary"
-			}, props.drafting ? "Generating…" : "Generate From Prompt"), h("button", {
-				type: "button",
-				"aria-label": "Start from scratch",
-				onClick: props.startBlankWorkflow
-			}, "Start From Scratch"))), props.activeSpec ? h("form", {
-				className: "hermes-workflows-stack",
-				onSubmit: props.refineWorkflow
-			}, h("textarea", {
-				value: props.refineText || "",
-				onChange: function(event) {
-					call(props.setRefineText, event.target.value);
-				},
-				placeholder: "Refine: add a step, change routing, etc.",
-				"aria-label": "Refine workflow"
-			}), h("button", {
-				type: "submit",
-				disabled: props.refining
-			}, props.refining ? "Refining…" : "Refine")) : null, props.draftResult ? h("div", { className: "hermes-workflows-palette-draft hermes-workflows-stack" }, props.draftResult.summary ? h("p", { className: "hermes-workflows-muted" }, props.draftResult.summary) : null, (props.draftResult.assumptions || []).length ? h("p", null, h("strong", null, "Assumptions: "), props.draftResult.assumptions.join("; ")) : null, (props.draftResult.warnings || []).length ? h("p", { className: "hermes-workflows-muted" }, h("strong", null, "Warnings: "), props.draftResult.warnings.join("; ")) : null, h("div", { className: "hermes-workflows-row" }, h("button", {
-				type: "button",
-				onClick: props.acceptDraftCandidate,
-				className: "hermes-workflows-primary"
-			}, props.candidateSource === "generate" ? "Accept Draft" : "Accept Changes"), h("button", {
-				type: "button",
-				onClick: props.rejectDraftCandidate
-			}, "Reject"))) : null);
 		}
 		function renderDefinitions() {
 			return h("section", { className: "hermes-workflows-palette-section" }, h("h3", null, "Workflows"), h("div", { className: "hermes-workflows-sidebar-list" }, definitions.length ? definitions.map(function(definition) {
@@ -1063,7 +1073,6 @@
 				}, category.name), h("div", { className: "hermes-workflows-node-palette" }, category.nodes.map(renderNodeCard)));
 			}) : h("p", { className: "hermes-workflows-muted" }, "No nodes match “" + String(search) + "”."));
 		}
-		if (props.variant === "onboarding") return h("div", { className: "hermes-workflows-onboarding-form" }, renderWorkflowForm());
 		return h("aside", { className: "hermes-workflows-sidebar hermes-workflows-palette" }, h("div", {
 			className: "hermes-workflows-palette-tabs",
 			role: "tablist",
@@ -1088,7 +1097,7 @@
 			className: "hermes-workflows-palette-panel hermes-workflows-workflow-library",
 			role: "tabpanel",
 			"aria-label": "Workflows"
-		}, renderWorkflowForm(), renderDefinitions(), renderExecutions()));
+		}, props.hideWorkflowForm ? null : renderWorkflowForm(h, props), renderDefinitions(), renderExecutions()));
 	}
 	//#endregion
 	//#region ../plugins/workflows/dashboard/src/inspector.js
@@ -4123,7 +4132,28 @@
 				}) : h("p", { className: "hermes-workflows-muted" }, "No edges defined.")));
 			}
 			function renderReactFlowGraph(spec) {
-				if (!ReactFlow || !ReactFlowProvider) return renderSimpleGraph(spec);
+				function renderCanvasOnboarding(className) {
+					return h("div", { className }, h("div", { className: "hermes-workflows-canvas-onboarding-card" }, renderWorkflowOnboarding({
+						createElement: h,
+						activeSpec: null,
+						goalText,
+						setGoalText,
+						newWorkflowName,
+						setNewWorkflowName,
+						draftFromGoal,
+						drafting,
+						startBlankWorkflow,
+						refineWorkflow,
+						refining,
+						refineText,
+						setRefineText,
+						draftResult,
+						candidateSource,
+						acceptDraftCandidate,
+						rejectDraftCandidate
+					})));
+				}
+				if (!ReactFlow || !ReactFlowProvider) return spec ? renderSimpleGraph(spec) : renderCanvasOnboarding("hermes-workflows-simple-canvas-onboarding");
 				return h("div", { className: "hermes-workflows-flow-surface" }, h("div", {
 					className: "hermes-workflows-canvas" + (isDragOver ? " hermes-workflows-canvas-drop-target" : ""),
 					onDragOver: function(event) {
@@ -4220,27 +4250,7 @@
 							});
 						}
 					}
-				}, Controls ? h(Controls, null) : null)), !spec ? h("div", { className: "hermes-workflows-canvas-onboarding" }, h("div", { className: "hermes-workflows-canvas-onboarding-card" }, renderPalette({
-					variant: "onboarding",
-					createElement: h,
-					React,
-					activeSpec: null,
-					goalText,
-					setGoalText,
-					newWorkflowName,
-					setNewWorkflowName,
-					draftFromGoal,
-					drafting,
-					startBlankWorkflow,
-					refineWorkflow,
-					refining,
-					refineText,
-					setRefineText,
-					draftResult,
-					candidateSource,
-					acceptDraftCandidate,
-					rejectDraftCandidate
-				}))) : null, contextMenu.visible ? h(React.Fragment, null, h("div", {
+				}, Controls ? h(Controls, null) : null)), !spec ? renderCanvasOnboarding("hermes-workflows-canvas-onboarding") : null, contextMenu.visible ? h(React.Fragment, null, h("div", {
 					className: "hermes-workflows-context-menu-overlay",
 					style: {
 						position: "fixed",
@@ -4526,6 +4536,7 @@
 				createElement: h,
 				React,
 				activeSpec: spec,
+				hideWorkflowForm: !spec,
 				goalText,
 				setGoalText,
 				newWorkflowName,

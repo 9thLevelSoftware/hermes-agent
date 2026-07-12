@@ -384,7 +384,8 @@
   border-radius: 0;
 }
 
-.hermes-workflows .hermes-workflows-canvas-onboarding {
+.hermes-workflows .hermes-workflows-canvas-onboarding,
+.hermes-workflows .hermes-workflows-simple-canvas-onboarding {
   position: absolute;
   inset: 0;
   z-index: 5;

@@ -35,4 +35,14 @@ describe("workflow canvas workspace layout", () => {
     expect(appSource).toContain("renderReactFlowGraph(activeSpec())");
     expect(appSource).not.toContain("No workflow loaded. Use the sidebar to draft a new workflow or select an existing one.");
   });
+
+  it("uses the hook-free onboarding renderer in the canvas overlay", () => {
+    expect(appSource).toContain("renderWorkflowOnboarding(");
+    const canvasStart = appSource.indexOf("function renderReactFlowGraph");
+    const canvasEnd = appSource.indexOf("function renderBuildMode");
+    const canvasSource = appSource.slice(canvasStart, canvasEnd);
+    expect(canvasSource).toContain("renderWorkflowOnboarding(");
+    expect(canvasSource).not.toContain("renderPalette({");
+    expect(canvasSource).toContain("hermes-workflows-simple-canvas-onboarding");
+  });
 });

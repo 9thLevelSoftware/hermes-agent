@@ -34,7 +34,7 @@ import {
   defaultTriggerForType,
 } from "./editor-model.js";
 import { makeWorkflowNode } from "./canvas-nodes.js";
-import { renderPalette } from "./palette.js";
+import { renderPalette, renderWorkflowOnboarding } from "./palette.js";
 import { renderInspector } from "./inspector.js";
 
 (function () {
@@ -2963,7 +2963,35 @@ import { renderInspector } from "./inspector.js";
     }
 
     function renderReactFlowGraph(spec) {
-      if (!ReactFlow || !ReactFlowProvider) return renderSimpleGraph(spec);
+      function renderCanvasOnboarding(className) {
+        return h("div", { className: className },
+          h("div", { className: "hermes-workflows-canvas-onboarding-card" },
+            renderWorkflowOnboarding({
+              createElement: h,
+              activeSpec: null,
+              goalText: goalText,
+              setGoalText: setGoalText,
+              newWorkflowName: newWorkflowName,
+              setNewWorkflowName: setNewWorkflowName,
+              draftFromGoal: draftFromGoal,
+              drafting: drafting,
+              startBlankWorkflow: startBlankWorkflow,
+              refineWorkflow: refineWorkflow,
+              refining: refining,
+              refineText: refineText,
+              setRefineText: setRefineText,
+              draftResult: draftResult,
+              candidateSource: candidateSource,
+              acceptDraftCandidate: acceptDraftCandidate,
+              rejectDraftCandidate: rejectDraftCandidate,
+            })
+          )
+        );
+      }
+
+      if (!ReactFlow || !ReactFlowProvider) {
+        return spec ? renderSimpleGraph(spec) : renderCanvasOnboarding("hermes-workflows-simple-canvas-onboarding");
+      }
       const nodes = spec ? flowNodes : [];
       const edges = spec ? flowEdges : [];
       return h("div", { className: "hermes-workflows-flow-surface" },
@@ -3063,31 +3091,7 @@ import { renderInspector } from "./inspector.js";
               Controls ? h(Controls, null) : null
             )
           ),
-          !spec ? h("div", { className: "hermes-workflows-canvas-onboarding" },
-            h("div", { className: "hermes-workflows-canvas-onboarding-card" },
-              renderPalette({
-                variant: "onboarding",
-                createElement: h,
-                React: React,
-                activeSpec: null,
-                goalText: goalText,
-                setGoalText: setGoalText,
-                newWorkflowName: newWorkflowName,
-                setNewWorkflowName: setNewWorkflowName,
-                draftFromGoal: draftFromGoal,
-                drafting: drafting,
-                startBlankWorkflow: startBlankWorkflow,
-                refineWorkflow: refineWorkflow,
-                refining: refining,
-                refineText: refineText,
-                setRefineText: setRefineText,
-                draftResult: draftResult,
-                candidateSource: candidateSource,
-                acceptDraftCandidate: acceptDraftCandidate,
-                rejectDraftCandidate: rejectDraftCandidate,
-              })
-            )
-          ) : null,
+          !spec ? renderCanvasOnboarding("hermes-workflows-canvas-onboarding") : null,
           contextMenu.visible ? h(React.Fragment, null,
             h("div", {
               className: "hermes-workflows-context-menu-overlay",
@@ -3767,6 +3771,7 @@ import { renderInspector } from "./inspector.js";
             createElement: h,
             React: React,
             activeSpec: spec,
+            hideWorkflowForm: !spec,
             goalText: goalText,
             setGoalText: setGoalText,
             newWorkflowName: newWorkflowName,
