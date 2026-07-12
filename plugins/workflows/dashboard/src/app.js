@@ -33,6 +33,7 @@ import {
   changeNodeType,
 } from "./editor-model.js";
 import { makeWorkflowNode } from "./canvas-nodes.js";
+import { renderInspector } from "./inspector.js";
 
 (function () {
   "use strict";
@@ -1020,6 +1021,21 @@ import { makeWorkflowNode } from "./canvas-nodes.js";
     const stateCellOutputText = useState("");
     const cellOutputText = stateCellOutputText[0];
     const setCellOutputText = stateCellOutputText[1];
+    const stateSendMessagePlatform = useState("auto");
+    const sendMessagePlatform = stateSendMessagePlatform[0];
+    const setSendMessagePlatform = stateSendMessagePlatform[1];
+    const stateSendMessageTarget = useState("");
+    const sendMessageTarget = stateSendMessageTarget[0];
+    const setSendMessageTarget = stateSendMessageTarget[1];
+    const stateSendMessageText = useState("");
+    const sendMessageText = stateSendMessageText[0];
+    const setSendMessageText = stateSendMessageText[1];
+    const stateSubworkflowRef = useState("");
+    const subworkflowRef = stateSubworkflowRef[0];
+    const setSubworkflowRef = stateSubworkflowRef[1];
+    const stateSubworkflowInputMappingText = useState("{}");
+    const subworkflowInputMappingText = stateSubworkflowInputMappingText[0];
+    const setSubworkflowInputMappingText = stateSubworkflowInputMappingText[1];
     const stateCellSeconds = useState("60");
     const cellSeconds = stateCellSeconds[0];
     const setCellSeconds = stateCellSeconds[1];
@@ -1455,6 +1471,11 @@ import { makeWorkflowNode } from "./canvas-nodes.js";
       setTriggerReadyPath(node && node.specKind === "trigger" ? readyPathFromTrigger(node) : "");
       setTriggerSchedule(node && (node.schedule || node.cron || node.expr) ? String(node.schedule || node.cron || node.expr) : "");
       setCellOutputText(node && node.output !== undefined && node.output !== null ? (typeof node.output === "string" ? node.output : jsonBlock(node.output)) : "");
+      setSendMessagePlatform(node && node.platform ? String(node.platform) : "auto");
+      setSendMessageTarget(node && node.target ? String(node.target) : "");
+      setSendMessageText(node && node.message_text !== undefined && node.message_text !== null ? String(node.message_text) : "");
+      setSubworkflowRef(node && node.workflow_ref ? String(node.workflow_ref) : "");
+      setSubworkflowInputMappingText(jsonBlock((node && node.input_mapping) || {}));
       setCellSeconds(node && node.seconds !== undefined && node.seconds !== null ? String(node.seconds) : "60");
       setSwitchDefault(node && node.default ? String(node.default) : "");
       setSwitchCases(asArray(node && node.cases));
@@ -2219,6 +2240,37 @@ import { makeWorkflowNode } from "./canvas-nodes.js";
           delete nextNode.default;
         }
       }
+        if (nextType === "send_message") {
+          const platform = ["auto", "discord", "telegram", "slack"].indexOf(sendMessagePlatform) !== -1 ? sendMessagePlatform : "auto";
+          if (sendMessageTarget.trim()) nextNode.target = sendMessageTarget.trim();
+          else delete nextNode.target;
+          if (sendMessageText.trim()) nextNode.message_text = sendMessageText;
+          else delete nextNode.message_text;
+          nextNode.platform = platform;
+        } else {
+          delete nextNode.target;
+          delete nextNode.message_text;
+          delete nextNode.platform;
+        }
+        if (nextType === "subworkflow") {
+          let inputMapping;
+          try {
+            inputMapping = parseJsonObject(subworkflowInputMappingText || "{}");
+          } catch (_) {
+            inputMapping = null;
+          }
+          if (!inputMapping) {
+            setNodeMessage("Input mapping JSON must be a JSON object.");
+            return;
+          }
+          if (subworkflowRef.trim()) nextNode.workflow_ref = subworkflowRef.trim();
+          else delete nextNode.workflow_ref;
+          nextNode.input_mapping = inputMapping;
+        } else {
+          delete nextNode.workflow_ref;
+          delete nextNode.input_mapping;
+        }
+      }
 
       delete nextNode.provider_override;
       delete nextNode.model_override;
@@ -2886,7 +2938,7 @@ import { makeWorkflowNode } from "./canvas-nodes.js";
       );
     }
 
-    function renderInspector(spec) {
+    function renderInspectorLegacy(spec) {
       return h("aside", { className: "hermes-workflows-inspector" },
         h("h3", null, "Node inspector"),
         selectedNode ? renderInspectorForType(spec) : h("p", { className: "hermes-workflows-muted" }, "Choose a node from the palette, select it on the canvas, then configure it in Properties.")
@@ -3435,7 +3487,109 @@ import { makeWorkflowNode } from "./canvas-nodes.js";
             h("div", { className: "hermes-workflows-canvas-wrap" },
               activeSpec() ? renderReactFlowGraph(activeSpec()) : h("div", { className: "hermes-workflows-muted", style: {padding: "2rem", textAlign: "center"} }, "No workflow loaded. Use the sidebar to draft a new workflow or select an existing one.")
             ),
-            activeSpec() ? h("div", { className: "hermes-workflows-inspector-panel" }, renderInspector(activeSpec())) : null
+            activeSpec() ? h("div", { className: "hermes-workflows-inspector-panel" }, renderInspector({
+              createElement: h,
+              React: React,
+              selectedNode: selectedNode,
+              cellId: cellId,
+              setCellId: setCellId,
+              cellType: cellType,
+              setCellType: setCellType,
+              activeSpec: activeSpec,
+              agentProfile: agentProfile,
+              setAgentProfile: setAgentProfile,
+              agentProvider: agentProvider,
+              setAgentProvider: setAgentProvider,
+              agentModel: agentModel,
+              setAgentModel: setAgentModel,
+              agentTitle: agentTitle,
+              setAgentTitle: setAgentTitle,
+              promptText: promptText,
+              setPromptText: setPromptText,
+              resultContractText: resultContractText,
+              setResultContractText: setResultContractText,
+              agentRoutingOptions: agentRoutingOptions,
+              promptAssistantOpen: promptAssistantOpen,
+              setPromptAssistantOpen: setPromptAssistantOpen,
+              promptAssistantGoal: promptAssistantGoal,
+              setPromptAssistantGoal: setPromptAssistantGoal,
+              promptAssistantObjective: promptAssistantObjective,
+              setPromptAssistantObjective: setPromptAssistantObjective,
+              promptAssistantContext: promptAssistantContext,
+              setPromptAssistantContext: setPromptAssistantContext,
+              promptAssistantOutput: promptAssistantOutput,
+              setPromptAssistantOutput: setPromptAssistantOutput,
+              promptAssistantConstraints: promptAssistantConstraints,
+              setPromptAssistantConstraints: setPromptAssistantConstraints,
+              promptAssistantAdvanced: promptAssistantAdvanced,
+              setPromptAssistantAdvanced: setPromptAssistantAdvanced,
+              draftPromptWithAssistant: draftPromptWithAssistant,
+              triggerInputRows: triggerInputRows,
+              setTriggerInputRows: setTriggerInputRows,
+              triggerInputName: triggerInputName,
+              setTriggerInputName: setTriggerInputName,
+              triggerInputKind: triggerInputKind,
+              setTriggerInputKind: setTriggerInputKind,
+              triggerInputRequired: triggerInputRequired,
+              setTriggerInputRequired: setTriggerInputRequired,
+              triggerInputDefault: triggerInputDefault,
+              setTriggerInputDefault: setTriggerInputDefault,
+              triggerInputMinLength: triggerInputMinLength,
+              setTriggerInputMinLength: setTriggerInputMinLength,
+              triggerInputMaxLength: triggerInputMaxLength,
+              setTriggerInputMaxLength: setTriggerInputMaxLength,
+              triggerIntakeMode: triggerIntakeMode,
+              setTriggerIntakeMode: setTriggerIntakeMode,
+              triggerDedupeKey: triggerDedupeKey,
+              setTriggerDedupeKey: setTriggerDedupeKey,
+              triggerReadyPath: triggerReadyPath,
+              setTriggerReadyPath: setTriggerReadyPath,
+              triggerSchedule: triggerSchedule,
+              setTriggerSchedule: setTriggerSchedule,
+              addTriggerInputFieldFromUi: addTriggerInputFieldFromUi,
+              removeTriggerInputField: removeTriggerInputField,
+              switchDefault: switchDefault,
+              setSwitchDefault: setSwitchDefault,
+              switchCases: switchCases,
+              setSwitchCases: setSwitchCases,
+              switchCaseName: switchCaseName,
+              setSwitchCaseName: setSwitchCaseName,
+              switchCasePath: switchCasePath,
+              setSwitchCasePath: setSwitchCasePath,
+              switchCaseEquals: switchCaseEquals,
+              setSwitchCaseEquals: setSwitchCaseEquals,
+              addSwitchCaseFromUi: addSwitchCaseFromUi,
+              cellSeconds: cellSeconds,
+              setCellSeconds: setCellSeconds,
+              cellOutputText: cellOutputText,
+              setCellOutputText: setCellOutputText,
+              sendMessagePlatform: sendMessagePlatform,
+              setSendMessagePlatform: setSendMessagePlatform,
+              sendMessageTarget: sendMessageTarget,
+              setSendMessageTarget: setSendMessageTarget,
+              sendMessageText: sendMessageText,
+              setSendMessageText: setSendMessageText,
+              subworkflowRef: subworkflowRef,
+              setSubworkflowRef: setSubworkflowRef,
+              subworkflowInputMappingText: subworkflowInputMappingText,
+              setSubworkflowInputMappingText: setSubworkflowInputMappingText,
+              applyAgentCellForm: applyAgentCellForm,
+              applyBasicCellForm: applyBasicCellForm,
+              deleteSelectedCell: deleteSelectedCell,
+              advancedJsonOpen: advancedJsonOpen,
+              setAdvancedJsonOpen: setAdvancedJsonOpen,
+              nodeJson: nodeJson,
+              setNodeJson: setNodeJson,
+              applyNodeJson: applyNodeJson,
+              useJsonDraft: useJsonDraft,
+              nodeMessage: nodeMessage,
+              setNodeMessage: setNodeMessage,
+              setDraftSpec: setDraftSpec,
+              setSelectedDefinition: setSelectedDefinition,
+              selectedDefinition: selectedDefinition,
+              setSelectedNode: setSelectedNode,
+              updateEditorText: updateEditorText,
+            })) : null
           )
         )
       );
