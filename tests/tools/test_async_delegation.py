@@ -686,8 +686,11 @@ def test_gateway_cli_origin_event_left_unrouted():
 # acknowledge after successful injection so a redelivery on restart
 # never double-fires.
 
+import importlib as _importlib_t8
 import json as _json_t8
+import sys as _sys_t8
 from pathlib import Path as _Path_t8
+from unittest.mock import MagicMock as _MM_t8, patch as _patch_t8
 
 import pytest as _pytest_t8
 
@@ -707,6 +710,49 @@ def _journal_db(tmp_path):
 def _open_journal_db(path: _Path_t8) -> _SessionDB_t8:
     """Return a SECOND SessionDB instance against the same path."""
     return _SessionDB_t8(db_path=path)
+
+
+def _make_cli_for_drain_test():
+    """HermesCLI instance with prompt_toolkit stubbed — only enough to exercise
+    the idle notification drain path. Mirrors tests/cli/test_cli_interrupt_ack_race.py."""
+    _clean_config = {
+        "model": {
+            "default": "anthropic/claude-opus-4.6",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "auto",
+        },
+        "display": {"compact": False, "tool_progress": "all"},
+        "agent": {},
+        "terminal": {"env_type": "local"},
+    }
+    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
+    prompt_toolkit_stubs = {
+        "prompt_toolkit": _MM_t8(),
+        "prompt_toolkit.history": _MM_t8(),
+        "prompt_toolkit.styles": _MM_t8(),
+        "prompt_toolkit.patch_stdout": _MM_t8(),
+        "prompt_toolkit.application": _MM_t8(),
+        "prompt_toolkit.layout": _MM_t8(),
+        "prompt_toolkit.layout.processors": _MM_t8(),
+        "prompt_toolkit.filters": _MM_t8(),
+        "prompt_toolkit.layout.dimension": _MM_t8(),
+        "prompt_toolkit.layout.menus": _MM_t8(),
+        "prompt_toolkit.widgets": _MM_t8(),
+        "prompt_toolkit.key_binding": _MM_t8(),
+        "prompt_toolkit.completion": _MM_t8(),
+        "prompt_toolkit.formatted_text": _MM_t8(),
+        "prompt_toolkit.auto_suggest": _MM_t8(),
+    }
+    with _patch_t8.dict(_sys_t8.modules, prompt_toolkit_stubs), _patch_t8.dict(
+        "os.environ", clean_env, clear=False
+    ):
+        import cli as _cli_mod_t8
+
+        _cli_mod_t8 = _importlib_t8.reload(_cli_mod_t8)
+        with _patch_t8.object(_cli_mod_t8, "get_tool_definitions", return_value=[]), _patch_t8.dict(
+            _cli_mod_t8.__dict__, {"CLI_CONFIG": _clean_config}
+        ):
+            return _cli_mod_t8.HermesCLI()
 
 
 def test_dispatch_creates_pending_record_and_completion_persists_before_queue(_journal_db):
@@ -1145,5 +1191,142 @@ def test_startup_reconcile_then_restore_emits_orphans_only(tmp_path):
     assert captured[0]["delegation_id"] == "orphan-1"
     assert captured[0]["summary"] == "save me"
     db2.close()
+
+
+def test_cli_idle_drain_does_not_ack_synchronously_after_enqueue(tmp_path, monkeypatch):
+    """The CLI idle drain puts the synthetic prompt into _pending_input but
+    MUST NOT synchronously call acknowledge_async_delegation(). If the process
+    dies between put() and the agent loop actually picking up + processing
+    the item, the durable row must remain unacked so a restart replays the
+    completion. Acknowledgement belongs on the *consumer* path, gated by
+    the moment we commit to running the turn.
+
+    We exercise the CLI's drain helper directly. Pre-fix the helper does
+    not exist (or acks synchronously); in both cases the durable row gets
+    acked before the agent can process the queued synth, which would lose
+    a completion across a crash + restart. Post-fix the helper stages the
+    ack for the consumer path.
+    """
+    db_path = tmp_path / "state.db"
+    db = _SessionDB_t8(db_path=db_path)
+    journal = _OpJournal_t8(db)
+    journal.create(operation_id="t8-cli-drain", kind="async_delegation")
+    journal.transition(
+        "t8-cli-drain", from_states={"pending"}, to_state="running",
+        effect_disposition="none",
+    )
+    journal.transition(
+        "t8-cli-drain", from_states={"running"}, to_state="confirmed",
+        effect_disposition="none",
+        result={"status": "completed", "summary": "from-drain",
+                "session_key": "", "parent_session_id": None},
+    )
+    ad._set_journal_for_tests(journal)
+
+    cli = _make_cli_for_drain_test()
+    cli._pending_input = queue.Queue()
+
+    fake_synth = "[SYSTEM: async delegation completed: from-drain]"
+    fake_evt = {"type": "async_delegation", "delegation_id": "t8-cli-drain",
+                "summary": "from-drain", "session_key": "",
+                "parent_session_id": None, "status": "completed"}
+
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.drain_notifications",
+        lambda session_key="": [(_dict_copy(fake_evt), fake_synth)],
+    )
+
+    # Helper under test (defined post-fix). Pre-fix this raises AttributeError.
+    cli._drain_idle_async_delegations()
+
+    # Drain put the synth into _pending_input.
+    assert not cli._pending_input.empty()
+    assert cli._pending_input.get_nowait() == fake_synth
+
+    # KEY invariant: the row is NOT yet acked — the consumer commit must ack.
+    # Pre-fix this assertion FAILS because the synchronous ack already
+    # marked acknowledged_at, so a crash between put and consumption loses
+    # the result forever on restart.
+    rec = journal.get("t8-cli-drain")
+    assert rec is not None
+    assert rec.acknowledged_at is None, (
+        "row was acked synchronously after enqueue; a crash before consumption "
+        "would lose the result on restart"
+    )
+
+    # Simulate a process restart: new journal handle, restore MUST replay
+    # because we did not ack. This is the operational truth: a crash
+    # between put and consume must NOT lose the completion.
+    db.close()
+    ad._reset_for_tests()
+    db2 = _SessionDB_t8(db_path=db_path)
+    journal2 = _OpJournal_t8(db2)
+    ad._set_journal_for_tests(journal2)
+    captured = []
+    n = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue, lambda e: captured.append(e),
+    )
+    db2.close()
+    assert n == 1, "row lost after simulated process death"
+    assert captured and captured[0]["delegation_id"] == "t8-cli-drain"
+
+
+def test_cli_consumer_path_acks_after_commit_to_run(tmp_path, monkeypatch):
+    """Once the consumer path commits to processing the queued synth (the
+    point where a future crash becomes the agent's responsibility, not
+    the durable journal's), the row must be acknowledged. Without this
+    edge, every successfully-processed completion would replay on restart
+    and double-fire the [SYSTEM: ...] block."""
+    db_path = tmp_path / "state.db"
+    db = _SessionDB_t8(db_path=db_path)
+    journal = _OpJournal_t8(db)
+    journal.create(operation_id="t8-cli-consume", kind="async_delegation")
+    journal.transition(
+        "t8-cli-consume", from_states={"pending"}, to_state="running",
+        effect_disposition="none",
+    )
+    journal.transition(
+        "t8-cli-consume", from_states={"running"}, to_state="confirmed",
+        effect_disposition="none",
+        result={"status": "completed", "summary": "consumed"},
+    )
+    ad._set_journal_for_tests(journal)
+
+    cli = _make_cli_for_drain_test()
+    cli._pending_input = queue.Queue()
+
+    fake_synth = "[SYSTEM: async delegation completed: consumed]"
+    fake_evt = {"type": "async_delegation", "delegation_id": "t8-cli-consume",
+                "summary": "consumed", "session_key": "",
+                "parent_session_id": None, "status": "completed"}
+
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.drain_notifications",
+        lambda session_key="": [(_dict_copy(fake_evt), fake_synth)],
+    )
+
+    # Stage the drain (does not ack by itself).
+    cli._drain_idle_async_delegations()
+    assert journal.get("t8-cli-consume").acknowledged_at is None
+
+    # Simulate the consumer pulling the item off the queue and committing
+    # to run it. The CLI ack hook lives at this commit point; if it is
+    # missing, every completion replays on restart (the second part of
+    # the original bug — never-acked rows double-fire).
+    assert cli._pending_input.get_nowait() == fake_synth
+    cli._ack_pending_async_delegations()
+
+    rec = journal.get("t8-cli-consume")
+    assert rec is not None
+    assert rec.acknowledged_at is not None, (
+        "consumer path did not acknowledge the row after committing to run it; "
+        "every completion would double-fire on restart"
+    )
+
+    db.close()
+
+
+def _dict_copy(d):
+    return {k: v for k, v in d.items()}
 
 

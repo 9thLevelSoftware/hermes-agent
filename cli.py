@@ -4039,6 +4039,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        # Stage async-delegation operation_ids awaiting acknowledgement. Popped
+        # when the agent commits to running the queued synth — see
+        # `_ack_pending_async_delegations`. Bounds if the agent loop crashes
+        # before consuming every staged ack; the durable journal still owns the
+        # source of truth, so this is just a "don't double-ack" hint list.
+        self._pending_delegation_acks: "deque[str]" = deque()
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
         # don't auto-queue another continuation on top of a user-cancelled
@@ -13130,6 +13136,54 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             ] if item is not None
         ]
 
+    def _drain_idle_async_delegations(self) -> int:
+        """Pull pending async-delegation (and watch-pattern) notifications
+        from ``process_registry`` and queue them for the agent loop.
+
+        Acknowledgement of the *durable* row is INTENTIONALLY deferred —
+        it lives in ``self._pending_delegation_acks`` until the agent
+        loop actually commits to running the queued item
+        (``_ack_pending_async_delegations``). This way a process death
+        between put() and consumption leaves the row unacked so a
+        restart replays the completion instead of silently dropping it.
+
+        Returns the number of events staged (test hook surface).
+        """
+        from tools.process_registry import process_registry
+        from tools.approval import get_current_session_key
+
+        _drain_sk = get_current_session_key(default="")
+        staged = 0
+        for _evt, _synth in process_registry.drain_notifications(session_key=_drain_sk):
+            self._pending_input.put(_synth)
+            # Stage the durable-row ack — do NOT call acknowledge yet.
+            # Background process completions have no operation row, so
+            # the later ack would be a no-op for them; we only stage
+            # the rows the journal actually owns.
+            if _evt.get("type") == "async_delegation":
+                _did = _evt.get("delegation_id", "")
+                if _did:
+                    self._pending_delegation_acks.append(_did)
+            staged += 1
+        return staged
+
+    def _ack_pending_async_delegations(self) -> None:
+        """Acknowledge the durable row for any queued async-delegation
+        synth this process is about to process. Called from the
+        consumer side of ``process_loop`` — once we have committed to
+        running the turn, any future crash is the agent's responsibility
+        (and the row must NOT replay on restart)."""
+        if not self._pending_delegation_acks:
+            return
+        from tools.async_delegation import acknowledge_async_delegation
+        while self._pending_delegation_acks:
+            _did = self._pending_delegation_acks.popleft()
+            try:
+                acknowledge_async_delegation(_did)
+            except Exception:
+                # ack must never crash the loop — see the helper's docstring.
+                pass
+
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
         if not self._claim_active_session("cli"):
@@ -13285,6 +13339,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()     # For normal input (commands + new queries)
         self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
+        # Mirrors the constructor above — see `_ack_pending_async_delegations`.
+        self._pending_delegation_acks: "deque[str]" = deque()
         # See constructor note. Mirrored here for the run() path that skips
         # the earlier __init__ branch.
         self._last_turn_interrupted = False
@@ -15207,33 +15263,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             self._check_config_mcp_changes()
                             # Check for background process notifications (completions
                             # and watch pattern matches) while agent is idle.
+                            # The drain puts the synthetic prompt onto _pending_input
+                            # but STAGES the durable-row ack (Task 8 — durable
+                            # delegation completion). The actual acknowledgement
+                            # runs on the *consumer* path just before the agent
+                            # commits to processing the queued item, so a process
+                            # death between put() and consumption leaves the row
+                            # unacked and a restart replays the completion.
                             try:
-                                from tools.process_registry import process_registry
-                                from tools.approval import get_current_session_key
-                                from tools.async_delegation import (
-                                    acknowledge_async_delegation,
-                                )
-                                _drain_sk = get_current_session_key(default="")
-                                for _evt, _synth in process_registry.drain_notifications(session_key=_drain_sk):
-                                    self._pending_input.put(_synth)
-                                    # Mark the durable row as acknowledged so a
-                                    # restart does not re-enqueue this same
-                                    # completion (Task 8). Background process
-                                    # completions have no operation row → ack is
-                                    # a no-op for them.
-                                    if _evt.get("type") == "async_delegation":
-                                        try:
-                                            acknowledge_async_delegation(
-                                                _evt.get("delegation_id", ""),
-                                            )
-                                        except Exception:
-                                            pass
+                                self._drain_idle_async_delegations()
                             except Exception:
                                 pass
                         continue
-                    
+
                     if not user_input:
                         continue
+
+                    # We have committed to processing whatever this string is.
+                    # If it was an async-delegation completion, drain_staged_ack
+                    # the corresponding durable row now — any future crash is
+                    # the agent's responsibility, not the durable journal's,
+                    # so the row must NOT be replayed on restart.
+                    self._ack_pending_async_delegations()
 
                     # The user has typed and submitted something, so any
                     # post-resize transient suppression should end here.
