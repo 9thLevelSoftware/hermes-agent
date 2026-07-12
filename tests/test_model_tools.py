@@ -11,6 +11,7 @@ from model_tools import (
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
+    registry,
 )
 
 
@@ -161,6 +162,8 @@ class TestHandleFunctionCall:
 
         def execution_middleware(**kwargs):
             seen["execution_args"] = kwargs["args"]
+            seen["operation_metadata"] = kwargs["operation_metadata"]
+            seen["operation_key"] = kwargs["operation_key"]
             return kwargs["next_call"]({**kwargs["args"], "wrapped": True})
 
         def fake_dispatch(tool_name, args, **kwargs):
@@ -193,6 +196,17 @@ class TestHandleFunctionCall:
         )
 
         assert seen["execution_args"] == {"q": "test", "rewritten": True}
+        assert seen["operation_metadata"] == {
+            "read_only": True,
+            "destructive": False,
+            "idempotent": True,
+        }
+        assert seen["operation_key"] == registry.operation_key(
+            "web_search",
+            {"q": "test", "rewritten": True},
+            task_id="task-1",
+            tool_call_id="tool-1",
+        )
         assert seen["dispatch"][1] == {"q": "test", "rewritten": True, "wrapped": True}
         assert result["args"] == {"q": "test", "rewritten": True, "wrapped": True}
         expected_trace = [{"source": "test-middleware", "reason": "rewrite"}]

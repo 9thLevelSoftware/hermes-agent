@@ -15,6 +15,7 @@ Import chain (circular-import safe):
 """
 
 import ast
+import hashlib
 import importlib
 import json
 import logging
@@ -82,11 +83,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "read_only", "destructive", "idempotent",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 read_only=False, destructive=True, idempotent=False):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -105,6 +108,9 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.read_only = bool(read_only)
+        self.destructive = bool(destructive) and not self.read_only
+        self.idempotent = bool(idempotent)
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +279,40 @@ class ToolRegistry:
         with self._lock:
             return self._tools.get(name)
 
+    def get_operation_metadata(self, name: str) -> Dict[str, bool]:
+        """Return conservative policy metadata without changing model schemas."""
+        entry = self.get_entry(name)
+        if entry is None:
+            return {"read_only": False, "destructive": True, "idempotent": False}
+        return {
+            "read_only": entry.read_only,
+            "destructive": entry.destructive,
+            "idempotent": entry.idempotent,
+        }
+
+    @staticmethod
+    def operation_key(
+        name: str,
+        args: Dict[str, object],
+        *,
+        task_id: str = "",
+        tool_call_id: str = "",
+    ) -> str:
+        """Return a stable correlation key for retries of one provider call."""
+        canonical = json.dumps(
+            {
+                "tool": name,
+                "args": args,
+                "task_id": task_id or "",
+                "tool_call_id": tool_call_id or "",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
         return sorted({entry.toolset for entry in self._snapshot_entries()})
@@ -372,6 +412,9 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        read_only: bool = False,
+        destructive: Optional[bool] = None,
+        idempotent: bool = False,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -442,6 +485,9 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                read_only=read_only,
+                destructive=(not read_only if destructive is None else destructive),
+                idempotent=idempotent,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by

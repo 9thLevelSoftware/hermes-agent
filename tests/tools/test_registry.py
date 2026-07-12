@@ -32,6 +32,50 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("alpha", {}))
         assert result == {"ok": True}
 
+    def test_operation_metadata_defaults_conservative_and_stays_internal(self):
+        reg = ToolRegistry()
+        schema = _make_schema("alpha")
+        reg.register(
+            name="alpha",
+            toolset="core",
+            schema=schema,
+            handler=_dummy_handler,
+        )
+
+        assert reg.get_operation_metadata("alpha") == {
+            "read_only": False,
+            "destructive": True,
+            "idempotent": False,
+        }
+        assert "read_only" not in schema
+        assert "destructive" not in schema
+        assert "idempotent" not in schema
+
+    def test_operation_key_is_stable_for_canonical_arguments(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="lookup",
+            toolset="core",
+            schema=_make_schema("lookup"),
+            handler=_dummy_handler,
+            read_only=True,
+            idempotent=True,
+        )
+
+        first = reg.operation_key(
+            "lookup", {"b": 2, "a": 1}, task_id="task", tool_call_id="call"
+        )
+        second = reg.operation_key(
+            "lookup", {"a": 1, "b": 2}, task_id="task", tool_call_id="call"
+        )
+
+        assert first == second
+        assert reg.get_operation_metadata("lookup") == {
+            "read_only": True,
+            "destructive": False,
+            "idempotent": True,
+        }
+
     def test_dispatch_passes_args(self):
         reg = ToolRegistry()
 

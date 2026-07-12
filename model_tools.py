@@ -1279,11 +1279,20 @@ def handle_function_call(
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 
+            operation_metadata = registry.get_operation_metadata(function_name)
+            operation_key = registry.operation_key(
+                function_name,
+                function_args,
+                task_id=task_id or "",
+                tool_call_id=tool_call_id or "",
+            )
             result = run_tool_execution_middleware(
                 function_name,
                 function_args,
                 _dispatch,
                 original_args=_tool_original_args,
+                operation_metadata=operation_metadata,
+                operation_key=operation_key,
                 task_id=task_id or "",
                 session_id=session_id or "",
                 tool_call_id=tool_call_id or "",
