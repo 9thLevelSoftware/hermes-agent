@@ -15,6 +15,7 @@ import {
   locationForMode,
   modeForLocation,
 } from "./workspace.js";
+import { renderTopBar as renderExtractedTopBar } from "./topbar.js";
 import {
   SCALAR_INPUT_KINDS,
   workflowIdFromText,
@@ -24,6 +25,7 @@ import {
   readyPathFromTrigger,
   changeNodeType,
 } from "./editor-model.js";
+import { makeWorkflowNode } from "./canvas-nodes.js";
 
 (function () {
   "use strict";
@@ -41,8 +43,6 @@ import {
   const Background = FlowSDK.Background;
   const Controls = FlowSDK.Controls;
   const MiniMap = FlowSDK.MiniMap;
-  const Handle = FlowSDK.Handle;
-  const Position = FlowSDK.Position || { Left: "left", Right: "right" };
   const MarkerType = FlowSDK.MarkerType || { ArrowClosed: "arrowclosed" };
   const addEdge = FlowSDK.addEdge;
   const applyNodeChanges = FlowSDK.applyNodeChanges;
@@ -604,46 +604,17 @@ import {
     return statuses;
   }
 
-  function makeWorkflowNode(kind) {
-    return function WorkflowNode(props) {
-      const data = (props && props.data) || {};
-      const status = data.status || "idle";
-      const node = data.node || {};
-      return h("div", {
-        className: "hermes-workflows-rf-node is-" + classSafe(kind) + " is-status-" + classSafe(status),
-        role: "button",
-        tabIndex: 0,
-        "aria-label": "Edit workflow cell " + safeString(data.id || node.id || "cell"),
-        onClick: function (event) {
-          event.stopPropagation();
-          if (data.onSelect) data.onSelect(node);
-        },
-        onKeyDown: function (event) {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            event.stopPropagation();
-            if (data.onSelect) data.onSelect(node);
-          }
-        },
-      },
-        Handle ? h(Handle, { type: "target", position: Position.Left }) : null,
-        h("div", { className: "hermes-workflows-rf-node-title" }, safeString(node.id || data.id)),
-        h("div", { className: "hermes-workflows-rf-node-type" }, kind),
-        status && status !== "idle" ? h("div", { className: "hermes-workflows-rf-node-status" }, safeString(status)) : null,
-        Handle ? h(Handle, { type: "source", position: Position.Right }) : null
-      );
-    };
-  }
-
   const NODE_TYPES = {
-    trigger: makeWorkflowNode("trigger"),
-    pass: makeWorkflowNode("pass"),
-    switch: makeWorkflowNode("switch"),
-    agent_task: makeWorkflowNode("agent_task"),
-    wait: makeWorkflowNode("wait"),
-    parallel: makeWorkflowNode("parallel"),
-    join: makeWorkflowNode("join"),
-    fail: makeWorkflowNode("fail"),
+    trigger: makeWorkflowNode("trigger", SDK),
+    pass: makeWorkflowNode("pass", SDK),
+    switch: makeWorkflowNode("switch", SDK),
+    agent_task: makeWorkflowNode("agent_task", SDK),
+    wait: makeWorkflowNode("wait", SDK),
+    parallel: makeWorkflowNode("parallel", SDK),
+    join: makeWorkflowNode("join", SDK),
+    fail: makeWorkflowNode("fail", SDK),
+    send_message: makeWorkflowNode("send_message", SDK),
+    subworkflow: makeWorkflowNode("subworkflow", SDK),
   };
 
   function buildFlowNodes(spec, statuses, selectedNode, onSelect, nodePositions) {
@@ -3519,9 +3490,34 @@ import {
     }
 
     var spec = activeSpec();
+    var topBarProps = {
+      createElement: h,
+      React: React,
+      activeSpec: spec,
+      selectedDefinition: selectedDefinition,
+      workflowIdForDefinition: workflowIdForDefinition,
+      versionForDefinition: versionForDefinition,
+      renderWorkspaceTabs: renderWorkspaceTabsBar,
+      validateDefinition: validateDefinition,
+      validating: validating,
+      deployDefinition: deployDefinition,
+      deploying: deploying,
+      deleteWorkflow: deleteWorkflow,
+      deleting: deleting,
+      openRunPanel: function () {
+        setRunWorkflowId(workflowIdForDefinition(selectedDefinition));
+        setRunPanelOpen(true);
+      },
+      running: running,
+      refresh: function () { refresh(); },
+      loading: loading,
+      showAdvancedYaml: showAdvancedYaml,
+      setShowAdvancedYaml: setShowAdvancedYaml,
+      persistedRunCapable: persistedRunCapable,
+    };
     return h("div", { className: "hermes-workflows" },
       h("div", { className: "hermes-workflows-app" },
-        renderTopBar(),
+        renderExtractedTopBar(topBarProps),
         (error || status) ? h("div", { className: "hermes-workflows-status-row" },
           error ? h("div", { className: "hermes-workflows-banner is-error", role: "alert" },
             h("span", null, error),
