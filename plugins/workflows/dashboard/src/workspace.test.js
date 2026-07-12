@@ -67,7 +67,7 @@ it("snaps a point to the configured flow grid", () => {
 
 it("centers a new node in the current flow viewport", () => {
   expect(centeredFlowPosition({ x: 100, y: 50, width: 800, height: 600, zoom: 2 }))
-    .toEqual({ x: 260, y: 178 });
+    .toEqual({ x: 260, y: 180 });
 });
 
 it("makes rail groups from the existing node categories without node descriptions", () => {

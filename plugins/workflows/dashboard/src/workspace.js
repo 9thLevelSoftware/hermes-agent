@@ -33,10 +33,10 @@ export function centeredFlowPosition(viewport, nodeSize = { width: 160, height: 
   const height = Number.isFinite(view.height) ? view.height : 0;
   const nodeWidth = Number.isFinite(size.width) ? size.width : 160;
   const nodeHeight = Number.isFinite(size.height) ? size.height : 88;
-  return {
+  return snapFlowPosition({
     x: x + (width - nodeWidth) / (2 * zoom),
     y: y + (height - nodeHeight) / (2 * zoom),
-  };
+  });
 }
 
 export function libraryGroups(categories) {
