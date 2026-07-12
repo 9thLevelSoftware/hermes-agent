@@ -260,6 +260,60 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(result["results"][1]["summary"], "Result B")
         self.assertIn("total_duration_seconds", result)
 
+    def test_batch_construction_closes_already_built_children_on_failure(self):
+        parent = _make_mock_parent()
+        first_child = MagicMock()
+        creds = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": None,
+            "max_output_tokens": None,
+            "command": None,
+            "args": None,
+        }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=creds),
+            patch(
+                "tools.delegate_tool._build_child_agent",
+                side_effect=[first_child, RuntimeError("second child failed")],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "second child failed"):
+                delegate_task(
+                    tasks=[{"goal": "first"}, {"goal": "second"}],
+                    parent_agent=parent,
+                )
+
+        first_child.close.assert_called_once_with()
+
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    def test_normal_execution_does_not_double_close_children(self, mock_build, mock_run):
+        parent = _make_mock_parent()
+        child = MagicMock()
+        mock_build.return_value = child
+
+        def run_child(_task_index, _goal, child, _parent_agent):
+            child.close()
+            return {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 0,
+                "duration_seconds": 0,
+            }
+
+        mock_run.side_effect = run_child
+        result = json.loads(delegate_task(goal="normal run", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        child.close.assert_called_once_with()
+
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode_accepts_json_string_tasks(self, mock_run):
         mock_run.side_effect = [
@@ -461,6 +515,28 @@ class TestDelegateTask(unittest.TestCase):
         parent_db.fork.assert_called_once_with()
         self.assertIs(kwargs["session_db"], child_db)
         self.assertTrue(kwargs["owns_session_db"])
+
+    def test_child_closes_forked_db_when_constructor_fails(self):
+        parent = _make_mock_parent(depth=0)
+        parent_db = MagicMock()
+        child_db = MagicMock()
+        parent_db.fork.return_value = child_db
+        parent._session_db = parent_db
+
+        with patch("run_agent.AIAgent", side_effect=RuntimeError("constructor failed")):
+            with self.assertRaisesRegex(RuntimeError, "constructor failed"):
+                _build_child_agent(
+                    task_index=0,
+                    goal="Close the fork on constructor failure",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        child_db.close.assert_called_once_with()
 
     def test_child_uses_thinking_callback_when_progress_callback_available(self):
         parent = _make_mock_parent(depth=0)

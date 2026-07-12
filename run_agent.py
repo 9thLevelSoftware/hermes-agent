@@ -496,7 +496,6 @@ class AIAgent:
         load_soul_identity: bool = False,
         skip_memory: bool = False,
         session_db=None,
-        owns_session_db: bool = False,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
@@ -507,6 +506,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         suppress_status_output: bool = False,
+        owns_session_db: bool = False,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -607,6 +607,7 @@ class AIAgent:
             from hermes_state import SessionDB
 
             self._session_db = SessionDB()
+            self._owns_session_db = True
             return self._session_db
         except Exception as exc:
             logger.debug("SessionDB unavailable for recall", exc_info=True)
@@ -3609,7 +3610,7 @@ class AIAgent:
                 session_db.end_session(session_id, "agent_close")
             except Exception:
                 pass
-            finally:
+            else:
                 self._session_end_called = True
 
         if (
@@ -3621,7 +3622,7 @@ class AIAgent:
                 session_db.close()
             except Exception:
                 pass
-            finally:
+            else:
                 self._session_db_closed = True
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:

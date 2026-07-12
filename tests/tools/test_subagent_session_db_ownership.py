@@ -66,3 +66,34 @@ def test_owned_session_db_is_ended_and_closed_once():
 
     session_db.end_session.assert_called_once_with("session-under-test", "agent_close")
     session_db.close.assert_called_once_with()
+
+
+def test_owned_session_db_retries_failed_end_without_reclosing():
+    session_db = MagicMock()
+    session_db.end_session.side_effect = [RuntimeError("transient"), None]
+    agent = _make_agent(session_db, owns_session_db=True)
+
+    agent.close()
+    assert agent._session_end_called is False
+    assert agent._session_db_closed is True
+
+    agent.close()
+
+    assert session_db.end_session.call_count == 2
+    session_db.close.assert_called_once_with()
+    assert agent._session_end_called is True
+
+
+def test_owned_session_db_retries_failed_close():
+    session_db = MagicMock()
+    session_db.close.side_effect = [RuntimeError("transient"), None]
+    agent = _make_agent(session_db, owns_session_db=True)
+
+    agent.close()
+    assert agent._session_db_closed is False
+
+    agent.close()
+
+    session_db.end_session.assert_called_once_with("session-under-test", "agent_close")
+    assert session_db.close.call_count == 2
+    assert agent._session_db_closed is True

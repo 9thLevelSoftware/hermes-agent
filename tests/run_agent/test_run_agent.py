@@ -55,6 +55,29 @@ def test_is_destructive_command_treats_install_as_mutating():
     assert run_agent._is_destructive_command("install template.env .env") is True
 
 
+def test_session_db_ownership_parameter_preserves_parent_session_positional_order():
+    from agent.agent_init import init_agent
+
+    agent_parameters = list(inspect.signature(AIAgent.__init__).parameters)
+    init_parameters = list(inspect.signature(init_agent).parameters)
+
+    assert agent_parameters.index("owns_session_db") > agent_parameters.index("parent_session_id")
+    assert init_parameters.index("owns_session_db") > init_parameters.index("parent_session_id")
+
+
+def test_lazy_recall_marks_new_session_db_as_owned():
+    agent = object.__new__(AIAgent)
+    agent._session_db = None
+    agent._owns_session_db = False
+    agent._persist_disabled = False
+    session_db = MagicMock()
+
+    with patch("hermes_state.SessionDB", return_value=session_db):
+        assert agent._get_session_db_for_recall() is session_db
+
+    assert agent._owns_session_db is True
+
+
 def test_run_conversation_dict_returns_include_final_response():
     """Structurally enforce final_response on dict returns from run_conversation().
 

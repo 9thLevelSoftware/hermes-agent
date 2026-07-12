@@ -321,7 +321,6 @@ def init_agent(
     load_soul_identity: bool = False,
     skip_memory: bool = False,
     session_db=None,
-    owns_session_db: bool = False,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
     fallback_model: Dict[str, Any] = None,
@@ -332,6 +331,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     suppress_status_output: bool = False,
+    owns_session_db: bool = False,
 ):
     """
     Initialize the AI Agent.
