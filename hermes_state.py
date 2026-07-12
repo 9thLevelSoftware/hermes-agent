@@ -809,6 +809,33 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_operations (
+    operation_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    turn_id TEXT NOT NULL DEFAULT '',
+    tool_call_id TEXT NOT NULL DEFAULT '',
+    destination TEXT NOT NULL DEFAULT '',
+    payload_hash TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL CHECK (state IN (
+        'pending', 'running', 'dispatched', 'confirmed',
+        'failed', 'unknown', 'cancelled'
+    )),
+    effect_disposition TEXT NOT NULL CHECK (
+        effect_disposition IN ('none', 'landed', 'unknown')
+    ),
+    result_json TEXT,
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    acknowledged_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_operations_kind_state_updated
+    ON agent_operations(kind, state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_agent_operations_session_updated
+    ON agent_operations(session_id, updated_at);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
