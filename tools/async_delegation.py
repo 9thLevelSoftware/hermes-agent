@@ -125,7 +125,10 @@ def _load_records_locked() -> None:
         payload = {}
     recovered = False
     now = time.time()
-    for record in payload.get("records", []):
+    records = payload.get("records", [])
+    if not isinstance(records, list):
+        records = []
+    for record in records:
         if not isinstance(record, dict):
             continue
         delegation_id = str(record.get("delegation_id") or "")

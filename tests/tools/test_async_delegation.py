@@ -126,6 +126,17 @@ def test_running_record_recovers_as_interrupted_after_restart(tmp_path, monkeypa
     assert "restart" in recovered[0]["error"].lower()
 
 
+def test_malformed_records_collection_loads_as_empty(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    records_path.write_text('{"records": null}', encoding="utf-8")
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    with ad._records_lock:
+        ad._records.clear()
+        ad._records_loaded_home = None
+
+    assert ad.list_async_delegations() == []
+
+
 def test_persistence_failure_rejects_background_dispatch(monkeypatch):
     called = False
 
