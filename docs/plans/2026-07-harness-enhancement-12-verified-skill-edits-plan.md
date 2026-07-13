@@ -128,7 +128,7 @@ def test_skill_verifier_origin_cannot_write_skills():
     assert result["status"] == "error"
 ```
 
-- [ ] Step 2: Add `skills.verify_background_writes` default enabled for staging but `auto_apply_pass=false`; preserve `write_approval` user policy precedence.
+- [ ] Step 2: Add `skills.verify_background_writes` default `false` for the initial rollout so existing installations do not change behavior; when explicitly enabled it stages background writes even if `skills.write_approval=false`, while `auto_apply_pass=false` remains the safe default. Define a later rollout gate that can flip the staging default only after pass/fail/unverifiable metrics exist.
 
 - [ ] Step 3: Extend pending records with source session/parent pointer, origin, skill path/base digest, verification state, claim token/lease, and idempotent apply/verdict ids. Keep old records readable with `verification.status=not_required`.
 
@@ -343,6 +343,7 @@ git commit -m "docs(skills): document verified autonomous edits"
 - [ ] Curator snapshots/rollback protect live skill state.
 - [ ] CLI/gateway review shows machine verdict evidence and correct staged status.
 - [ ] Metrics provide origin/tier/status accept-rate without raw sensitive data.
+- [ ] Initial default keeps verification opt-in; any future default-on rollout is tied to observed verifier metrics and an explicit migration/config change.
 
 ## Deliberate Simplifications
 
