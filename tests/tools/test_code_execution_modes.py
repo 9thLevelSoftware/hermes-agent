@@ -19,6 +19,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -303,10 +304,19 @@ class TestExecuteCodeModeIntegration(unittest.TestCase):
 
     def _run(self, code, mode, enabled_tools=None, extra_env=None):
         env_overrides = extra_env or {}
+        execution_manager = SimpleNamespace(_middleware={"tool_execution": [object()]})
         with _mock_mode(mode):
             with patch.dict(os.environ, env_overrides):
-                with patch("model_tools.handle_function_call",
-                           side_effect=_mock_handle_function_call):
+                with (
+                    patch(
+                        "hermes_cli.plugins.get_plugin_manager",
+                        return_value=execution_manager,
+                    ),
+                    patch(
+                        "model_tools.handle_function_call",
+                        side_effect=_mock_handle_function_call,
+                    ),
+                ):
                     raw = execute_code(
                         code=code,
                         task_id=f"test-{mode}",

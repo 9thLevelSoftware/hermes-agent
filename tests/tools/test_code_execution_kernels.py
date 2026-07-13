@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import psutil
@@ -90,9 +91,16 @@ def test_config_persistent_default_is_opt_in_without_overriding_explicit_false(t
 
 
 def test_persistent_kernel_reuses_existing_tool_rpc_channel():
-    with patch(
-        "model_tools.handle_function_call",
-        return_value=json.dumps({"output": "rpc-ok", "exit_code": 0}),
+    execution_manager = SimpleNamespace(_middleware={"tool_execution": [object()]})
+    with (
+        patch(
+            "hermes_cli.plugins.get_plugin_manager",
+            return_value=execution_manager,
+        ),
+        patch(
+            "model_tools.handle_function_call",
+            return_value=json.dumps({"output": "rpc-ok", "exit_code": 0}),
+        ),
     ):
         result = _run(
             "from hermes_tools import terminal\nprint(terminal('echo rpc'))",
