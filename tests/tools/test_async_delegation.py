@@ -91,6 +91,65 @@ def test_async_executor_workers_are_daemon_threads():
     assert _drain_one() is not None
 
 
+def test_running_record_recovers_as_interrupted_after_restart(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    with ad._records_lock:
+        ad._records_loaded_home = None
+        ad._records["deleg_restart"] = {
+            "delegation_id": "deleg_restart",
+            "goal": "finish the migration",
+            "context": "continue from the saved child transcript",
+            "toolsets": ["file"],
+            "role": "leaf",
+            "model": "m",
+            "session_key": "session",
+            "parent_session_id": "parent",
+            "child_session_ids": ["child-session-1"],
+            "status": "running",
+            "dispatched_at": time.time() - 30,
+            "completed_at": None,
+            "interrupt_fn": None,
+        }
+        ad._persist_records_locked()
+        ad._records.clear()
+        ad._records_loaded_home = None
+
+    recovered = ad.list_async_delegations()
+
+    assert len(recovered) == 1
+    assert recovered[0]["delegation_id"] == "deleg_restart"
+    assert recovered[0]["status"] == "interrupted"
+    assert recovered[0]["goal"] == "finish the migration"
+    assert recovered[0]["context"] == "continue from the saved child transcript"
+    assert recovered[0]["child_session_ids"] == ["child-session-1"]
+    assert "restart" in recovered[0]["error"].lower()
+
+
+def test_persistence_failure_rejects_background_dispatch(monkeypatch):
+    called = False
+
+    def runner():
+        nonlocal called
+        called = True
+        return {"status": "completed"}
+
+    monkeypatch.setattr(ad, "_persist_records_locked", lambda: False)
+    result = ad.dispatch_async_delegation(
+        goal="must be durable",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+    )
+
+    assert result["status"] == "rejected"
+    assert "persist" in result["error"].lower()
+    assert called is False
+
+
 def test_completion_event_lands_on_shared_queue_with_session_key():
     def runner():
         return {"status": "completed", "summary": "the result",
@@ -243,6 +302,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
+    fake_child.session_id = "child-session-1"
 
     gate = threading.Event()
 
@@ -277,6 +337,11 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     # blocked on the closed gate, so no completion event exists yet.
     assert process_registry.completion_queue.empty()
     assert ad.active_count() == 1  # one background batch unit, not finished
+    record = next(
+        item for item in ad.list_async_delegations()
+        if item["delegation_id"] == parsed["delegation_id"]
+    )
+    assert record["child_session_ids"] == ["child-session-1"]
 
     gate.set()
     evt = _drain_one()
@@ -284,6 +349,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert evt["type"] == "async_delegation"
     # Single task rides the batch path → carries a 1-item results list.
     assert evt.get("is_batch") is True
+    assert evt["child_session_ids"] == ["child-session-1"]
     assert len(evt["results"]) == 1
     assert evt["results"][0]["summary"] == "done: the real task"
     text = format_process_notification(evt)
@@ -525,6 +591,7 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
+    fake_child.session_id = "child-session-1"
 
     gate = threading.Event()
 

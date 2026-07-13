@@ -287,9 +287,13 @@ class CLICommandsMixin:
             _cprint(f"  Background delegations: {len(running_d)} running")
             for d in delegations:
                 goal = (d.get("goal") or "")[:60]
+                resume_ids = d.get("child_session_ids") or []
+                resume_hint = ""
+                if d.get("status") == "interrupted" and resume_ids:
+                    resume_hint = f" · /resume {resume_ids[0]}"
                 _cprint(
                     f"    {d.get('delegation_id', '?')} · "
-                    f"{d.get('status', '?')} · {goal}"
+                    f"{d.get('status', '?')} · {goal}{resume_hint}"
                 )
 
         agent_running = getattr(self, "_agent_running", False)
