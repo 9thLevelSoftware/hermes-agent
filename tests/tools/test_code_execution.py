@@ -505,6 +505,90 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("def read_file(path: str, offset: int = 1)", src)
         compile(src, "hermes_tools.py", "exec")
 
+    def test_arbitrary_unicode_names_compile_and_preserve_registered_names(self):
+        registered_name = "tool_²"
+        parameter_name = "value²"
+        definitions = [
+            {
+                "type": "function",
+                "function": {
+                    "name": registered_name,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "typed_tool",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {parameter_name: {"type": "string"}},
+                        "required": [parameter_name],
+                    },
+                },
+            },
+        ]
+        src = generate_hermes_tools_module(definitions)
+        compile(src, "hermes_tools.py", "exec")
+        self.assertIn(f"_call({registered_name!r}", src)
+        self.assertIn(f"{parameter_name!r}", src)
+
+    def test_registry_wrapper_names_cannot_overwrite_catalog_helpers(self):
+        registered_name = "call_tool"
+        definition = {
+            "type": "function",
+            "function": {
+                "name": registered_name,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+            },
+        }
+        src = generate_hermes_tools_module([definition])
+        namespace = {}
+        exec(compile(src, "hermes_tools.py", "exec"), namespace)
+        calls = []
+        namespace["_call"] = lambda name, args: calls.append((name, args)) or {"ok": True}
+
+        self.assertIn("call_tool_2", namespace)
+        self.assertEqual(namespace["call_tool"]("catalog", {"x": 1}), {"ok": True})
+        self.assertEqual(namespace["call_tool_2"]("registered"), {"ok": True})
+        self.assertEqual(calls, [
+            ("__code_mode_catalog__", {
+                "action": "tool_call",
+                "arguments": {"name": "catalog", "arguments": {"x": 1}},
+            }),
+            (registered_name, {"value": "registered"}),
+        ])
+
+    def test_explicit_free_form_additional_properties_use_kwargs(self):
+        for name, additional_properties in (
+            ("free_form_true", True),
+            ("free_form_schema", {"type": "string"}),
+        ):
+            definition = {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"known": {"type": "string"}},
+                        "required": ["known"],
+                        "additionalProperties": additional_properties,
+                    },
+                },
+            }
+            src = generate_hermes_tools_module([definition])
+            self.assertIn(f"def {name}(**kwargs)", src)
+            self.assertIn("Sanitized schema:", src)
+            compile(src, "hermes_tools.py", "exec")
+
     def test_exotic_schema_uses_kwargs_and_sanitized_schema_docstring(self):
         definitions = [{
             "type": "function",

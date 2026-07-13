@@ -890,7 +890,7 @@ def _sanitize_registry_definitions(definitions: List[dict]) -> List[dict]:
 def _safe_python_identifier(name: str, used: set[str]) -> tuple[str, bool]:
     """Return a deterministic Python identifier and whether the original is valid."""
     original_valid = name.isidentifier() and not keyword.iskeyword(name)
-    candidate = re.sub(r"\W", "_", name, flags=re.UNICODE) or "tool"
+    candidate = re.sub(r"\W", "_", name, flags=re.ASCII) or "tool"
     if candidate[0].isdigit():
         candidate = "tool_" + candidate
     if keyword.iskeyword(candidate):
@@ -952,6 +952,8 @@ def _schema_is_unsupported(schema: Any) -> bool:
     if schema_type == "object":
         properties = schema.get("properties")
         if not isinstance(properties, dict):
+            return True
+        if "additionalProperties" in schema and schema["additionalProperties"] is not False:
             return True
         if not properties and schema.get("additionalProperties") is not False:
             return True
@@ -1069,7 +1071,9 @@ def generate_hermes_tools_module(
             if str((item.get("function") or {}).get("name", ""))
             not in SCRIPT_DENIED_TOOLS | SCRIPT_INTERNAL_TOOLS
         ]
-        used_names: set[str] = set()
+        used_names: set[str] = {
+            "search_tools", "describe_tool", "call_tool", "save_artifact",
+        }
         stub_functions = [
             _render_registry_wrapper(item, used_names) for item in definitions
         ]
