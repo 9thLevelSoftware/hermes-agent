@@ -285,15 +285,15 @@ class CLICommandsMixin:
         running_d = [d for d in delegations if d.get("status") == "running"]
         if delegations:
             _cprint(f"  Background delegations: {len(running_d)} running")
-            session_db = getattr(self, "_session_db", None)
-            if session_db is None:
+            session_db = self._session_db
+            if not session_db:
                 try:
                     from hermes_state import SessionDB
 
                     session_db = SessionDB()
                     self._session_db = session_db
                 except Exception:
-                    session_db = None
+                    pass
             for d in delegations:
                 goal = (d.get("goal") or "")[:60]
                 resume_ids = d.get("child_session_ids") or []
