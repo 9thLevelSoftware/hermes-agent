@@ -1571,12 +1571,15 @@ def _load_pending_locked() -> None:
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
-    for request in payload.get("requests", []):
+    requests = payload.get("requests", [])
+    if not isinstance(requests, list):
+        requests = []
+    for request in requests:
         if not isinstance(request, dict) or request.get("status") not in {"pending", "resolved"}:
             continue
         request_id = str(request.get("request_id") or "")
         session_key = str(request.get("session_key") or "")
-        if not request_id or not session_key:
+        if not request_id or not session_key or request_id in _pending:
             continue
         _pending[request_id] = request
         _pending_by_session.setdefault(session_key, []).append(request_id)
@@ -1595,7 +1598,7 @@ def _persist_pending_locked() -> None:
         "allow_permanent", "description",
     }
     records = [
-        {key: copy.deepcopy(value) for key, value in request.items() if key in safe_fields}
+        {key: value for key, value in request.items() if key in safe_fields}
         for request in _pending.values()
         if request.get("status") in {"pending", "resolved"}
     ]
@@ -2021,10 +2024,12 @@ def clear_session(session_key: str) -> None:
     if not session_key:
         return
     with _lock:
+        _prune_pending_locked()
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         for request_id in _pending_by_session.pop(session_key, []):
             _pending.pop(request_id, None)
+        _persist_pending_locked()
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
