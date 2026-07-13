@@ -1251,7 +1251,10 @@ class TestParseContract:
             "verify: the auth test suite passes\n"
             "constraints: keep the /login response shape unchanged\n"
             "boundaries: only touch services/auth and its tests\n"
-            "stop when: a schema change needs product sign-off"
+            "stop when: a schema change needs product sign-off\n"
+            "decisions: use the existing token validator\n"
+            "blockers: staging credentials are unavailable\n"
+            "next action: add the failing refresh-token test"
         )
         headline, contract = parse_contract(text)
         assert headline == "Migrate auth to JWT"
@@ -1259,6 +1262,9 @@ class TestParseContract:
         assert contract.constraints == "keep the /login response shape unchanged"
         assert contract.boundaries == "only touch services/auth and its tests"
         assert contract.stop_when == "a schema change needs product sign-off"
+        assert contract.decisions == "use the existing token validator"
+        assert contract.blockers == "staging credentials are unavailable"
+        assert contract.next_action == "add the failing refresh-token test"
         assert not contract.is_empty()
 
     def test_alias_variants(self):
@@ -1284,12 +1290,18 @@ class TestGoalContractSerialization:
             contract=GoalContract(
                 verification="pytest passes",
                 constraints="don't break the API",
+                decisions="reuse the existing serializer",
+                blockers="waiting for fixture data",
+                next_action="write the failing test",
             ),
         )
         restored = GoalState.from_json(state.to_json())
         assert restored.goal == "ship it"
         assert restored.contract.verification == "pytest passes"
         assert restored.contract.constraints == "don't break the API"
+        assert restored.contract.decisions == "reuse the existing serializer"
+        assert restored.contract.blockers == "waiting for fixture data"
+        assert restored.contract.next_action == "write the failing test"
         assert restored.has_contract()
 
     def test_old_row_without_contract_loads_clean(self):
@@ -1333,11 +1345,22 @@ class TestGoalManagerContract:
         from hermes_cli.goals import GoalManager, GoalContract
 
         mgr = GoalManager(session_id="c-cont")
-        mgr.set("ship it", contract=GoalContract(verification="run pytest"))
+        mgr.set(
+            "ship it",
+            contract=GoalContract(
+                verification="run pytest",
+                decisions="keep SQLite as the source of truth",
+                blockers="none",
+                next_action="add the persistence test",
+            ),
+        )
         prompt = mgr.next_continuation_prompt()
         assert "Completion contract" in prompt
         assert "run pytest" in prompt
         assert "concrete evidence" in prompt
+        assert "keep SQLite as the source of truth" in prompt
+        assert "none" in prompt
+        assert "add the persistence test" in prompt
 
     def test_set_contract_after_the_fact(self, hermes_home):
         from hermes_cli.goals import GoalManager, GoalContract

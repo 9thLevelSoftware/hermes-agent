@@ -220,14 +220,17 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
 # Adapted from Codex's "let Codex draft the goal" guidance.
 DRAFT_CONTRACT_SYSTEM_PROMPT = (
     "You turn a user's plain-language objective into a structured completion "
-    "contract for an autonomous coding agent. The contract has five fields:\n"
+    "contract for an autonomous coding agent. The contract has eight fields:\n"
     "- outcome: the single end state that must be true when done\n"
     "- verification: the specific test / command / artifact that PROVES the "
     "outcome (must be concrete and checkable)\n"
     "- constraints: what must NOT change or regress\n"
     "- boundaries: which files, dirs, tools, or systems are in scope\n"
     "- stop_when: the condition under which the agent should stop and ask "
-    "for human input instead of pushing on\n\n"
+    "for human input instead of pushing on\n"
+    "- decisions: durable choices already made and why\n"
+    "- blockers: unresolved facts or dependencies preventing progress\n"
+    "- next_action: the next concrete step to take\n\n"
     "Infer sensible, specific values from the objective and any project "
     "context implied by it. Prefer concrete verification (a named test "
     "command, a build, a benchmark) over vague phrases. Keep each field to "
@@ -235,7 +238,8 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
     "empty string for it.\n\n"
     "Reply ONLY with a single JSON object on one line:\n"
     '{"outcome": "...", "verification": "...", "constraints": "...", '
-    '"boundaries": "...", "stop_when": "..."}'
+    '"boundaries": "...", "stop_when": "...", "decisions": "...", '
+    '"blockers": "...", "next_action": "..."}'
 )
 
 
@@ -243,13 +247,15 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
 # Completion contract
 # ──────────────────────────────────────────────────────────────────────
 
-# The five contract fields, in display order. Adapted from OpenAI Codex's
-# "strong goal" guidance: a durable objective works best when it names what
-# "done" means, how to prove it, what must not regress, what tools/paths are
-# in bounds, and when to stop and ask. A bare free-form goal (no contract)
-# stays fully supported — every field defaults empty and is simply omitted
-# from the prompts when unset.
-_CONTRACT_FIELDS = ("outcome", "verification", "constraints", "boundaries", "stop_when")
+# The contract fields, in display order. The first five follow OpenAI Codex's
+# "strong goal" guidance: define done, proof, constraints, scope, and when to
+# stop. The final three are durable working state carried across turns and
+# compression. A bare free-form goal stays fully supported — every field
+# defaults empty and is omitted from prompts when unset.
+_CONTRACT_FIELDS = (
+    "outcome", "verification", "constraints", "boundaries", "stop_when",
+    "decisions", "blockers", "next_action",
+)
 
 # Human labels for rendering and for the inline `field: value` parser.
 _CONTRACT_LABELS = {
@@ -258,6 +264,9 @@ _CONTRACT_LABELS = {
     "constraints": "Constraints",
     "boundaries": "Boundaries",
     "stop_when": "Stop when blocked",
+    "decisions": "Decisions",
+    "blockers": "Blockers",
+    "next_action": "Next action",
 }
 
 # Inline-input aliases the user may type before a value, mapped to the
@@ -287,6 +296,15 @@ _CONTRACT_ALIASES = {
     "blocked": "stop_when",
     "stop if blocked": "stop_when",
     "give up when": "stop_when",
+    "decision": "decisions",
+    "decisions": "decisions",
+    "decided": "decisions",
+    "blocker": "blockers",
+    "blockers": "blockers",
+    "blocked by": "blockers",
+    "next": "next_action",
+    "next action": "next_action",
+    "next step": "next_action",
 }
 
 
@@ -307,6 +325,9 @@ class GoalContract:
     constraints: str = ""
     boundaries: str = ""
     stop_when: str = ""
+    decisions: str = ""
+    blockers: str = ""
+    next_action: str = ""
 
     def is_empty(self) -> bool:
         return not any(getattr(self, f).strip() for f in _CONTRACT_FIELDS)
