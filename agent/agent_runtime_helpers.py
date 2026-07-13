@@ -2246,6 +2246,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
         return result
 
+    registry_passthrough = False
     if function_name == "todo":
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool
@@ -2333,6 +2334,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
     else:
+        registry_passthrough = True
+
         def _execute(next_args: dict) -> Any:
             return _ra().handle_function_call(
                 function_name, next_args, effective_task_id,
@@ -2347,6 +2350,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
+
+    if registry_passthrough:
+        # handle_function_call owns the registry tool's execution middleware;
+        # wrapping it here would emit the same operation key twice.
+        return _execute(function_args)
 
     from hermes_cli.middleware import run_tool_execution_middleware
     from model_tools import registry
