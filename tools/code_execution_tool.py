@@ -295,6 +295,7 @@ def _dispatch_script_call(
             dispatch_kwargs["enabled_toolsets"] = list(context.enabled_toolsets)
         if context.disabled_toolsets:
             dispatch_kwargs["disabled_toolsets"] = list(context.disabled_toolsets)
+        dispatch_kwargs["operation_metadata"] = _operation_metadata_for(tool_name)
         raw_result = _call_handle_function_call(
             handle_function_call, tool_name, arguments, dispatch_kwargs,
         )

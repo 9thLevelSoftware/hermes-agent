@@ -17,8 +17,12 @@ import pytest
 
 import json
 import os
+import shutil
 import socket
+import subprocess
+import tempfile
 import time
+import uuid
 
 os.environ["TERMINAL_ENV"] = "local"
 
@@ -70,6 +74,285 @@ def _mock_handle_function_call(function_name, function_args, task_id=None, user_
     if function_name == "web_extract":
         return json.dumps("# Extracted content\nSome text from the page.")
     return json.dumps({"error": f"Unknown tool in mock: {function_name}"})
+
+
+def _fixture_definition(name):
+    return {
+        "name": name,
+        "description": f"Code-mode fixture {name}.",
+        "parameters": {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+        },
+    }
+
+
+def _dispatch_script(code, context, definitions):
+    """Run generated code against the production local RPC server."""
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    tmpdir = tempfile.mkdtemp(prefix="hermes_code_mode_test_")
+    sock_path = os.path.join("/tmp", f"hermes_code_mode_{uuid.uuid4().hex}.sock")
+    server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server_sock.bind(sock_path)
+    server_sock.listen(1)
+    token = uuid.uuid4().hex
+    stop_event = threading.Event()
+    call_log = []
+    call_counter = [0]
+    tool_names = {
+        str((item.get("function") or item).get("name")) for item in definitions
+    }
+    rpc_thread = threading.Thread(
+        target=code_execution_tool._rpc_server_loop,
+        args=(
+            server_sock, context.task_id, call_log, call_counter, 20,
+            frozenset(tool_names), stop_event, token, context,
+        ),
+        daemon=True,
+    )
+    try:
+        with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as handle:
+            handle.write(generate_hermes_tools_module(definitions, context=context))
+        with open(os.path.join(tmpdir, "script.py"), "w", encoding="utf-8") as handle:
+            handle.write(code)
+        rpc_thread.start()
+        env = dict(os.environ)
+        env.update({
+            "HERMES_RPC_SOCKET": sock_path,
+            "HERMES_RPC_TOKEN": token,
+            "PYTHONPATH": os.pathsep.join((tmpdir, repo_root)),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONIOENCODING": "utf-8",
+        })
+        completed = subprocess.run(
+            [sys.executable, os.path.join(tmpdir, "script.py")],
+            cwd=tmpdir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        output_lines = [line for line in completed.stdout.splitlines() if line.strip()]
+        assert output_lines, completed.stderr
+        return json.loads(output_lines[-1])
+    finally:
+        stop_event.set()
+        try:
+            server_sock.close()
+        except OSError:
+            pass
+        rpc_thread.join(timeout=5)
+        try:
+            os.unlink(sock_path)
+        except OSError:
+            pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="local UDS RPC is POSIX-only")
+class TestCodeModeDispatchIntegration:
+    """Exercise the production RPC and dispatcher seams with real registry tools."""
+
+    def test_scripted_calls_keep_middleware_context_metadata_and_approval(self, monkeypatch):
+        import model_tools
+        from types import SimpleNamespace
+        from tools.registry import registry
+
+        read_name = "code_mode_read_fixture"
+        write_name = "code_mode_write_fixture"
+        definitions = [_fixture_definition(read_name), _fixture_definition(write_name)]
+        seen = {"dispatch": [], "request": [], "execution": [], "hooks": [], "handlers": []}
+
+        def read_handler(args, **kwargs):
+            seen["handlers"].append((read_name, dict(args), dict(kwargs)))
+            return json.dumps({"tool": read_name, "args": args})
+
+        def write_handler(args, **kwargs):
+            seen["handlers"].append((write_name, dict(args), dict(kwargs)))
+            return json.dumps({"tool": write_name, "args": args})
+
+        registry.register(read_name, "mcp-code-mode-fixture", definitions[0], read_handler,
+                          read_only=True, destructive=False, idempotent=True)
+        registry.register(write_name, "mcp-code-mode-fixture", definitions[1], write_handler,
+                          read_only=False, destructive=True, idempotent=False)
+        try:
+            def request_middleware(kind, **kwargs):
+                assert kind == "tool_request"
+                seen["request"].append(dict(kwargs))
+                return [{"args": {**kwargs["args"], "request_rewritten": True}}]
+
+            def execution_middleware(**kwargs):
+                seen["execution"].append(dict(kwargs))
+                if kwargs["operation_metadata"]["destructive"]:
+                    return json.dumps({
+                        "status": "approval_required",
+                        "blocked": True,
+                        "tool_name": kwargs["tool_name"],
+                    })
+                return kwargs["next_call"]({**kwargs["args"], "execution_rewritten": True})
+
+            manager = SimpleNamespace(_middleware={"tool_execution": [execution_middleware]})
+            monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+            monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", request_middleware)
+            monkeypatch.setattr("hermes_cli.plugins.has_middleware", lambda kind: kind == "tool_request")
+            monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: True)
+            monkeypatch.setattr(
+                "hermes_cli.plugins.invoke_hook",
+                lambda hook_name, **kwargs: seen["hooks"].append((hook_name, kwargs)) or [],
+            )
+
+            real_handle = model_tools.handle_function_call
+
+            def recording_dispatch(function_name, function_args, **kwargs):
+                seen["dispatch"].append((function_name, dict(function_args), dict(kwargs)))
+                return real_handle(function_name, function_args, **kwargs)
+
+            monkeypatch.setattr(model_tools, "handle_function_call", recording_dispatch)
+            context = CodeExecutionContext(
+                "code-task", "code-session", ("mcp-code-mode-fixture",), ("blocked",)
+            )
+            result = _dispatch_script(
+                """
+import json
+from hermes_tools import code_mode_read_fixture, code_mode_write_fixture
+print(json.dumps([
+    code_mode_read_fixture(value='read'),
+    code_mode_write_fixture(value='write'),
+]))
+""",
+                context,
+                definitions,
+            )
+
+            assert result[0]["tool"] == read_name
+            assert result[0]["args"] == {
+                "value": "read",
+                "request_rewritten": True,
+                "execution_rewritten": True,
+            }
+            assert result[1]["status"] == "approval_required"
+            assert [item[0] for item in seen["dispatch"]] == [read_name, write_name]
+            assert all(item[2]["task_id"] == context.task_id for item in seen["dispatch"])
+            assert all(item[2]["session_id"] == context.session_id for item in seen["dispatch"])
+            assert all(item[2]["enabled_toolsets"] == list(context.enabled_toolsets)
+                       for item in seen["dispatch"])
+            assert all(item[2]["disabled_toolsets"] == list(context.disabled_toolsets)
+                       for item in seen["dispatch"])
+            assert seen["dispatch"][0][2]["operation_metadata"] == {
+                "read_only": True, "destructive": False, "idempotent": True,
+            }
+            assert seen["dispatch"][1][2]["operation_metadata"] == {
+                "read_only": False, "destructive": True, "idempotent": False,
+            }
+            assert len(seen["request"]) == 2
+            assert len(seen["execution"]) == 2
+            assert seen["handlers"] == [
+                (read_name, result[0]["args"], {
+                    "task_id": context.task_id,
+                    "session_id": context.session_id,
+                    "user_task": None,
+                }),
+            ]
+            assert {name for name, _kwargs in seen["hooks"]} >= {
+                "pre_tool_call", "post_tool_call", "transform_tool_result",
+            }
+            assert seen["execution"][0]["operation_key"] == registry.operation_key(
+                read_name,
+                {"value": "read", "request_rewritten": True},
+                task_id=context.task_id,
+                tool_call_id="",
+            )
+        finally:
+            registry.deregister(read_name)
+            registry.deregister(write_name)
+
+    def test_catalog_bridge_scopes_tool_call_before_handler(self, monkeypatch):
+        import model_tools
+        from tools.registry import registry
+
+        safe_name = "code_mode_catalog_safe"
+        unsafe_name = "code_mode_catalog_unsafe"
+        definitions = [_fixture_definition(safe_name), _fixture_definition(unsafe_name)]
+        called = []
+        middleware_seen = {"request": [], "execution": []}
+
+        def handler(args, **kwargs):
+            called.append((dict(args), dict(kwargs)))
+            return json.dumps({"ok": True, "args": args})
+
+        registry.register(safe_name, "mcp-code-mode-catalog-safe", definitions[0], handler,
+                          read_only=True, destructive=False, idempotent=True)
+        registry.register(unsafe_name, "mcp-code-mode-catalog-unsafe", definitions[1], handler,
+                          read_only=True, destructive=False, idempotent=True)
+        try:
+            context = CodeExecutionContext(
+                "catalog-task", "catalog-session",
+                ("mcp-code-mode-catalog-safe", "mcp-code-mode-catalog-unsafe"),
+                ("mcp-code-mode-catalog-unsafe",),
+            )
+            for raw_name in ("tool_search", "tool_describe", "tool_call"):
+                denied = _dispatch_script_call(raw_name, {}, context)
+                assert "not available" in str(denied.get("error"))
+            unknown = _dispatch_script_call("code_mode_catalog_unknown", {}, context)
+            assert "Unknown scripted tool" in str(unknown.get("error"))
+            out_of_scope = _dispatch_script_call(unsafe_name, {"value": "raw"}, context)
+            assert "not available in this session" in str(out_of_scope.get("error"))
+
+            real_handle = model_tools.handle_function_call
+            from types import SimpleNamespace
+
+            def request_middleware(kind, **kwargs):
+                if kind == "tool_request":
+                    middleware_seen["request"].append(dict(kwargs))
+                return []
+
+            def execution_middleware(**kwargs):
+                middleware_seen["execution"].append(dict(kwargs))
+                return kwargs["next_call"](kwargs["args"])
+
+            monkeypatch.setattr(
+                "hermes_cli.plugins.get_plugin_manager",
+                lambda: SimpleNamespace(_middleware={"tool_execution": [execution_middleware]}),
+            )
+            monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", request_middleware)
+            monkeypatch.setattr("hermes_cli.plugins.has_middleware", lambda kind: kind == "tool_request")
+            monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: False)
+            dispatch_seen = []
+
+            def recording_dispatch(function_name, function_args, **kwargs):
+                dispatch_seen.append((function_name, dict(function_args), dict(kwargs)))
+                return real_handle(function_name, function_args, **kwargs)
+
+            monkeypatch.setattr(model_tools, "handle_function_call", recording_dispatch)
+            result = _dispatch_script(
+                """
+import json
+from hermes_tools import call_tool
+print(json.dumps([
+    call_tool('code_mode_catalog_safe', {'value': 'safe'}),
+    call_tool('code_mode_catalog_unsafe', {'value': 'unsafe'}),
+]))
+""",
+                context,
+                definitions,
+            )
+            assert result[0]["ok"] is True
+            assert "error" in result[1]
+            assert "not available in this session" in result[1]["error"]
+            assert len(called) == 1
+            assert called[0][0] == {"value": "safe"}
+            assert [item[0] for item in dispatch_seen] == ["tool_call", safe_name, "tool_call"]
+            assert [item["tool_name"] for item in middleware_seen["request"]] == [safe_name]
+            assert [item["tool_name"] for item in middleware_seen["execution"]] == [safe_name]
+            assert middleware_seen["execution"][0]["operation_metadata"] == {
+                "read_only": True, "destructive": False, "idempotent": True,
+            }
+        finally:
+            registry.deregister(safe_name)
+            registry.deregister(unsafe_name)
 
 
 class TestSandboxRequirements(unittest.TestCase):
