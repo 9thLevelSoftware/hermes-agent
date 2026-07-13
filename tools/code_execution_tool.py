@@ -43,9 +43,10 @@ import tempfile
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 
 _IS_WINDOWS = platform.system() == "Windows"
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from tools.thread_context import propagate_context_to_thread
 
@@ -68,6 +69,177 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
     "patch",
     "terminal",
 ])
+
+
+@dataclass(frozen=True)
+class CodeExecutionContext:
+    """Immutable parent-session context carried over script RPC calls."""
+
+    task_id: str | None
+    session_id: str | None
+    enabled_toolsets: tuple[str, ...]
+    disabled_toolsets: tuple[str, ...]
+
+
+# Keep policy names centralized so every RPC transport applies the same
+# recursion, interaction, memory, and lifecycle boundary.
+SCRIPT_RECURSION_TOOLS = frozenset({
+    "execute_code", "delegate_task", "tool_search", "tool_describe", "tool_call",
+})
+SCRIPT_INTERACTIVE_TOOLS = frozenset({"clarify"})
+SCRIPT_MEMORY_TOOLS = frozenset({"memory"})
+SCRIPT_LIFECYCLE_TOOLS = frozenset({
+    "process", "read_terminal", "close_terminal", "todo", "cronjob",
+    "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
+    "kanban_heartbeat", "kanban_comment", "kanban_create", "kanban_link",
+    "kanban_unblock",
+})
+SCRIPT_DENIED_TOOLS = frozenset().union(
+    SCRIPT_RECURSION_TOOLS,
+    SCRIPT_INTERACTIVE_TOOLS,
+    SCRIPT_MEMORY_TOOLS,
+    SCRIPT_LIFECYCLE_TOOLS,
+)
+
+_DEFAULT_OPERATION_METADATA = {
+    "read_only": False,
+    "destructive": True,
+    "idempotent": False,
+}
+
+
+def _operation_metadata_for(
+    tool_name: str,
+    operation_metadata: Optional[Dict[str, Dict[str, bool]]] = None,
+) -> Dict[str, bool]:
+    """Resolve operation metadata without weakening conservative defaults."""
+    try:
+        from tools.registry import registry
+        resolved = dict(registry.get_operation_metadata(tool_name))
+    except Exception:
+        resolved = {}
+    resolved = {**_DEFAULT_OPERATION_METADATA, **resolved}
+    if operation_metadata and tool_name in operation_metadata:
+        resolved.update(operation_metadata[tool_name] or {})
+    return resolved
+
+
+def _scriptable_tool_names(
+    session_tools: set[str],
+    operation_metadata: Dict[str, Dict[str, bool]],
+) -> set[str]:
+    """Return deterministic session tools minus the script denylist."""
+    names = {str(name) for name in session_tools}
+    # Resolve metadata for every candidate here so callers can build one
+    # registry-backed snapshot before generation/dispatch.
+    for name in sorted(names):
+        _operation_metadata_for(name, operation_metadata)
+    return names - SCRIPT_DENIED_TOOLS
+
+
+def _script_operation_decision(
+    tool_name: str,
+    metadata: Optional[Dict[str, bool]],
+) -> Literal["allow", "approval_required", "deny"]:
+    """Classify a scripted operation before it reaches the normal dispatcher."""
+    if tool_name in SCRIPT_DENIED_TOOLS:
+        return "deny"
+    resolved = {**_DEFAULT_OPERATION_METADATA, **(metadata or {})}
+    if bool(resolved.get("read_only")) and not bool(resolved.get("destructive")):
+        return "allow"
+    return "approval_required"
+
+
+def _context_payload(context: Optional[CodeExecutionContext]) -> Dict[str, object]:
+    context = context or CodeExecutionContext(None, None, (), ())
+    return {
+        "task_id": context.task_id,
+        "session_id": context.session_id,
+        "enabled_toolsets": list(context.enabled_toolsets),
+        "disabled_toolsets": list(context.disabled_toolsets),
+    }
+
+
+def _context_from_rpc_request(
+    request: Dict[str, Any], fallback: CodeExecutionContext,
+) -> CodeExecutionContext:
+    """Normalize a request's context, falling back to the parent RPC context."""
+    payload = request.get("context")
+    if not isinstance(payload, dict):
+        payload = request
+
+    def _tuple_value(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+        value = payload.get(key)
+        if value is None:
+            return default
+        if isinstance(value, (list, tuple)):
+            return tuple(str(item) for item in value)
+        return default
+
+    return CodeExecutionContext(
+        task_id=payload.get("task_id", fallback.task_id),
+        session_id=payload.get("session_id", fallback.session_id),
+        enabled_toolsets=_tuple_value("enabled_toolsets", fallback.enabled_toolsets),
+        disabled_toolsets=_tuple_value("disabled_toolsets", fallback.disabled_toolsets),
+    )
+
+
+def _dispatch_script_call(
+    tool_name: str,
+    arguments: Dict[str, object],
+    context: CodeExecutionContext,
+) -> dict[str, object]:
+    """Dispatch one in-scope scripted call through the standard tool path."""
+    if not isinstance(arguments, dict):
+        return {"error": "Script tool arguments must be an object."}
+
+    decision = _script_operation_decision(
+        tool_name, _operation_metadata_for(tool_name),
+    )
+    if decision == "deny":
+        return {"error": f"Tool '{tool_name}' is not available to execute_code scripts."}
+
+    try:
+        from tools.registry import registry
+        if registry.get_entry(tool_name) is None:
+            return {"error": f"Unknown scripted tool: {tool_name}"}
+
+        # Reuse the active model-facing scope when the parent supplied one;
+        # the empty tuple preserves the legacy unrestricted RPC behavior.
+        if context.enabled_toolsets or context.disabled_toolsets:
+            from model_tools import get_tool_definitions
+            from tools.tool_search import scoped_tool_names
+            definitions = get_tool_definitions(
+                enabled_toolsets=list(context.enabled_toolsets) or None,
+                disabled_toolsets=list(context.disabled_toolsets) or None,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            if tool_name not in scoped_tool_names(definitions):
+                return {"error": f"Tool '{tool_name}' is not available in this session."}
+
+        from model_tools import handle_function_call
+        dispatch_kwargs: Dict[str, Any] = {"task_id": context.task_id}
+        if context.session_id is not None:
+            dispatch_kwargs["session_id"] = context.session_id
+        if context.enabled_toolsets:
+            dispatch_kwargs["enabled_toolsets"] = list(context.enabled_toolsets)
+        if context.disabled_toolsets:
+            dispatch_kwargs["disabled_toolsets"] = list(context.disabled_toolsets)
+        raw_result = handle_function_call(tool_name, dict(arguments), **dispatch_kwargs)
+    except Exception as exc:
+        logger.error("Scripted tool call failed: %s", exc, exc_info=True)
+        return {"error": str(exc)}
+
+    if isinstance(raw_result, dict):
+        return raw_result
+    if isinstance(raw_result, str):
+        try:
+            parsed = json.loads(raw_result)
+        except (TypeError, json.JSONDecodeError):
+            return {"result": raw_result}
+        return parsed if isinstance(parsed, dict) else {"result": parsed}
+    return {"result": raw_result}
 
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
@@ -270,8 +442,12 @@ _TOOL_STUBS = {
 }
 
 
-def generate_hermes_tools_module(enabled_tools: List[str],
-                                 transport: str = "uds") -> str:
+def generate_hermes_tools_module(
+    enabled_tools: List[str],
+    transport: str = "uds",
+    *,
+    context: Optional[CodeExecutionContext] = None,
+) -> str:
     """
     Build the source code for the hermes_tools.py stub module.
 
@@ -302,7 +478,12 @@ def generate_hermes_tools_module(enabled_tools: List[str],
     else:
         header = _UDS_TRANSPORT_HEADER
 
-    return header + "\n".join(stub_functions)
+    context_source = (
+        "\n_HERMES_RPC_CONTEXT = "
+        + repr(_context_payload(context))
+        + "\n"
+    )
+    return header + context_source + "\n".join(stub_functions)
 
 
 # ---- Shared helpers section (embedded in both transport headers) ----------
@@ -390,6 +571,10 @@ def _call(tool_name, args):
         "tool": tool_name,
         "args": args,
         "token": os.environ.get("HERMES_RPC_TOKEN", ""),
+        "task_id": _HERMES_RPC_CONTEXT["task_id"],
+        "session_id": _HERMES_RPC_CONTEXT["session_id"],
+        "enabled_toolsets": _HERMES_RPC_CONTEXT["enabled_toolsets"],
+        "disabled_toolsets": _HERMES_RPC_CONTEXT["disabled_toolsets"],
     }) + "\\n"
     with _call_lock:
         conn = _connect()
@@ -448,6 +633,10 @@ def _call(tool_name, args):
             "args": args,
             "seq": seq,
             "token": os.environ.get("HERMES_RPC_TOKEN", ""),
+            "task_id": _HERMES_RPC_CONTEXT["task_id"],
+            "session_id": _HERMES_RPC_CONTEXT["session_id"],
+            "enabled_toolsets": _HERMES_RPC_CONTEXT["enabled_toolsets"],
+            "disabled_toolsets": _HERMES_RPC_CONTEXT["disabled_toolsets"],
         }, f)
     os.rename(tmp, req_file)
 
@@ -497,13 +686,13 @@ def _rpc_server_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    rpc_context: Optional[CodeExecutionContext] = None,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
     the client disconnects or the call limit is reached.
     """
-    from model_tools import handle_function_call
-
+    rpc_context = rpc_context or CodeExecutionContext(task_id, None, (), ())
     conn = None
     try:
         server_sock.settimeout(0.05)
@@ -551,6 +740,7 @@ def _rpc_server_loop(
 
                 tool_name = request.get("tool", "")
                 tool_args = request.get("args", {})
+                request_context = _context_from_rpc_request(request, rpc_context)
 
                 # Enforce the allow-list
                 if tool_name not in allowed_tools:
@@ -589,8 +779,11 @@ def _rpc_server_loop(
                     try:
                         sys.stdout = devnull
                         sys.stderr = devnull
-                        result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
+                        result = json.dumps(
+                            _dispatch_script_call(
+                                tool_name, tool_args, request_context,
+                            ),
+                            ensure_ascii=False,
                         )
                     finally:
                         sys.stdout, sys.stderr = _real_stdout, _real_stderr
@@ -774,6 +967,7 @@ def _rpc_poll_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    rpc_context: Optional[CodeExecutionContext] = None,
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -781,8 +975,7 @@ def _rpc_poll_loop(
     independent process, so these calls run safely concurrent with the
     script-execution thread.
     """
-    from model_tools import handle_function_call
-
+    rpc_context = rpc_context or CodeExecutionContext(task_id, None, (), ())
     poll_interval = 0.1  # 100 ms
 
     quoted_rpc_dir = shlex.quote(rpc_dir)
@@ -836,6 +1029,7 @@ def _rpc_poll_loop(
 
                 tool_name = request.get("tool", "")
                 tool_args = request.get("args", {})
+                request_context = _context_from_rpc_request(request, rpc_context)
                 seq = request.get("seq", 0)
                 seq_str = f"{seq:06d}"
                 res_file = f"{rpc_dir}/res_{seq_str}"
@@ -871,8 +1065,11 @@ def _rpc_poll_loop(
                         try:
                             sys.stdout = devnull
                             sys.stderr = devnull
-                            tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
+                            tool_result = json.dumps(
+                                _dispatch_script_call(
+                                    tool_name, tool_args, request_context,
+                                ),
+                                ensure_ascii=False,
                             )
                         finally:
                             sys.stdout, sys.stderr = _real_stdout, _real_stderr
@@ -918,6 +1115,7 @@ def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
+    context: Optional[CodeExecutionContext] = None,
 ) -> str:
     """Run a script on the remote terminal backend via file-based RPC.
 
@@ -929,6 +1127,7 @@ def _execute_remote(
     _cfg = _load_config()
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+    context = context or CodeExecutionContext(task_id, None, (), ())
 
     session_tools = set(enabled_tools) if enabled_tools else set()
     sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
@@ -977,7 +1176,7 @@ def _execute_remote(
 
         # Generate and ship files
         tools_src = generate_hermes_tools_module(
-            list(sandbox_tools), transport="file",
+            list(sandbox_tools), transport="file", context=context,
         )
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py", tools_src)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
@@ -990,7 +1189,7 @@ def _execute_remote(
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event, rpc_token,
+                sandbox_tools, stop_event, rpc_token, context,
             ),
             daemon=True,
         )
@@ -1120,6 +1319,10 @@ def execute_code(
     code: str,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    *,
+    session_id: Optional[str] = None,
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -1145,6 +1348,13 @@ def execute_code(
 
     if not code or not code.strip():
         return tool_error("No code provided.")
+
+    context = CodeExecutionContext(
+        task_id=task_id,
+        session_id=session_id,
+        enabled_toolsets=tuple(str(name) for name in (enabled_toolsets or ())),
+        disabled_toolsets=tuple(str(name) for name in (disabled_toolsets or ())),
+    )
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
@@ -1189,7 +1399,7 @@ def execute_code(
         clear_current_thread_interrupt()
 
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools)
+        return _execute_remote(code, task_id, enabled_tools, context)
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -1247,7 +1457,9 @@ def execute_code(
         # Python source files are decoded as UTF-8 by default (PEP 3120).
         # sandbox_tools is already the correct set (intersection with session
         # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
-        tools_src = generate_hermes_tools_module(list(sandbox_tools))
+        tools_src = generate_hermes_tools_module(
+            list(sandbox_tools), context=context,
+        )
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)
 
@@ -1283,7 +1495,8 @@ def execute_code(
             target=propagate_context_to_thread(_rpc_server_loop),
             args=(
                 server_sock, task_id, tool_call_log,
-                tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
+                tool_call_counter, max_tool_calls, sandbox_tools, stop_event,
+                rpc_token, context,
             ),
             daemon=True,
         )
@@ -1915,7 +2128,10 @@ registry.register(
     handler=lambda args, **kw: execute_code(
         code=args.get("code", ""),
         task_id=kw.get("task_id"),
-        enabled_tools=kw.get("enabled_tools")),
+        enabled_tools=kw.get("enabled_tools"),
+        session_id=kw.get("session_id"),
+        enabled_toolsets=kw.get("enabled_toolsets"),
+        disabled_toolsets=kw.get("disabled_toolsets")),
     check_fn=check_sandbox_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,

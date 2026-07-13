@@ -37,6 +37,7 @@ import threading
 import unittest
 from unittest.mock import patch, MagicMock
 
+from tools import code_execution_tool
 from tools.code_execution_tool import (
     SANDBOX_ALLOWED_TOOLS,
     execute_code,
@@ -1131,6 +1132,21 @@ class TestRpcTokenAuthorization(unittest.TestCase):
         src = generate_hermes_tools_module(["terminal"], transport="uds")
         self.assertIn("HERMES_RPC_TOKEN", src)
         self.assertIn('"token"', src)
+
+
+def test_code_mode_denies_recursive_and_interactive_tools():
+    allowed = code_execution_tool._scriptable_tool_names(
+        session_tools={"read_file", "execute_code", "delegate_task", "clarify"},
+        operation_metadata={"read_file": {"read_only": True}},
+    )
+    assert allowed == {"read_file"}
+
+
+def test_unknown_mcp_operation_is_destructive_by_default():
+    decision = code_execution_tool._script_operation_decision(
+        "mcp__server__write", {"read_only": False, "destructive": True}
+    )
+    assert decision == "approval_required"
 
 
 if __name__ == "__main__":

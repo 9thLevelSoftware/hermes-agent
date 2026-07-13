@@ -498,6 +498,23 @@ def test_env_scrub_passthrough_overrides_secret_block():
     assert out.get("MY_SERVICE_DSN") == "value"
 
 
+def test_generic_catalog_call_respects_session_scope(monkeypatch):
+    from tools.code_execution_tool import CodeExecutionContext, _dispatch_script_call
+
+    def should_not_dispatch(*_args, **_kwargs):
+        raise AssertionError("out-of-scope script call reached handle_function_call")
+
+    import model_tools
+    monkeypatch.setattr(model_tools, "handle_function_call", should_not_dispatch)
+
+    result = _dispatch_script_call(
+        "mcp__other__secret",
+        {},
+        CodeExecutionContext("task", "session", ("mcp-safe",), ()),
+    )
+    assert result["error"]
+
+
 # ---------------------------------------------------------------------------
 # 5. File-tool sensitive-path refusal (security B1)
 # ---------------------------------------------------------------------------
