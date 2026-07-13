@@ -1575,6 +1575,12 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # Phase 2: stop the actual sandboxes OUTSIDE the lock so other tool calls
     # are not blocked while Modal/Docker sandboxes shut down.
     for task_id, env in envs_to_stop:
+        try:
+            from tools.code_execution_tool import cleanup_execution_kernels
+            cleanup_execution_kernels(task_id)
+        except ImportError:
+            pass
+
         # Invalidate stale file_ops cache entry (Bug fix: prevents
         # ShellFileOperations from referencing a dead sandbox)
         try:
@@ -1723,6 +1729,12 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     # Clean up per-task creation lock
     with _creation_locks_lock:
         _creation_locks.pop(task_id, None)
+
+    try:
+        from tools.code_execution_tool import cleanup_execution_kernels
+        cleanup_execution_kernels(task_id)
+    except ImportError:
+        pass
 
     # Invalidate stale file_ops cache entry
     try:

@@ -28,6 +28,7 @@ Platform: Linux / macOS only (Unix domain sockets for local). Disabled on Window
 Remote execution additionally requires Python 3 in the terminal backend.
 """
 
+import atexit
 import base64
 import functools
 import json
@@ -1459,6 +1460,7 @@ def _execute_remote(
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
     context: Optional[CodeExecutionContext] = None,
+    timeout: Optional[float] = None,
 ) -> str:
     """Run a script on the remote terminal backend via file-based RPC.
 
@@ -1468,7 +1470,7 @@ def _execute_remote(
     """
 
     _cfg = _load_config()
-    timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
+    timeout = timeout if timeout is not None else _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
     context = context or CodeExecutionContext(task_id, None, (), ())
 
@@ -1655,6 +1657,464 @@ def _execute_remote(
 
 
 # ---------------------------------------------------------------------------
+# Opt-in persistent execution kernels
+# ---------------------------------------------------------------------------
+
+DEFAULT_KERNEL_IDLE_TTL = 15 * 60
+
+_KERNEL_WORKER_SOURCE = r'''\
+"""Private worker for one opt-in execute_code kernel."""
+import contextlib
+import io
+import json
+import os
+import socket
+import sys
+import time
+import traceback
+
+
+def _connect():
+    endpoint = os.environ["HERMES_KERNEL_SOCKET"]
+    if endpoint.startswith("tcp://"):
+        host, _, port = endpoint[len("tcp://"):].rpartition(":")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((host or "127.0.0.1", int(port)))
+    else:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(endpoint)
+    return sock
+
+
+def _new_globals():
+    return {"__name__": "__main__", "__builtins__": __builtins__}
+
+
+sock = _connect()
+reader = sock.makefile("rb")
+writer = sock.makefile("wb")
+globals_ns = _new_globals()
+for raw in reader:
+    try:
+        request = json.loads(raw.decode("utf-8"))
+        code = request.get("code", "")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        started = time.monotonic()
+        status = "success"
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                exec(compile(code, "<execute_code_kernel>", "exec"), globals_ns, globals_ns)
+            except BaseException:
+                status = "error"
+                traceback.print_exc()
+        response = {
+            "status": status,
+            "stdout": stdout.getvalue(),
+            "stderr": stderr.getvalue(),
+            "duration_seconds": round(time.monotonic() - started, 2),
+        }
+    except BaseException as exc:
+        response = {
+            "status": "error",
+            "stdout": "",
+            "stderr": f"{type(exc).__name__}: {exc}",
+            "duration_seconds": 0,
+        }
+    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+    writer.flush()
+'''
+
+
+def _kernel_listener(prefix: str):
+    """Create a private local listener and its generated-child endpoint."""
+    use_tcp = _IS_WINDOWS
+    if use_tcp:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        host, port = listener.getsockname()[:2]
+        endpoint = f"tcp://{host}:{port}"
+        path = None
+    else:
+        path = os.path.join("/tmp", f"{prefix}_{uuid.uuid4().hex}.sock")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        os.chmod(path, 0o600)
+        endpoint = path
+    listener.listen(1)
+    return listener, endpoint, path
+
+
+def _truncate_kernel_output(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    head = int(limit * 0.4)
+    tail = limit - head
+    omitted = len(text) - head - tail
+    return (
+        text[:head]
+        + f"\n\n... [OUTPUT TRUNCATED - {omitted:,} chars omitted out of {len(text):,} total] ...\n\n"
+        + text[-tail:]
+    )
+
+
+def _clean_kernel_output(text: str, limit: int) -> str:
+    from tools.ansi_strip import strip_ansi
+    from agent.redact import redact_sensitive_text
+    return redact_sensitive_text(
+        strip_ansi(_truncate_kernel_output(text or "", limit)),
+        code_file=True,
+    )
+
+
+class ExecutionKernel:
+    """One task-scoped child interpreter with shared globals between calls."""
+
+    def __init__(
+        self,
+        task_id: str,
+        kernel_id: str,
+        sandbox_tools: frozenset,
+        context: CodeExecutionContext,
+        *,
+        idle_ttl: float = DEFAULT_KERNEL_IDLE_TTL,
+        clock=time.monotonic,
+    ):
+        self.task_id = task_id
+        self.kernel_id = kernel_id
+        self.sandbox_tools = frozenset(sandbox_tools)
+        self.context = context
+        self.idle_ttl = float(idle_ttl)
+        self.clock = clock
+        self.last_activity = clock()
+        self.process = None
+        self._tmpdir = None
+        self._rpc_server = None
+        self._rpc_path = None
+        self._control_server = None
+        self._control_path = None
+        self._control_conn = None
+        self._control_buffer = b""
+        self._rpc_thread = None
+        self._stop_event = threading.Event()
+        self._tool_call_log = []
+        self._tool_call_counter = [0]
+        self._lock = threading.RLock()
+        self.closed = False
+
+    @property
+    def alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None and not self.closed
+
+    def start(self) -> None:
+        with self._lock:
+            if self.alive:
+                return
+            self._tmpdir = tempfile.mkdtemp(prefix="hermes_kernel_")
+            tools_src = generate_hermes_tools_module(
+                list(self.sandbox_tools), context=self.context,
+            )
+            with open(os.path.join(self._tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as handle:
+                handle.write(tools_src)
+            worker_path = os.path.join(self._tmpdir, "kernel_worker.py")
+            with open(worker_path, "w", encoding="utf-8") as handle:
+                handle.write(_KERNEL_WORKER_SOURCE)
+
+            self._rpc_server, rpc_endpoint, self._rpc_path = _kernel_listener("hermes_kernel_rpc")
+            self._control_server, control_endpoint, self._control_path = _kernel_listener("hermes_kernel_ctl")
+            rpc_token = secrets.token_urlsafe(32)
+            self._rpc_thread = threading.Thread(
+                target=propagate_context_to_thread(_rpc_server_loop),
+                args=(
+                    self._rpc_server, self.task_id, self._tool_call_log,
+                    self._tool_call_counter, DEFAULT_MAX_TOOL_CALLS,
+                    self.sandbox_tools, self._stop_event, rpc_token, self.context,
+                ),
+                daemon=True,
+            )
+            self._rpc_thread.start()
+
+            child_env = _scrub_child_env(os.environ)
+            child_env.update({
+                "HERMES_RPC_SOCKET": rpc_endpoint,
+                "HERMES_RPC_TOKEN": rpc_token,
+                "HERMES_KERNEL_SOCKET": control_endpoint,
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
+            })
+            hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            existing_pp = child_env.get("PYTHONPATH", "")
+            pp_parts = [self._tmpdir, hermes_root]
+            if existing_pp:
+                pp_parts.append(existing_pp)
+            child_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
+            tz = os.getenv("HERMES_TIMEZONE", "").strip()
+            if tz:
+                child_env["TZ"] = tz
+            child_env.pop("HERMES_TIMEZONE", None)
+            from hermes_constants import apply_subprocess_home_env
+            apply_subprocess_home_env(child_env)
+
+            child_python = _resolve_child_python(_get_execution_mode())
+            self.process = subprocess.Popen(
+                [child_python, worker_path],
+                cwd=self._tmpdir,
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            )
+            self._control_server.settimeout(5)
+            try:
+                self._control_conn, _ = self._control_server.accept()
+            except (socket.timeout, OSError):
+                raise RuntimeError("Persistent execute_code kernel failed to start.")
+            self._control_conn.settimeout(None)
+            self.last_activity = self.clock()
+
+    def execute(self, code: str, timeout: float) -> dict:
+        with self._lock:
+            if not self.alive:
+                self.start()
+            request = (json.dumps({"code": code}, ensure_ascii=False) + "\n").encode("utf-8")
+            deadline = time.monotonic() + max(0.01, float(timeout))
+            try:
+                self._control_conn.sendall(request)
+                while b"\n" not in self._control_buffer:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout()
+                    self._control_conn.settimeout(min(0.2, remaining))
+                    chunk = self._control_conn.recv(65536)
+                    if not chunk:
+                        raise RuntimeError("Persistent execute_code kernel exited.")
+                    self._control_buffer += chunk
+                line, self._control_buffer = self._control_buffer.split(b"\n", 1)
+                response = json.loads(line.decode("utf-8"))
+                self.last_activity = self.clock()
+            except socket.timeout:
+                _kill_process_group(self.process, escalate=True)
+                self.close()
+                return {
+                    "status": "timeout",
+                    "output": f"⏰ Kernel timed out after {timeout}s and was killed.",
+                    "stdout": "",
+                    "stderr": "",
+                    "timed_out": True,
+                    "kernel_restarted": True,
+                    "tool_calls_made": self._tool_call_counter[0],
+                    "duration_seconds": round(float(timeout), 2),
+                    "error": f"Kernel timed out after {timeout}s and was killed.",
+                }
+            except Exception as exc:
+                self.close()
+                return {
+                    "status": "error",
+                    "output": "",
+                    "stdout": "",
+                    "stderr": "",
+                    "error": str(exc),
+                    "tool_calls_made": self._tool_call_counter[0],
+                    "duration_seconds": 0,
+                }
+
+            stdout = _clean_kernel_output(response.get("stdout", ""), MAX_STDOUT_BYTES)
+            stderr = _clean_kernel_output(response.get("stderr", ""), MAX_STDERR_BYTES)
+            result = {
+                "status": response.get("status", "error"),
+                "output": stdout,
+                "stdout": stdout,
+                "stderr": stderr,
+                "tool_calls_made": self._tool_call_counter[0],
+                "duration_seconds": response.get("duration_seconds", 0),
+                "persistent": True,
+                "kernel_id": self.kernel_id,
+            }
+            if stderr:
+                result["error"] = stderr
+                result["output"] = (stdout + "\n--- stderr ---\n" + stderr).strip()
+                result["stdout"] = stdout
+            return result
+
+    def reset(self) -> None:
+        """Terminate this kernel; the registry creates a fresh one on demand."""
+        self.close()
+
+    def close(self) -> None:
+        with self._lock:
+            if self.closed:
+                return
+            self.closed = True
+            self._stop_event.set()
+            if self._control_conn is not None:
+                try:
+                    self._control_conn.close()
+                except OSError:
+                    pass
+            if self.process is not None and self.process.poll() is None:
+                _kill_process_group(self.process, escalate=True)
+            if self._rpc_server is not None:
+                try:
+                    self._rpc_server.close()
+                except OSError:
+                    pass
+            if self._control_server is not None:
+                try:
+                    self._control_server.close()
+                except OSError:
+                    pass
+            if self._rpc_thread is not None:
+                self._rpc_thread.join(timeout=3)
+            for pipe in (getattr(self.process, "stdout", None), getattr(self.process, "stderr", None)):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+            import shutil
+            shutil.rmtree(self._tmpdir or "", ignore_errors=True)
+            for path in (self._rpc_path, self._control_path):
+                if path:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+
+
+class ExecutionKernelRegistry:
+    """Thread-safe registry scoped by parent task and explicit kernel id."""
+
+    def __init__(self, *, clock=time.monotonic, idle_ttl=DEFAULT_KERNEL_IDLE_TTL):
+        self.clock = clock
+        self.idle_ttl = float(idle_ttl)
+        self._kernels = {}
+        self._expired_keys = set()
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _key(task_id, kernel_id):
+        return (str(task_id or "default"), str(kernel_id or "default"))
+
+    def get(self, task_id, kernel_id):
+        self.cleanup_expired()
+        key = self._key(task_id, kernel_id)
+        with self._lock:
+            kernel = self._kernels.get(key)
+            if kernel is not None and not kernel.alive:
+                self._kernels.pop(key, None)
+                kernel.close()
+                return None
+            return kernel
+
+    def get_or_create(self, task_id, kernel_id, sandbox_tools, context, *, idle_ttl=None):
+        self.cleanup_expired()
+        key = self._key(task_id, kernel_id)
+        with self._lock:
+            kernel = self._kernels.get(key)
+            if kernel is not None and kernel.alive:
+                return kernel
+            if kernel is not None:
+                kernel.close()
+            kernel = ExecutionKernel(
+                key[0], key[1], sandbox_tools, context,
+                idle_ttl=self.idle_ttl if idle_ttl is None else idle_ttl,
+                clock=self.clock,
+            )
+            self._kernels[key] = kernel
+            try:
+                kernel.start()
+            except Exception:
+                self._kernels.pop(key, None)
+                kernel.close()
+                raise
+            return kernel
+
+    def reset(self, task_id, kernel_id):
+        key = self._key(task_id, kernel_id)
+        with self._lock:
+            self._expired_keys.discard(key)
+            kernel = self._kernels.pop(key, None)
+        if kernel is not None:
+            kernel.close()
+            return True
+        return False
+
+    def remove(self, task_id, kernel_id, *, close=True):
+        key = self._key(task_id, kernel_id)
+        with self._lock:
+            self._expired_keys.discard(key)
+            kernel = self._kernels.pop(key, None)
+        if kernel is not None and close:
+            kernel.close()
+        return kernel
+
+    def cleanup_task(self, task_id):
+        task = str(task_id or "default")
+        with self._lock:
+            kernels = [self._kernels.pop(key) for key in list(self._kernels) if key[0] == task]
+            self._expired_keys = {key for key in self._expired_keys if key[0] != task}
+        for kernel in kernels:
+            kernel.close()
+        return len(kernels)
+
+    def for_task(self, task_id):
+        task = str(task_id or "default")
+        with self._lock:
+            return {key[1]: kernel for key, kernel in self._kernels.items() if key[0] == task}
+
+    def cleanup_expired(self):
+        now = self.clock()
+        with self._lock:
+            expired = []
+            for key, kernel in list(self._kernels.items()):
+                if kernel.idle_ttl < 0 or now - kernel.last_activity < kernel.idle_ttl:
+                    continue
+                expired.append(self._kernels.pop(key))
+                self._expired_keys.add(key)
+        for kernel in expired:
+            kernel.close()
+        return len(expired)
+
+    def consume_expired(self, task_id, kernel_id):
+        key = self._key(task_id, kernel_id)
+        with self._lock:
+            if key not in self._expired_keys:
+                return False
+            self._expired_keys.remove(key)
+            return True
+
+    def close_all(self):
+        with self._lock:
+            kernels = list(self._kernels.values())
+            self._kernels.clear()
+            self._expired_keys.clear()
+        for kernel in kernels:
+            kernel.close()
+
+
+_kernel_registry = ExecutionKernelRegistry()
+atexit.register(_kernel_registry.close_all)
+
+
+def _kernel_registry_for_task(task_id):
+    _kernel_registry.cleanup_expired()
+    return _kernel_registry.for_task(task_id)
+
+
+def cleanup_execution_kernels(task_id):
+    """Terminate and forget every persistent kernel owned by *task_id*."""
+    return _kernel_registry.cleanup_task(task_id)
+
+
+def reap_kernels_for_task(task_id):
+    """Compatibility alias for environment teardown callers."""
+    return cleanup_execution_kernels(task_id)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -1666,6 +2126,13 @@ def execute_code(
     session_id: Optional[str] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    persistent: bool = False,
+    kernel_id: Optional[str] = None,
+    session: Optional[str] = None,
+    reset: bool = False,
+    timeout: Optional[float] = None,
+    idle_ttl: Optional[float] = None,
+    kernel_idle_ttl: Optional[float] = None,
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -1679,6 +2146,10 @@ def execute_code(
         task_id:       Session task ID for tool isolation (terminal env, etc.).
         enabled_tools: Tool names enabled in the current session. The sandbox
                        gets the intersection with SANDBOX_ALLOWED_TOOLS.
+        persistent:    Opt into a task-scoped interpreter reused across calls.
+        kernel_id:     Explicit persistent-kernel name; ``session`` is an alias.
+        reset:         Terminate the matching persistent kernel before running.
+        timeout:       Per-call timeout override in seconds.
 
     Returns:
         JSON string with execution results.
@@ -1689,7 +2160,23 @@ def execute_code(
                      "Use normal tool calls (terminal, read_file, write_file, ...) instead."
         })
 
-    if not code or not code.strip():
+    persistent_requested = bool(persistent or session or kernel_id)
+    selected_kernel_id = str(kernel_id or session or "default")
+    if reset:
+        reset_done = _kernel_registry.reset(task_id, selected_kernel_id)
+        if not code or not code.strip():
+            return json.dumps({
+                "status": "success",
+                "output": "",
+                "stdout": "",
+                "persistent": persistent_requested,
+                "kernel_id": selected_kernel_id,
+                "kernel_reset": reset_done,
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            })
+        persistent_requested = True
+    elif not code or not code.strip():
         return tool_error("No code provided.")
 
     context = CodeExecutionContext(
@@ -1741,8 +2228,55 @@ def execute_code(
         from tools.interrupt import clear_current_thread_interrupt
         clear_current_thread_interrupt()
 
+    if persistent_requested:
+        if env_type != "local":
+            return json.dumps({
+                "status": "error",
+                "error": "Persistent execute_code kernels currently require the local terminal backend.",
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            })
+        cfg = _load_config()
+        kernel_timeout = timeout if timeout is not None else cfg.get("timeout", DEFAULT_TIMEOUT)
+        requested_tools = SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())
+        if not requested_tools:
+            requested_tools = SANDBOX_ALLOWED_TOOLS
+        sandbox_tools = frozenset(_scriptable_tool_names(requested_tools, {}))
+        try:
+            kernel = _kernel_registry.get_or_create(
+                task_id or "default",
+                selected_kernel_id,
+                sandbox_tools,
+                context,
+                idle_ttl=kernel_idle_ttl if kernel_idle_ttl is not None else idle_ttl,
+            )
+            kernel_expired = _kernel_registry.consume_expired(task_id, selected_kernel_id)
+            result = kernel.execute(code, kernel_timeout)
+            if kernel_expired:
+                result["kernel_expired"] = True
+            if result.get("status") == "timeout" or not kernel.alive:
+                _kernel_registry.remove(task_id, selected_kernel_id)
+            return json.dumps(result, ensure_ascii=False)
+        except Exception as exc:
+            _kernel_registry.reset(task_id, selected_kernel_id)
+            return json.dumps({
+                "status": "error",
+                "error": str(exc),
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            }, ensure_ascii=False)
+
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools, context)
+        try:
+            if timeout is None:
+                return _execute_remote(code, task_id, enabled_tools, context)
+            return _execute_remote(code, task_id, enabled_tools, context, timeout=timeout)
+        except TypeError as exc:
+            # Preserve tiny legacy test/integration adapters that still expose
+            # the pre-context three-argument remote seam.
+            if "positional argument" not in str(exc) and "unexpected keyword" not in str(exc):
+                raise
+            return _execute_remote(code, task_id, enabled_tools)
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -1751,7 +2285,7 @@ def execute_code(
 
     # Resolve config
     _cfg = _load_config()
-    timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
+    timeout = timeout if timeout is not None else _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
@@ -2449,6 +2983,30 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
                         "and print your final result to stdout."
                     ),
                 },
+                "persistent": {
+                    "type": "boolean",
+                    "description": "Opt into a task-scoped persistent Python kernel; omitted or false keeps fresh-process execution.",
+                },
+                "kernel_id": {
+                    "type": "string",
+                    "description": "Persistent kernel name within the current task (defaults to the task's default kernel).",
+                },
+                "session": {
+                    "type": "string",
+                    "description": "Compatibility alias for kernel_id; supplying it opts into persistence.",
+                },
+                "reset": {
+                    "type": "boolean",
+                    "description": "Terminate and clear the selected persistent kernel before running code; omit code to reset only.",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Optional execution timeout in seconds; a timed-out kernel is killed and recreated cleanly on the next call.",
+                },
+                "idle_ttl": {
+                    "type": "number",
+                    "description": "Optional idle-expiry TTL in seconds for this persistent kernel.",
+                },
             },
             "required": ["code"],
         },
@@ -2473,7 +3031,13 @@ registry.register(
         enabled_tools=kw.get("enabled_tools"),
         session_id=kw.get("session_id"),
         enabled_toolsets=kw.get("enabled_toolsets"),
-        disabled_toolsets=kw.get("disabled_toolsets")),
+        disabled_toolsets=kw.get("disabled_toolsets"),
+        persistent=args.get("persistent", False),
+        kernel_id=args.get("kernel_id"),
+        session=args.get("session"),
+        reset=args.get("reset", False),
+        timeout=args.get("timeout"),
+        idle_ttl=args.get("idle_ttl")),
     check_fn=check_sandbox_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,
