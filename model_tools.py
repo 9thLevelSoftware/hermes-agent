@@ -1273,6 +1273,8 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        enabled_toolsets=enabled_toolsets,
+                        disabled_toolsets=disabled_toolsets,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
