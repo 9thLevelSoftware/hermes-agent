@@ -263,6 +263,7 @@ def test_locked_capacity_recheck_rejects_foreign_process_race(tmp_path, monkeypa
     )
 
     assert result["status"] == "rejected"
+    assert result["reason"] == "capacity"
     assert "capacity" in result["error"].lower()
     assert called is False
 
@@ -332,6 +333,7 @@ def test_persistence_failure_rejects_background_dispatch(monkeypatch):
     )
 
     assert result["status"] == "rejected"
+    assert result["reason"] == "persistence"
     assert "persist" in result["error"].lower()
     assert called is False
 
@@ -603,6 +605,69 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+
+
+def test_delegate_task_persistence_rejection_releases_unstarted_child(monkeypatch):
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess"
+    parent._current_turn_id = "turn-1"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+    fake_child._subagent_id = "s1"
+    fake_child._delegate_progress_callback = MagicMock()
+    fake_child.session_id = "child-session-1"
+    child_ran = False
+    stop_hook = MagicMock()
+
+    def build_child(**kwargs):
+        parent._active_children.append(fake_child)
+        return fake_child
+
+    def run_child(*args, **kwargs):
+        nonlocal child_ran
+        child_ran = True
+        return {"status": "completed"}
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
+    monkeypatch.setattr(dt, "_run_single_child", run_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", stop_hook)
+    monkeypatch.setattr(
+        ad,
+        "dispatch_async_delegation_batch",
+        lambda **kwargs: {
+            "status": "rejected",
+            "reason": "persistence",
+            "error": "disk unavailable",
+        },
+    )
+
+    parsed = json.loads(dt.delegate_task(
+        goal="the real task", background=True, parent_agent=parent
+    ))
+
+    assert parsed["status"] == "rejected"
+    assert parsed["reason"] == "persistence"
+    assert child_ran is False
+    assert fake_child not in parent._active_children
+    fake_child.close.assert_called_once_with()
+    completion_call = fake_child._delegate_progress_callback.call_args
+    assert completion_call.args[0] == "subagent.complete"
+    assert completion_call.kwargs["status"] == "failed"
+    stop_call = stop_hook.call_args
+    assert stop_call.args[0] == "subagent_stop"
+    assert stop_call.kwargs["child_status"] == "error"
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
