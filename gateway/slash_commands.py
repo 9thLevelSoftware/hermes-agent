@@ -2324,7 +2324,7 @@ class GatewaySlashCommandsMixin:
         if adapter and _quick_key:
             try:
                 kickoff_event = MessageEvent(
-                    text=state.goal,
+                    text=mgr.kickoff_prompt() or state.goal,
                     message_type=MessageType.TEXT,
                     source=event.source,
                     message_id=event.message_id,

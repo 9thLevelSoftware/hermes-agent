@@ -1376,11 +1376,13 @@ class TestGoalManagerContract:
         )
 
         prompt = mgr.next_continuation_prompt()
+        kickoff = mgr.kickoff_prompt()
 
         assert not mgr.has_contract()
         assert "Completion contract" not in prompt
         assert "Durable working state" in prompt
         assert "write the failing test" in prompt
+        assert "write the failing test" in kickoff
         assert "working state" in mgr.status_line()
 
     def test_set_contract_after_the_fact(self, hermes_home):

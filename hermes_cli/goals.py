@@ -1148,6 +1148,17 @@ class GoalManager:
     def has_contract(self) -> bool:
         return self._state is not None and self._state.has_contract()
 
+    def kickoff_prompt(self) -> Optional[str]:
+        if self._state is None:
+            return None
+        block = self._state.contract.render_block()
+        if not block:
+            return self._state.goal
+        return (
+            f"{self._state.goal}\n\n"
+            f"Goal contract and durable working state:\n{block}"
+        )
+
     def status_line(self) -> str:
         s = self._state
         if s is None or s.status in {"cleared",}:
