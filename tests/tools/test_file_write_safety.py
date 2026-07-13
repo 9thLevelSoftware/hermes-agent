@@ -202,6 +202,19 @@ class TestCheckSensitivePathMacOSBypass:
         assert "error" in result
         assert "approval state" in result["error"].lower()
 
+    def test_container_and_profile_approval_state_paths_blocked(self):
+        from tools.file_tools import _check_sensitive_path
+
+        assert _check_sensitive_path(
+            "/root/.hermes/approval_requests.json"
+        ) is not None
+        assert _check_sensitive_path(
+            "/root/.hermes/profiles/work/approval_requests.json"
+        ) is not None
+        assert _check_sensitive_path(
+            r"C:\Users\agent\.hermes\profiles\work\approval_requests.json"
+        ) is not None
+
     def test_safe_path_allowed(self):
         from tools.file_tools import _check_sensitive_path
         assert _check_sensitive_path("/tmp/safe_file.txt") is None

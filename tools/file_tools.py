@@ -697,7 +697,20 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         )
     except Exception:
         approval_state = ""
-    if approval_state and (resolved == approval_state or normalized == approval_state):
+    candidates = [resolved, normalized]
+    is_approval_state = bool(
+        approval_state and any(path == approval_state for path in candidates)
+    )
+    for candidate in candidates:
+        clean = candidate.replace("\\", "/").rstrip("/")
+        if clean.endswith("/.hermes/approval_requests.json"):
+            is_approval_state = True
+        marker = "/.hermes/profiles/"
+        if marker in clean:
+            profile_tail = clean.split(marker, 1)[1].split("/")
+            if len(profile_tail) == 2 and profile_tail[1] == "approval_requests.json":
+                is_approval_state = True
+    if is_approval_state:
         return (
             f"Refusing to write to Hermes approval state: {filepath}\n"
             "Agent cannot modify persisted security decisions."

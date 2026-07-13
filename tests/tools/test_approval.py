@@ -587,25 +587,66 @@ class TestTeePattern:
 
 
 class TestHermesApprovalStateWriteProtection:
-    def test_terminal_writes_require_approval(self):
-        commands = [
-            "echo '{\"requests\":[]}' > ~/.hermes/approval_requests.json",
-            "echo x | tee $HERMES_HOME/approval_requests.json",
-            "cp /tmp/forged.json ~/.hermes/approval_requests.json",
-            "sed -i 's/pending/resolved/' ~/.hermes/approval_requests.json",
-            "perl -i -pe 's/pending/resolved/' ~/.hermes/approval_requests.json",
-        ]
-        for command in commands:
-            dangerous, key, desc = detect_dangerous_command(command)
-            assert dangerous is True, command
-            assert key is not None
+    @staticmethod
+    def _assert_dangerous(command):
+        dangerous, key, desc = detect_dangerous_command(command)
+        assert dangerous is True, command
+        assert key is not None
+        assert desc
+
+    def test_redirect_overwrite(self):
+        self._assert_dangerous(
+            "echo '{\"requests\":[]}' > ~/.hermes/approval_requests.json"
+        )
+
+    def test_append(self):
+        self._assert_dangerous(
+            "echo forged >> ~/.hermes/approval_requests.json"
+        )
+
+    def test_tee(self):
+        self._assert_dangerous(
+            "echo x | tee ~/.hermes/approval_requests.json"
+        )
+
+    def test_cp_mv_and_install(self):
+        for command in ("cp", "mv", "install"):
+            self._assert_dangerous(
+                f"{command} /tmp/forged.json ~/.hermes/approval_requests.json"
+            )
+
+    def test_symlink(self):
+        self._assert_dangerous(
+            "ln -sf /tmp/forged.json ~/.hermes/approval_requests.json"
+        )
+
+    def test_sed_in_place_forms(self):
+        self._assert_dangerous(
+            "sed -i 's/pending/resolved/' ~/.hermes/approval_requests.json"
+        )
+        self._assert_dangerous(
+            "sed --in-place 's/pending/resolved/' ~/.hermes/approval_requests.json"
+        )
+
+    def test_perl_and_ruby_in_place(self):
+        self._assert_dangerous(
+            "perl -i -pe 's/pending/resolved/' ~/.hermes/approval_requests.json"
+        )
+        self._assert_dangerous(
+            "ruby -i -pe 'gsub(/pending/, \"resolved\")' ~/.hermes/approval_requests.json"
+        )
+
+    def test_profile_qualified_and_custom_home(self):
+        self._assert_dangerous(
+            "echo forged > ~/.hermes/profiles/work/approval_requests.json"
+        )
+        self._assert_dangerous(
+            "echo x | tee $HERMES_HOME/approval_requests.json"
+        )
 
     def test_absolute_active_home_write_requires_approval(self):
         state_path = get_hermes_home() / "approval_requests.json"
-        dangerous, key, desc = detect_dangerous_command(
-            f"echo forged > {state_path}"
-        )
-        assert dangerous is True
+        self._assert_dangerous(f"echo forged > {state_path}")
 
 
 class TestHermesConfigWriteProtection:
