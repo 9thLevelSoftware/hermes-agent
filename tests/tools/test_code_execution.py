@@ -120,6 +120,97 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("def retry(", src)
         self.assertIn("import json, os, socket, shlex, threading, time", src)
 
+    def test_registry_definitions_generate_typed_required_and_optional_params(self):
+        definitions = {
+            "read_file": {
+                "description": "Read a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "offset": {"type": "integer", "default": 1},
+                    },
+                    "required": ["path"],
+                },
+            },
+        }
+        src = generate_hermes_tools_module(
+            definitions,
+            context=CodeExecutionContext("task", "session", (), ()),
+        )
+        self.assertIn("def read_file(path: str, offset: int = 1)", src)
+        compile(src, "hermes_tools.py", "exec")
+
+    def test_exotic_schema_uses_kwargs_and_sanitized_schema_docstring(self):
+        definitions = [{
+            "type": "function",
+            "function": {
+                "name": "complex-tool",
+                "description": "A complex tool.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {"$ref": "#/$defs/Value"},
+                            ],
+                        },
+                    },
+                },
+            },
+        }]
+        src = generate_hermes_tools_module(definitions)
+        self.assertIn("def complex_tool(**kwargs)", src)
+        self.assertIn("anyOf", src)
+        self.assertIn("$ref", src)
+        compile(src, "hermes_tools.py", "exec")
+
+    def test_registry_definitions_generate_catalog_helpers_and_bounded_source(self):
+        definitions = {
+            f"tool_{index}": {
+                "description": "Small tool description.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+            }
+            for index in range(80)
+        }
+        src = generate_hermes_tools_module(
+            definitions,
+            context=CodeExecutionContext("task", "session", ("tools",), ()),
+        )
+        for helper in ("search_tools", "describe_tool", "call_tool", "save_artifact"):
+            self.assertIn(f"def {helper}(", src)
+        self.assertIn("__code_mode_catalog__", src)
+        self.assertIn("'tool_search'", src)
+        self.assertIn("'tool_describe'", src)
+        self.assertIn("'tool_call'", src)
+        self.assertLess(len(src), 100_000)
+        compile(src, "hermes_tools.py", "exec")
+
+    def test_catalog_internal_action_preserves_context_and_raw_bridge_denylist(self):
+        context = CodeExecutionContext("task", "session", ("mcp-tools",), ("blocked",))
+        with patch("model_tools.handle_function_call", return_value=json.dumps({"ok": True})) as handler:
+            result = _dispatch_script_call(
+                "__code_mode_catalog__",
+                {"action": "tool_search", "arguments": {"query": "files"}},
+                context,
+            )
+        self.assertEqual(result, {"ok": True})
+        handler.assert_called_once_with(
+            "tool_search",
+            {"query": "files"},
+            task_id="task",
+            session_id="session",
+            enabled_toolsets=["mcp-tools"],
+            disabled_toolsets=["blocked"],
+        )
+        denied = _dispatch_script_call("tool_search", {"query": "files"}, context)
+        self.assertIn("not available", denied["error"])
+
     def test_file_transport_uses_tempfile_fallback_for_rpc_dir(self):
         src = generate_hermes_tools_module(["terminal"], transport="file")
         self.assertIn("import json, os, shlex, tempfile, threading, time", src)

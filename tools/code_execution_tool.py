@@ -31,9 +31,11 @@ Remote execution additionally requires Python 3 in the terminal backend.
 import base64
 import functools
 import json
+import keyword
 import logging
 import os
 import platform
+import re
 import secrets
 import shlex
 import socket
@@ -100,6 +102,9 @@ SCRIPT_DENIED_TOOLS = frozenset().union(
     SCRIPT_MEMORY_TOOLS,
     SCRIPT_LIFECYCLE_TOOLS,
 )
+# Internal request kind used by generated catalog helpers. It is not exposed
+# as a registry tool and is handled by the parent adapter below.
+SCRIPT_INTERNAL_TOOLS = frozenset({"__code_mode_catalog__"})
 
 _DEFAULT_OPERATION_METADATA = {
     "read_only": False,
@@ -200,6 +205,47 @@ def _call_handle_function_call(
         )
 
 
+def _dispatch_catalog_action(
+    arguments: Dict[str, object],
+    context: CodeExecutionContext,
+) -> dict[str, object]:
+    """Route generated catalog helpers through the existing bridge dispatcher."""
+    action = arguments.get("action")
+    bridge_name = {
+        "tool_search": "tool_search",
+        "tool_describe": "tool_describe",
+        "tool_call": "tool_call",
+    }.get(action)
+    if action == "save_artifact":
+        return {"error": "save_artifact is not available in this code-mode bridge yet."}
+    if bridge_name is None:
+        return {"error": f"Unknown code-mode catalog action: {action}"}
+    bridge_args = arguments.get("arguments", {})
+    if not isinstance(bridge_args, dict):
+        return {"error": "Code-mode catalog arguments must be an object."}
+
+    from model_tools import handle_function_call
+    dispatch_kwargs: Dict[str, Any] = {"task_id": context.task_id}
+    if context.session_id is not None:
+        dispatch_kwargs["session_id"] = context.session_id
+    if context.enabled_toolsets:
+        dispatch_kwargs["enabled_toolsets"] = list(context.enabled_toolsets)
+    if context.disabled_toolsets:
+        dispatch_kwargs["disabled_toolsets"] = list(context.disabled_toolsets)
+    raw_result = _call_handle_function_call(
+        handle_function_call, bridge_name, bridge_args, dispatch_kwargs,
+    )
+    if isinstance(raw_result, dict):
+        return raw_result
+    if isinstance(raw_result, str):
+        try:
+            parsed = json.loads(raw_result)
+        except (TypeError, json.JSONDecodeError):
+            return {"result": raw_result}
+        return parsed if isinstance(parsed, dict) else {"result": parsed}
+    return {"result": raw_result}
+
+
 def _dispatch_script_call(
     tool_name: str,
     arguments: Dict[str, object],
@@ -209,6 +255,12 @@ def _dispatch_script_call(
     context = context or CodeExecutionContext(None, None, (), ())
     if not isinstance(arguments, dict):
         return {"error": "Script tool arguments must be an object."}
+    if tool_name in SCRIPT_INTERNAL_TOOLS:
+        try:
+            return _dispatch_catalog_action(arguments, context)
+        except Exception as exc:
+            logger.error("Code-mode catalog action failed: %s", exc, exc_info=True)
+            return {"error": str(exc)}
 
     decision = _script_operation_decision(
         tool_name, _operation_metadata_for(tool_name),
@@ -461,52 +513,317 @@ _TOOL_STUBS = {
 }
 
 
+_MAX_GENERATED_SOURCE_CHARS = 100_000
+_MAX_TOOL_DESCRIPTION_CHARS = 600
+_MAX_SCHEMA_DOC_CHARS = 2_400
+
+
+_CODE_MODE_CATALOG_HELPERS = '''
+
+def search_tools(query: str, limit: int = 5):
+    """Search the active deferred-tool catalog by capability."""
+    return _call('__code_mode_catalog__', {
+        'action': 'tool_search',
+        'arguments': {'query': query, 'limit': limit},
+    })
+
+
+def describe_tool(name: str):
+    """Return the registered schema for one catalog tool."""
+    return _call('__code_mode_catalog__', {
+        'action': 'tool_describe',
+        'arguments': {'name': name},
+    })
+
+
+def call_tool(name: str, arguments: dict = None):
+    """Invoke a catalog tool through the normal parent dispatcher."""
+    return _call('__code_mode_catalog__', {
+        'action': 'tool_call',
+        'arguments': {'name': name, 'arguments': arguments or {}},
+    })
+
+
+def save_artifact(path: str, name: str = None, mime_type: str = None):
+    """Request artifact persistence; collection is implemented by the parent."""
+    return _call('__code_mode_catalog__', {
+        'action': 'save_artifact',
+        'arguments': {'path': path, 'name': name, 'mime_type': mime_type},
+    })
+'''
+
+
+def _definition_input(value: Any) -> bool:
+    """Return whether *value* is a registry/OpenAI definition container."""
+    if isinstance(value, dict):
+        return True
+    return isinstance(value, (list, tuple)) and any(
+        isinstance(item, dict) for item in value
+    )
+
+
+def _normalize_tool_definitions(value: Any) -> List[dict]:
+    """Normalize registry mappings and OpenAI definitions to one shape."""
+    if isinstance(value, dict):
+        if isinstance(value.get("function"), dict) or "name" in value:
+            raw_items = [value]
+        else:
+            raw_items = []
+            for name, definition in value.items():
+                if isinstance(definition, dict) and isinstance(
+                    definition.get("function"), dict
+                ):
+                    item = dict(definition)
+                    item["function"] = dict(definition["function"])
+                    item["function"].setdefault("name", str(name))
+                elif isinstance(definition, dict) and (
+                    "parameters" in definition or "description" in definition
+                ):
+                    item = dict(definition)
+                    item.setdefault("name", str(name))
+                else:
+                    item = {"name": str(name), "parameters": definition}
+                raw_items.append(item)
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        return []
+
+    normalized: List[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        if isinstance(function, dict):
+            function = dict(function)
+        else:
+            function = dict(item)
+            function.pop("type", None)
+        name = function.get("name")
+        if name is None and item.get("name") is not None:
+            name = item["name"]
+        if name is None:
+            continue
+        function["name"] = str(name)
+        if "parameters" not in function:
+            # A mapping value may itself be a JSON-Schema object.
+            if isinstance(item.get("type"), str) and item.get("type") != "function":
+                function["parameters"] = item
+            else:
+                function["parameters"] = {"type": "object", "properties": {}}
+        normalized.append({"type": "function", "function": function})
+    return sorted(normalized, key=lambda item: str(
+        (item.get("function") or {}).get("name", "")
+    ))
+
+
+def _sanitize_registry_definitions(definitions: List[dict]) -> List[dict]:
+    """Run the shared schema sanitizer before code-mode conversion."""
+    try:
+        from tools.schema_sanitizer import sanitize_tool_schemas
+        return sanitize_tool_schemas(definitions)
+    except Exception as exc:
+        logger.debug("Code-mode schema sanitization failed: %s", exc)
+        return definitions
+
+
+def _safe_python_identifier(name: str, used: set[str]) -> tuple[str, bool]:
+    """Return a deterministic Python identifier and whether the original is valid."""
+    original_valid = name.isidentifier() and not keyword.iskeyword(name)
+    candidate = re.sub(r"\W", "_", name, flags=re.UNICODE) or "tool"
+    if candidate[0].isdigit():
+        candidate = "tool_" + candidate
+    if keyword.iskeyword(candidate):
+        candidate += "_"
+    base = candidate
+    suffix = 2
+    while candidate in used:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate, original_valid
+
+
+def _safe_default(value: Any) -> str:
+    """Return a source-safe literal for JSON-compatible schema defaults."""
+    if value is None or isinstance(value, (bool, int, str)):
+        return repr(value)
+    if isinstance(value, float) and value == value and value not in (float("inf"), float("-inf")):
+        return repr(value)
+    if isinstance(value, list):
+        return repr([_json_default_value(item) for item in value])
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return repr({key: _json_default_value(item) for key, item in value.items()})
+    return "None"
+
+
+def _json_default_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, list):
+        return [_json_default_value(item) for item in value]
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return {key: _json_default_value(item) for key, item in value.items()}
+    return None
+
+
+def _schema_annotation(schema: Any) -> Optional[str]:
+    if not isinstance(schema, dict) or any(
+        key in schema for key in ("$ref", "anyOf", "oneOf", "allOf")
+    ):
+        return None
+    return {
+        "string": "str",
+        "integer": "int",
+        "number": "float",
+        "boolean": "bool",
+        "array": "list",
+        "object": "dict",
+    }.get(schema.get("type"))
+
+
+def _schema_is_unsupported(schema: Any) -> bool:
+    """Reject schemas that cannot be represented by a safe Python signature."""
+    if not isinstance(schema, dict):
+        return True
+    if any(key in schema for key in ("$ref", "anyOf", "oneOf", "allOf")):
+        return True
+    schema_type = schema.get("type")
+    if schema_type == "object":
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return True
+        if not properties and schema.get("additionalProperties") is not False:
+            return True
+        return any(_schema_is_unsupported(item) for item in properties.values())
+    if schema_type == "array":
+        return "items" in schema and _schema_is_unsupported(schema.get("items"))
+    return _schema_annotation(schema) is None
+
+
+def _bounded_schema_text(schema: Any) -> str:
+    try:
+        text = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        text = repr(schema)
+    return text[:_MAX_SCHEMA_DOC_CHARS]
+
+
+def _render_registry_wrapper(
+    definition: dict,
+    used_names: set[str],
+) -> str:
+    function = definition.get("function") or {}
+    registered_name = str(function.get("name", "tool"))
+    function_name, valid_name = _safe_python_identifier(registered_name, used_names)
+    parameters = function.get("parameters") or {"type": "object", "properties": {}}
+    description = str(function.get("description") or "Registered Hermes tool.")
+    description = description[:_MAX_TOOL_DESCRIPTION_CHARS]
+    properties = parameters.get("properties") if isinstance(parameters, dict) else None
+    raw_required = parameters.get("required", []) if isinstance(parameters, dict) else []
+    required = [
+        name for name in (raw_required if isinstance(raw_required, list) else [])
+        if isinstance(name, str) and isinstance(properties, dict) and name in properties
+    ]
+    ordered_names = required + [
+        name for name in (properties or {}) if name not in required
+    ]
+    unsupported = (
+        not valid_name
+        or not isinstance(properties, dict)
+        or _schema_is_unsupported(parameters)
+    )
+    if unsupported:
+        doc = f"{description}\nSanitized schema: {_bounded_schema_text(parameters)}"
+        return (
+            f"def {function_name}(**kwargs):\n"
+            f"    {repr(doc)}\n"
+            f"    return _call({registered_name!r}, kwargs)\n\n"
+        )
+
+    used_params: set[str] = set()
+    signature_parts: List[str] = []
+    payload_parts: List[str] = []
+    for raw_name in ordered_names:
+        schema = properties[raw_name]
+        param_name, _ = _safe_python_identifier(str(raw_name), used_params)
+        annotation = _schema_annotation(schema)
+        if annotation is None:
+            # A malformed property should not produce a partially typed API.
+            doc = f"{description}\nSanitized schema: {_bounded_schema_text(parameters)}"
+            return (
+                f"def {function_name}(**kwargs):\n"
+                f"    {repr(doc)}\n"
+                f"    return _call({registered_name!r}, kwargs)\n\n"
+            )
+        default = ""
+        if raw_name not in required:
+            default = " = " + _safe_default(schema.get("default"))
+        signature_parts.append(f"{param_name}: {annotation}{default}")
+        payload_parts.append(f"{str(raw_name)!r}: {param_name}")
+    signature = ", ".join(signature_parts)
+    payload = "{" + ", ".join(payload_parts) + "}"
+    return (
+        f"def {function_name}({signature}):\n"
+        f"    {repr(description)}\n"
+        f"    return _call({registered_name!r}, {payload})\n\n"
+    )
+
+
 def generate_hermes_tools_module(
-    enabled_tools: List[str],
+    enabled_tools: Any = None,
     transport: str = "uds",
     *,
     context: Optional[CodeExecutionContext] = None,
+    active_tool_definitions: Any = None,
 ) -> str:
-    """
-    Build the source code for the hermes_tools.py stub module.
+    """Build ``hermes_tools.py`` for legacy names or active registry definitions."""
+    if isinstance(transport, CodeExecutionContext):
+        context, transport = transport, "uds"
 
-    Only tools in both SANDBOX_ALLOWED_TOOLS and enabled_tools get stubs.
-
-    Args:
-        enabled_tools: Tool names enabled in the current session.
-        transport: ``"uds"`` for Unix domain socket (local backend) or
-                   ``"file"`` for file-based RPC (remote backends).
-    """
-    tools_to_generate = sorted(
-        _scriptable_tool_names(
-            SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ()),
-        )
-    )
-
-    stub_functions = []
-    export_names = []
-    for tool_name in tools_to_generate:
-        if tool_name not in _TOOL_STUBS:
-            continue
-        func_name, sig, doc, args_expr = _TOOL_STUBS[tool_name]
-        stub_functions.append(
-            f"def {func_name}({sig}):\n"
-            f"    {doc}\n"
-            f"    return _call({func_name!r}, {args_expr})\n"
-        )
-        export_names.append(func_name)
-
-    if transport == "file":
-        header = _FILE_TRANSPORT_HEADER
+    definitions_input = active_tool_definitions is not None or _definition_input(enabled_tools)
+    if active_tool_definitions is not None:
+        definitions = _normalize_tool_definitions(active_tool_definitions)
+    elif definitions_input:
+        definitions = _normalize_tool_definitions(enabled_tools)
     else:
-        header = _UDS_TRANSPORT_HEADER
+        tools_to_generate = sorted(_scriptable_tool_names(
+            SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ()),
+        ))
+        stub_functions = []
+        for tool_name in tools_to_generate:
+            if tool_name not in _TOOL_STUBS:
+                continue
+            func_name, sig, doc, args_expr = _TOOL_STUBS[tool_name]
+            stub_functions.append(
+                f"def {func_name}({sig}):\n"
+                f"    {doc}\n"
+                f"    return _call({func_name!r}, {args_expr})\n\n"
+            )
+        definitions = []
 
-    context_source = (
-        "\n_HERMES_RPC_CONTEXT = "
-        + repr(_context_payload(context))
-        + "\n"
-    )
-    return header + context_source + "\n".join(stub_functions)
+    if definitions_input:
+        definitions = _sanitize_registry_definitions(definitions)
+        definitions = [
+            item for item in definitions
+            if str((item.get("function") or {}).get("name", ""))
+            not in SCRIPT_DENIED_TOOLS | SCRIPT_INTERNAL_TOOLS
+        ]
+        used_names: set[str] = set()
+        stub_functions = [
+            _render_registry_wrapper(item, used_names) for item in definitions
+        ]
+
+    header = _FILE_TRANSPORT_HEADER if transport == "file" else _UDS_TRANSPORT_HEADER
+    context_source = "\n_HERMES_RPC_CONTEXT = " + repr(_context_payload(context)) + "\n"
+    catalog_helpers = _CODE_MODE_CATALOG_HELPERS if definitions_input else ""
+    prefix = header + context_source
+    body = ""
+    for stub in stub_functions:
+        if len(prefix) + len(body) + len(stub) + len(catalog_helpers) > _MAX_GENERATED_SOURCE_CHARS:
+            break
+        body += stub
+    return prefix + body + catalog_helpers
 
 
 # ---- Shared helpers section (embedded in both transport headers) ----------
@@ -715,7 +1032,7 @@ def _rpc_server_loop(
     Accept one client connection and dispatch tool-call requests until
     the client disconnects or the call limit is reached.
     """
-    allowed_tools = frozenset(_scriptable_tool_names(allowed_tools, {}))
+    allowed_tools = frozenset(_scriptable_tool_names(allowed_tools, {})) | SCRIPT_INTERNAL_TOOLS
     rpc_context = rpc_context or CodeExecutionContext(task_id, None, (), ())
     conn = None
     try:
@@ -999,7 +1316,7 @@ def _rpc_poll_loop(
     independent process, so these calls run safely concurrent with the
     script-execution thread.
     """
-    allowed_tools = frozenset(_scriptable_tool_names(allowed_tools, {}))
+    allowed_tools = frozenset(_scriptable_tool_names(allowed_tools, {})) | SCRIPT_INTERNAL_TOOLS
     rpc_context = rpc_context or CodeExecutionContext(task_id, None, (), ())
     poll_interval = 0.1  # 100 ms
 
