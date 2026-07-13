@@ -1243,6 +1243,14 @@ class TestParseContract:
         assert headline == "Fix bug: the parser drops trailing commas"
         assert contract.is_empty()
 
+    def test_short_next_label_remains_freeform_goal_text(self):
+        from hermes_cli.goals import parse_contract
+
+        headline, contract = parse_contract("Fix workflow\nNext: run tests")
+
+        assert headline == "Fix workflow Next: run tests"
+        assert contract.next_action == ""
+
     def test_inline_fields_parsed(self):
         from hermes_cli.goals import parse_contract
 

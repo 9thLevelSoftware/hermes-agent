@@ -303,7 +303,6 @@ _CONTRACT_ALIASES = {
     "blocker": "blockers",
     "blockers": "blockers",
     "blocked by": "blockers",
-    "next": "next_action",
     "next action": "next_action",
     "next_action": "next_action",
     "next step": "next_action",
