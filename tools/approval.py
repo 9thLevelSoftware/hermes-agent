@@ -679,6 +679,7 @@ DANGEROUS_PATTERNS = [
     # but reading OUT of a sensitive path (`cp ~/.ssh/config /tmp/x`) stays safe.
     # The trailing `[^\s"\']*` consumes the rest of the destination filename
     # (e.g. `authorized_keys` after the `~/.ssh/` fragment).
+    (rf'\bcp\b(?=[^\n]*(?:\s-[^\s]*[sl][^\s]*|\s--(?:symbolic-link|link)\b)).*{_SENSITIVE_WRITE_TARGET}', "link sensitive credential/SSH/shell-rc/Hermes path via cp"),
     (rf'\b(cp|mv|install)\b.*\s["\']?{_SENSITIVE_WRITE_TARGET}[^\s"\']*["\']?{_COMMAND_TAIL}', "copy/move file into sensitive credential/SSH/shell-rc/Hermes path"),
     (rf'\bln\b.*{_SENSITIVE_WRITE_TARGET}', "link sensitive credential/SSH/shell-rc/Hermes path"),
     # In-place edits mutate the target file directly, bypassing redirection,

@@ -623,6 +623,10 @@ class TestHermesApprovalStateWriteProtection:
             "ln -s ~/.hermes/approval_requests.json /tmp/approval-alias && "
             "echo forged > /tmp/approval-alias"
         )
+        for option in ("-s", "-l", "--symbolic-link", "--link"):
+            self._assert_dangerous(
+                f"cp {option} ~/.hermes/approval_requests.json /tmp/approval-alias"
+            )
 
     def test_sed_in_place_forms(self):
         self._assert_dangerous(
