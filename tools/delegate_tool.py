@@ -2852,6 +2852,25 @@ def delegate_task(
             if getattr(child, "session_id", None)
         ]
 
+        def _detach_children(*, close: bool = False) -> None:
+            if hasattr(parent_agent, "_active_children"):
+                lock = getattr(parent_agent, "_active_children_lock", None)
+                for child in _child_agents:
+                    try:
+                        if lock:
+                            with lock:
+                                parent_agent._active_children.remove(child)
+                        else:
+                            parent_agent._active_children.remove(child)
+                    except ValueError:
+                        pass
+                    if close:
+                        try:
+                            if hasattr(child, "close"):
+                                child.close()
+                        except Exception:
+                            logger.debug("Failed to close rejected child agent")
+
         def _batch_runner():
             return _execute_and_aggregate()
 
@@ -2885,18 +2904,8 @@ def delegate_task(
 
         if dispatch.get("status") == "dispatched":
             # The async registry now owns cancellation. Detach only after the
-            # durable dispatch is accepted; rejected work remains parent-owned.
-            if hasattr(parent_agent, "_active_children"):
-                _ac_lock = getattr(parent_agent, "_active_children_lock", None)
-                for _c in _child_agents:
-                    try:
-                        if _ac_lock:
-                            with _ac_lock:
-                                parent_agent._active_children.remove(_c)
-                        else:
-                            parent_agent._active_children.remove(_c)
-                    except ValueError:
-                        pass
+            # durable dispatch is accepted; the worker closes children later.
+            _detach_children()
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -2921,6 +2930,7 @@ def delegate_task(
             return json.dumps(payload, ensure_ascii=False)
 
         if dispatch.get("reason") != "capacity":
+            _detach_children(close=True)
             return json.dumps(
                 {
                     "status": "rejected",
@@ -2928,8 +2938,8 @@ def delegate_task(
                     "error": dispatch.get("error", "Background dispatch failed."),
                     "reason": dispatch.get("reason", "dispatch"),
                     "note": (
-                        "The background delegation was not started. The child "
-                        "remains attached to the parent for interruption safety."
+                        "The background delegation was not started. Its unstarted "
+                        "child resources were released safely."
                     ),
                 },
                 ensure_ascii=False,

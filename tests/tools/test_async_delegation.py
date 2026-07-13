@@ -607,7 +607,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert "the real task" in text
 
 
-def test_delegate_task_persistence_rejection_stays_parent_owned(monkeypatch):
+def test_delegate_task_persistence_rejection_releases_unstarted_child(monkeypatch):
     from unittest.mock import MagicMock
     import tools.delegate_tool as dt
 
@@ -655,7 +655,8 @@ def test_delegate_task_persistence_rejection_stays_parent_owned(monkeypatch):
     assert parsed["status"] == "rejected"
     assert parsed["reason"] == "persistence"
     assert child_ran is False
-    assert fake_child in parent._active_children
+    assert fake_child not in parent._active_children
+    fake_child.close.assert_called_once_with()
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
