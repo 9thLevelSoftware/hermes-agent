@@ -215,6 +215,13 @@ class TestHandleFunctionCall:
         assert pre_call[1]["middleware_trace"] == expected_trace
         assert post_call[1]["middleware_trace"] == expected_trace
 
+    def test_web_extract_cache_writer_is_not_classified_read_only(self):
+        assert registry.get_operation_metadata("web_extract") == {
+            "read_only": False,
+            "destructive": True,
+            "idempotent": False,
+        }
+
     def test_no_execution_middleware_does_not_hash_arguments(self, monkeypatch):
         manager = type("Manager", (), {"_middleware": {"tool_execution": []}})()
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)

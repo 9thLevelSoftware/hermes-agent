@@ -1237,6 +1237,4 @@ registry.register(
     is_async=True,
     emoji="📄",
     max_result_size_chars=100_000,
-    read_only=True,
-    idempotent=True,
 )
