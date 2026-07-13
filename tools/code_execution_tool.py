@@ -46,7 +46,7 @@ import uuid
 from dataclasses import dataclass
 
 _IS_WINDOWS = platform.system() == "Windows"
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, Iterable, List, Literal, Optional
 
 from tools.thread_context import propagate_context_to_thread
 
@@ -75,8 +75,8 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
 class CodeExecutionContext:
     """Immutable parent-session context carried over script RPC calls."""
 
-    task_id: str | None
-    session_id: str | None
+    task_id: Optional[str]
+    session_id: Optional[str]
     enabled_toolsets: tuple[str, ...]
     disabled_toolsets: tuple[str, ...]
 
@@ -125,11 +125,11 @@ def _operation_metadata_for(
 
 
 def _scriptable_tool_names(
-    session_tools: set[str],
-    operation_metadata: Dict[str, Dict[str, bool]],
+    session_tools: Optional[Iterable[str]] = None,
+    operation_metadata: Optional[Dict[str, Dict[str, bool]]] = None,
 ) -> set[str]:
     """Return deterministic session tools minus the script denylist."""
-    names = {str(name) for name in session_tools}
+    names = {str(name) for name in (session_tools or ())}
     # Resolve metadata for every candidate here so callers can build one
     # registry-backed snapshot before generation/dispatch.
     for name in sorted(names):
@@ -184,12 +184,29 @@ def _context_from_rpc_request(
     )
 
 
+def _call_handle_function_call(
+    handler, tool_name: str, arguments: dict, dispatch_kwargs: Dict[str, Any],
+):
+    """Call current or legacy dispatchers without dropping real context."""
+    try:
+        return handler(tool_name, dict(arguments), **dispatch_kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        return handler(
+            tool_name,
+            dict(arguments),
+            task_id=dispatch_kwargs.get("task_id"),
+        )
+
+
 def _dispatch_script_call(
     tool_name: str,
     arguments: Dict[str, object],
-    context: CodeExecutionContext,
+    context: Optional[CodeExecutionContext] = None,
 ) -> dict[str, object]:
     """Dispatch one in-scope scripted call through the standard tool path."""
+    context = context or CodeExecutionContext(None, None, (), ())
     if not isinstance(arguments, dict):
         return {"error": "Script tool arguments must be an object."}
 
@@ -226,7 +243,9 @@ def _dispatch_script_call(
             dispatch_kwargs["enabled_toolsets"] = list(context.enabled_toolsets)
         if context.disabled_toolsets:
             dispatch_kwargs["disabled_toolsets"] = list(context.disabled_toolsets)
-        raw_result = handle_function_call(tool_name, dict(arguments), **dispatch_kwargs)
+        raw_result = _call_handle_function_call(
+            handle_function_call, tool_name, arguments, dispatch_kwargs,
+        )
     except Exception as exc:
         logger.error("Scripted tool call failed: %s", exc, exc_info=True)
         return {"error": str(exc)}
@@ -458,7 +477,11 @@ def generate_hermes_tools_module(
         transport: ``"uds"`` for Unix domain socket (local backend) or
                    ``"file"`` for file-based RPC (remote backends).
     """
-    tools_to_generate = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+    tools_to_generate = sorted(
+        _scriptable_tool_names(
+            SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ()),
+        )
+    )
 
     stub_functions = []
     export_names = []
@@ -692,6 +715,7 @@ def _rpc_server_loop(
     Accept one client connection and dispatch tool-call requests until
     the client disconnects or the call limit is reached.
     """
+    allowed_tools = frozenset(_scriptable_tool_names(allowed_tools, {}))
     rpc_context = rpc_context or CodeExecutionContext(task_id, None, (), ())
     conn = None
     try:
@@ -975,6 +999,7 @@ def _rpc_poll_loop(
     independent process, so these calls run safely concurrent with the
     script-execution thread.
     """
+    allowed_tools = frozenset(_scriptable_tool_names(allowed_tools, {}))
     rpc_context = rpc_context or CodeExecutionContext(task_id, None, (), ())
     poll_interval = 0.1  # 100 ms
 
@@ -1129,10 +1154,10 @@ def _execute_remote(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
     context = context or CodeExecutionContext(task_id, None, (), ())
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    requested_tools = SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())
+    if not requested_tools:
+        requested_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = frozenset(_scriptable_tool_names(requested_tools, {}))
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1412,11 +1437,10 @@ def execute_code(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    requested_tools = SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())
+    if not requested_tools:
+        requested_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = frozenset(_scriptable_tool_names(requested_tools, {}))
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")

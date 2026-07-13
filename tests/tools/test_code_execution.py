@@ -47,6 +47,8 @@ from tools.code_execution_tool import (
     EXECUTE_CODE_SCHEMA,
     _TOOL_DOC_LINES,
     _execute_remote,
+    CodeExecutionContext,
+    _dispatch_script_call,
 )
 
 
@@ -139,6 +141,29 @@ class TestHermesToolsGeneration(unittest.TestCase):
         src = generate_hermes_tools_module(["terminal"], transport="file")
         self.assertIn("_seq_lock = threading.Lock()", src)
         self.assertIn("with _seq_lock:", src)
+
+    def test_dispatch_keeps_context_with_legacy_handler_signature(self):
+        seen = {}
+
+        def legacy_handler(function_name, function_args, task_id=None, user_task=None):
+            seen.update(function_name=function_name, function_args=function_args,
+                        task_id=task_id)
+            return json.dumps({"ok": True})
+
+        context = CodeExecutionContext("task", "session", ("terminal",), ())
+        with patch("model_tools.get_tool_definitions",
+                   return_value=[{"function": {"name": "terminal"}}]), \
+             patch("model_tools.handle_function_call", side_effect=legacy_handler):
+            result = _dispatch_script_call(
+                "terminal", {"command": "echo hi"}, context,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(seen, {
+            "function_name": "terminal",
+            "function_args": {"command": "echo hi"},
+            "task_id": "task",
+        })
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
