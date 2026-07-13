@@ -95,9 +95,10 @@ def test_running_record_recovers_as_interrupted_after_restart(tmp_path, monkeypa
     records_path = tmp_path / "delegations.json"
     monkeypatch.setattr(ad, "_records_path", lambda: records_path)
     with ad._records_lock:
-        ad._records_loaded_home = None
+        ad._records_loaded_homes.clear()
         ad._records["deleg_restart"] = {
             "delegation_id": "deleg_restart",
+            "_home": str(records_path.parent),
             "goal": "finish the migration",
             "context": "continue from the saved child transcript",
             "toolsets": ["file"],
@@ -113,7 +114,7 @@ def test_running_record_recovers_as_interrupted_after_restart(tmp_path, monkeypa
         }
         ad._persist_records_locked()
         ad._records.clear()
-        ad._records_loaded_home = None
+        ad._records_loaded_homes.clear()
 
     recovered = ad.list_async_delegations()
 
@@ -126,13 +127,48 @@ def test_running_record_recovers_as_interrupted_after_restart(tmp_path, monkeypa
     assert "restart" in recovered[0]["error"].lower()
 
 
+def test_profile_switch_does_not_drop_another_profiles_running_record(tmp_path, monkeypatch):
+    current = {"path": tmp_path / "profile-a" / "delegations.json"}
+    monkeypatch.setattr(ad, "_records_path", lambda: current["path"])
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    result = ad.dispatch_async_delegation(
+        goal="profile A work",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="profile-a",
+        runner=runner,
+    )
+    delegation_id = result["delegation_id"]
+
+    current["path"] = tmp_path / "profile-b" / "delegations.json"
+    assert ad.list_async_delegations() == []
+    with ad._records_lock:
+        assert delegation_id in ad._records
+
+    gate.set()
+    event = _drain_one()
+    assert event is not None
+    assert event["delegation_id"] == delegation_id
+
+    current["path"] = tmp_path / "profile-a" / "delegations.json"
+    restored = ad.list_async_delegations()
+    assert restored[0]["status"] == "completed"
+
+
 def test_malformed_records_collection_loads_as_empty(tmp_path, monkeypatch):
     records_path = tmp_path / "delegations.json"
     records_path.write_text('{"records": null}', encoding="utf-8")
     monkeypatch.setattr(ad, "_records_path", lambda: records_path)
     with ad._records_lock:
         ad._records.clear()
-        ad._records_loaded_home = None
+        ad._records_loaded_homes.clear()
 
     assert ad.list_async_delegations() == []
 

@@ -47,6 +47,7 @@ import logging
 import threading
 import time
 import uuid
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
@@ -75,7 +76,7 @@ _records_lock = threading.Lock()
 # delegation_id -> record dict. Kept for the lifetime of the run plus a short
 # tail after completion so `list_async_delegations()` can show recent results.
 _records: Dict[str, Dict[str, Any]] = {}
-_records_loaded_home: Optional[str] = None
+_records_loaded_homes: set[str] = set()
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
@@ -88,17 +89,24 @@ def _records_path():
     return get_hermes_home() / "delegations.json"
 
 
-def _persist_records_locked() -> bool:
-    """Atomically persist serialisable records; never break completion delivery."""
+def _persist_records_locked(home: Optional[str] = None) -> bool:
+    """Atomically persist one profile's records; never break completion delivery."""
     from utils import atomic_json_write
 
+    home = home or str(_records_path().parent)
     records = [
-        {key: value for key, value in record.items() if key != "interrupt_fn"}
+        {
+            key: value
+            for key, value in record.items()
+            if key not in {"interrupt_fn", "_home"}
+        }
         for record in _records.values()
+        if record.get("_home") == home
     ]
+    path = Path(home) / "delegations.json"
     try:
         atomic_json_write(
-            _records_path(),
+            path,
             {"records": records},
             mode=0o600,
             default=str,
@@ -110,13 +118,11 @@ def _persist_records_locked() -> bool:
 
 
 def _load_records_locked() -> None:
-    """Load this profile once and recover orphaned running records safely."""
-    global _records_loaded_home
+    """Load the active profile once without evicting other profiles' workers."""
     path = _records_path()
     home = str(path.parent)
-    if _records_loaded_home == home:
+    if home in _records_loaded_homes:
         return
-    _records.clear()
     try:
         payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     except (OSError, ValueError, TypeError):
@@ -136,6 +142,7 @@ def _load_records_locked() -> None:
             continue
         record = dict(record)
         record["interrupt_fn"] = None
+        record["_home"] = home
         if record.get("status") == "running":
             record["status"] = "interrupted"
             record["completed_at"] = now
@@ -145,11 +152,12 @@ def _load_records_locked() -> None:
             )
             recovered = True
         _records[delegation_id] = record
-    _records_loaded_home = home
-    before_prune = len(_records)
-    _prune_completed_locked()
-    if recovered or len(_records) != before_prune:
-        _persist_records_locked()
+    _records_loaded_homes.add(home)
+    before_prune = sum(1 for record in _records.values() if record.get("_home") == home)
+    _prune_completed_locked(home)
+    after_prune = sum(1 for record in _records.values() if record.get("_home") == home)
+    if recovered or after_prune != before_prune:
+        _persist_records_locked(home)
 
 
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
@@ -172,25 +180,30 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
 
 
 def active_count() -> int:
-    """Number of async delegations currently running."""
+    """Number of async delegations currently running for the active profile."""
     with _records_lock:
         _load_records_locked()
-        return sum(1 for r in _records.values() if r.get("status") == "running")
+        home = str(_records_path().parent)
+        return sum(
+            1 for record in _records.values()
+            if record.get("_home") == home and record.get("status") == "running"
+        )
 
 
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
 
-def _prune_completed_locked() -> None:
-    """Drop the oldest completed records beyond the retention cap.
+def _prune_completed_locked(home: Optional[str] = None) -> None:
+    """Drop the oldest completed records beyond the per-profile retention cap.
 
     Caller must hold ``_records_lock``.
     """
+    home = home or str(_records_path().parent)
     completed = [
-        (rid, r)
-        for rid, r in _records.items()
-        if r.get("status") != "running"
+        (rid, record)
+        for rid, record in _records.items()
+        if record.get("_home") == home and record.get("status") != "running"
     ]
     if len(completed) <= _MAX_RETAINED_COMPLETED:
         return
@@ -209,7 +222,6 @@ def dispatch_async_delegation(
     model: Optional[str],
     session_key: str,
     parent_session_id: Optional[str] = None,
-    child_session_ids: Optional[List[str]] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
@@ -253,6 +265,7 @@ def dispatch_async_delegation(
     dispatched_at = time.time()
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
+        "_home": str(_records_path().parent),
         "goal": goal,
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
@@ -261,9 +274,6 @@ def dispatch_async_delegation(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "parent_session_id": parent_session_id,
-        "child_session_ids": [
-            str(session_id) for session_id in (child_session_ids or []) if session_id
-        ],
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -275,7 +285,8 @@ def dispatch_async_delegation(
     with _records_lock:
         _load_records_locked()
         running = sum(
-            1 for r in _records.values() if r.get("status") == "running"
+            1 for r in _records.values()
+            if r.get("_home") == record["_home"] and r.get("status") == "running"
         )
         if running >= max_async_children:
             return {
@@ -346,15 +357,10 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         record["status"] = status
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None  # drop the closure; child is done
-        record["summary"] = result.get("summary")
-        record["error"] = result.get("error")
-        record["api_calls"] = result.get("api_calls", 0)
-        record["duration_seconds"] = result.get("duration_seconds")
-        record["exit_reason"] = result.get("exit_reason")
         # Snapshot fields needed for the event while holding the lock.
         event_record = dict(record)
-        _prune_completed_locked()
-        _persist_records_locked()
+        _prune_completed_locked(record.get("_home"))
+        _persist_records_locked(record.get("_home"))
 
     _push_completion_event(event_record, result, status)
 
@@ -390,7 +396,6 @@ def _push_completion_event(
         "session_key": record.get("session_key", ""),
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
-        "child_session_ids": record.get("child_session_ids") or [],
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -461,6 +466,7 @@ def dispatch_async_delegation_batch(
     )
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
+        "_home": str(_records_path().parent),
         "goal": combined_goal,
         "goals": list(goals),
         "context": context,
@@ -482,7 +488,8 @@ def dispatch_async_delegation_batch(
     with _records_lock:
         _load_records_locked()
         running = sum(
-            1 for r in _records.values() if r.get("status") == "running"
+            1 for r in _records.values()
+            if r.get("_home") == record["_home"] and r.get("status") == "running"
         )
         if running >= max_async_children:
             return {
@@ -559,12 +566,9 @@ def _finalize_batch(
         record["status"] = status
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None
-        record["error"] = combined.get("error")
-        record["total_duration_seconds"] = combined.get("total_duration_seconds")
-        record["result_count"] = len(combined.get("results") or [])
         event_record = dict(record)
-        _prune_completed_locked()
-        _persist_records_locked()
+        _prune_completed_locked(record.get("_home"))
+        _persist_records_locked(record.get("_home"))
 
     try:
         from tools.process_registry import process_registry
@@ -618,9 +622,15 @@ def list_async_delegations() -> List[Dict[str, Any]]:
     """
     with _records_lock:
         _load_records_locked()
+        home = str(_records_path().parent)
         return [
-            {k: v for k, v in r.items() if k != "interrupt_fn"}
-            for r in _records.values()
+            {
+                key: value
+                for key, value in record.items()
+                if key not in {"interrupt_fn", "_home"}
+            }
+            for record in _records.values()
+            if record.get("_home") == home
         ]
 
 
@@ -710,7 +720,7 @@ def interrupt_for_session(
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state, persistent records, and the executor."""
-    global _executor, _executor_max_workers, _records_loaded_home
+    global _executor, _executor_max_workers
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
@@ -718,7 +728,7 @@ def _reset_for_tests() -> None:
         _executor_max_workers = 0
     with _records_lock:
         _records.clear()
-        _records_loaded_home = None
+        _records_loaded_homes.clear()
         try:
             _records_path().unlink(missing_ok=True)
         except OSError:
