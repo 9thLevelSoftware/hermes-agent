@@ -263,6 +263,7 @@ def test_locked_capacity_recheck_rejects_foreign_process_race(tmp_path, monkeypa
     )
 
     assert result["status"] == "rejected"
+    assert result["reason"] == "capacity"
     assert "capacity" in result["error"].lower()
     assert called is False
 
@@ -332,6 +333,7 @@ def test_persistence_failure_rejects_background_dispatch(monkeypatch):
     )
 
     assert result["status"] == "rejected"
+    assert result["reason"] == "persistence"
     assert "persist" in result["error"].lower()
     assert called is False
 
@@ -603,6 +605,57 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+
+
+def test_delegate_task_persistence_rejection_stays_parent_owned(monkeypatch):
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+    fake_child.session_id = "child-session-1"
+    child_ran = False
+
+    def build_child(**kwargs):
+        parent._active_children.append(fake_child)
+        return fake_child
+
+    def run_child(*args, **kwargs):
+        nonlocal child_ran
+        child_ran = True
+        return {"status": "completed"}
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
+    monkeypatch.setattr(dt, "_run_single_child", run_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(
+        ad,
+        "dispatch_async_delegation_batch",
+        lambda **kwargs: {
+            "status": "rejected",
+            "reason": "persistence",
+            "error": "disk unavailable",
+        },
+    )
+
+    parsed = json.loads(dt.delegate_task(
+        goal="the real task", background=True, parent_agent=parent
+    ))
+
+    assert parsed["status"] == "rejected"
+    assert parsed["reason"] == "persistence"
+    assert child_ran is False
+    assert fake_child in parent._active_children
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):

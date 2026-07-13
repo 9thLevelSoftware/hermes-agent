@@ -398,6 +398,7 @@ def dispatch_async_delegation(
         if running >= max_async_children:
             return {
                 "status": "rejected",
+                "reason": "capacity",
                 "error": (
                     f"Async delegation capacity reached ({max_async_children} "
                     f"running). Wait for one to finish (its result will re-enter "
@@ -413,6 +414,7 @@ def dispatch_async_delegation(
             if reservation == "capacity":
                 return {
                     "status": "rejected",
+                    "reason": "capacity",
                     "error": (
                         f"Async delegation capacity reached ({max_async_children} "
                         "running across this profile). Wait for one to finish."
@@ -420,6 +422,7 @@ def dispatch_async_delegation(
                 }
             return {
                 "status": "rejected",
+                "reason": "persistence",
                 "error": "Could not persist the background delegation record.",
             }
 
@@ -456,6 +459,7 @@ def dispatch_async_delegation(
             )
         return {
             "status": "rejected",
+            "reason": "schedule",
             "error": f"Failed to schedule async delegation: {exc}",
         }
 
@@ -614,6 +618,7 @@ def dispatch_async_delegation_batch(
         if running >= max_async_children:
             return {
                 "status": "rejected",
+                "reason": "capacity",
                 "error": (
                     f"Async delegation capacity reached ({max_async_children} "
                     f"running). Wait for one to finish (its result will re-enter "
@@ -628,6 +633,7 @@ def dispatch_async_delegation_batch(
             if reservation == "capacity":
                 return {
                     "status": "rejected",
+                    "reason": "capacity",
                     "error": (
                         f"Async delegation capacity reached ({max_async_children} "
                         "running across this profile). Wait for one to finish."
@@ -635,6 +641,7 @@ def dispatch_async_delegation_batch(
                 }
             return {
                 "status": "rejected",
+                "reason": "persistence",
                 "error": "Could not persist the background delegation record.",
             }
 
@@ -676,6 +683,7 @@ def dispatch_async_delegation_batch(
             )
         return {
             "status": "rejected",
+            "reason": "schedule",
             "error": f"Failed to schedule async delegation batch: {exc}",
         }
 

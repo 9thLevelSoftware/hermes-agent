@@ -2852,21 +2852,6 @@ def delegate_task(
             if getattr(child, "session_id", None)
         ]
 
-        # Detach every child from the parent's interrupt-propagation list — the
-        # batch's lifecycle is owned by the async registry now, not the parent
-        # turn. _build_child_agent attached them (correct for sync runs).
-        if hasattr(parent_agent, "_active_children"):
-            _ac_lock = getattr(parent_agent, "_active_children_lock", None)
-            for _c in _child_agents:
-                try:
-                    if _ac_lock:
-                        with _ac_lock:
-                            parent_agent._active_children.remove(_c)
-                    else:
-                        parent_agent._active_children.remove(_c)
-                except ValueError:
-                    pass
-
         def _batch_runner():
             return _execute_and_aggregate()
 
@@ -2899,6 +2884,19 @@ def delegate_task(
         )
 
         if dispatch.get("status") == "dispatched":
+            # The async registry now owns cancellation. Detach only after the
+            # durable dispatch is accepted; rejected work remains parent-owned.
+            if hasattr(parent_agent, "_active_children"):
+                _ac_lock = getattr(parent_agent, "_active_children_lock", None)
+                for _c in _child_agents:
+                    try:
+                        if _ac_lock:
+                            with _ac_lock:
+                                parent_agent._active_children.remove(_c)
+                        else:
+                            parent_agent._active_children.remove(_c)
+                    except ValueError:
+                        pass
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -2922,9 +2920,23 @@ def delegate_task(
             }
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        if dispatch.get("reason") != "capacity":
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "mode": "background",
+                    "error": dispatch.get("error", "Background dispatch failed."),
+                    "reason": dispatch.get("reason", "dispatch"),
+                    "note": (
+                        "The background delegation was not started. The child "
+                        "remains attached to the parent for interruption safety."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        # Pool at capacity — keep the parent-owned children attached while the
+        # batch runs synchronously.
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
             "batch synchronously instead.",
