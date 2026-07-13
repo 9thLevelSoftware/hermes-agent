@@ -2349,12 +2349,22 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
 
     from hermes_cli.middleware import run_tool_execution_middleware
+    from model_tools import registry
 
+    operation_metadata = registry.get_operation_metadata(function_name)
+    operation_key = registry.operation_key(
+        function_name,
+        function_args,
+        task_id=effective_task_id or "",
+        tool_call_id=tool_call_id or "",
+    )
     return run_tool_execution_middleware(
         function_name,
         function_args,
         lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
         original_args=function_args,
+        operation_metadata=operation_metadata,
+        operation_key=operation_key,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",
         tool_call_id=tool_call_id or "",

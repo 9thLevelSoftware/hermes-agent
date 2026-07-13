@@ -308,7 +308,7 @@ class ToolRegistry:
             },
             sort_keys=True,
             separators=(",", ":"),
-            ensure_ascii=False,
+            ensure_ascii=True,
             default=str,
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

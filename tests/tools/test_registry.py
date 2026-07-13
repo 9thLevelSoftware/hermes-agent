@@ -70,6 +70,9 @@ class TestRegisterAndDispatch:
         )
 
         assert first == second
+        assert reg.operation_key(
+            "lookup", {"path": "bad\udcffname"}, task_id="task", tool_call_id="call"
+        )
         assert reg.get_operation_metadata("lookup") == {
             "read_only": True,
             "destructive": False,

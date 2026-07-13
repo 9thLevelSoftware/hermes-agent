@@ -3255,6 +3255,8 @@ class TestConcurrentToolExecution:
 
         def execution_middleware(**kwargs):
             seen["middleware_args"] = kwargs["args"]
+            seen["operation_metadata"] = kwargs["operation_metadata"]
+            seen["operation_key"] = kwargs["operation_key"]
             return kwargs["next_call"]({**kwargs["args"], "merge": True})
 
         manager = SimpleNamespace(_middleware={
@@ -3280,6 +3282,18 @@ class TestConcurrentToolExecution:
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         assert seen["middleware_args"] == {"todos": [], "request_rewritten": True}
+        assert seen["operation_metadata"] == {
+            "read_only": False,
+            "destructive": True,
+            "idempotent": False,
+        }
+        from model_tools import registry
+        assert seen["operation_key"] == registry.operation_key(
+            "todo",
+            {"todos": [], "request_rewritten": True},
+            task_id="task-1",
+            tool_call_id="todo-1",
+        )
         mock_todo.assert_called_once_with(todos=[], merge=True, store=agent._todo_store)
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
         assert post_call[1]["tool_name"] == "todo"
