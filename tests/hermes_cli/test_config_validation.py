@@ -1,7 +1,7 @@
 """Tests for config.yaml structure validation (validate_config_structure)."""
 
 
-from hermes_cli.config import validate_config_structure, ConfigIssue
+from hermes_cli.config import _KNOWN_ROOT_KEYS, validate_config_structure, ConfigIssue
 
 
 class TestCustomProvidersValidation:
@@ -205,3 +205,49 @@ class TestConfigIssueDataclass:
         a = ConfigIssue("error", "msg", "hint")
         b = ConfigIssue("error", "msg", "hint")
         assert a == b
+
+
+class TestCodeExecutionValidation:
+    def test_code_execution_is_a_known_root_section(self):
+        assert "code_execution" in _KNOWN_ROOT_KEYS
+
+    def test_valid_code_execution_config_has_no_issues(self):
+        assert validate_config_structure({
+            "code_execution": {
+                "mode": "strict",
+                "persistent": False,
+                "timeout": 300,
+                "max_tool_calls": 50,
+                "kernel_idle_ttl": 900,
+                "max_stdout_bytes": 50_000,
+                "max_stderr_bytes": 10_000,
+                "artifact_dir": "/tmp/hermes-results",
+            },
+        }) == []
+
+    def test_invalid_code_execution_types_and_ranges_are_reported(self):
+        issues = validate_config_structure({
+            "code_execution": {
+                "mode": "banana",
+                "persistent": "yes",
+                "timeout": 0,
+                "max_tool_calls": -1,
+                "kernel_idle_ttl": -2,
+                "max_stdout_bytes": 0,
+                "max_stderr_bytes": True,
+                "artifact_dir": 42,
+            },
+        })
+        messages = "\n".join(issue.message for issue in issues)
+        assert "code_execution.mode" in messages
+        assert "code_execution.persistent" in messages
+        assert "code_execution.timeout" in messages
+        assert "code_execution.max_tool_calls" in messages
+        assert "code_execution.kernel_idle_ttl" in messages
+        assert "code_execution.max_stdout_bytes" in messages
+        assert "code_execution.max_stderr_bytes" in messages
+        assert "code_execution.artifact_dir" in messages
+
+    def test_code_execution_must_be_a_mapping(self):
+        issues = validate_config_structure({"code_execution": []})
+        assert any("code_execution must be a mapping" in issue.message for issue in issues)

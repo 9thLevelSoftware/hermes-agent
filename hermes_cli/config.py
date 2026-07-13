@@ -2781,6 +2781,16 @@ DEFAULT_CONFIG = {
         # Env scrubbing (strips *_API_KEY, *_TOKEN, *_SECRET, ...) and the
         # tool whitelist apply identically in both modes.
         "mode": "project",
+        # Fresh-process execution remains the default. Set true to make calls
+        # that omit the persistent argument reuse a task-scoped kernel.
+        "persistent": False,
+        "kernel_idle_ttl": 15 * 60,
+        "timeout": 300,
+        "max_tool_calls": 50,
+        "max_stdout_bytes": 50_000,
+        "max_stderr_bytes": 10_000,
+        # Durable spill files (already-redacted) are written here.
+        "artifact_dir": "/tmp/hermes-results",
     },
 
     # Tool Search (progressive disclosure for large tool surfaces).
@@ -5225,7 +5235,7 @@ def check_config_version() -> Tuple[int, int]:
 _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
-    "agent", "terminal", "display", "compression", "delegation",
+    "agent", "terminal", "code_execution", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
     "sessions", "streaming", "updates", "mcp_servers",
 }
@@ -5268,6 +5278,63 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    # ── code_execution nested settings ───────────────────────────────────
+    code_execution = config.get("code_execution")
+    if code_execution is not None:
+        if not isinstance(code_execution, dict):
+            issues.append(ConfigIssue(
+                "error",
+                f"code_execution must be a mapping, got {type(code_execution).__name__}",
+                "Use code_execution: with mode, limits, and artifact_dir underneath it",
+            ))
+        else:
+            mode = code_execution.get("mode")
+            if "mode" in code_execution and (
+                not isinstance(mode, str) or mode.strip().lower() not in {"project", "strict"}
+            ):
+                issues.append(ConfigIssue(
+                    "error",
+                    "code_execution.mode must be 'project' or 'strict'",
+                    "Set mode: project (default) or mode: strict",
+                ))
+
+            persistent = code_execution.get("persistent")
+            if "persistent" in code_execution and not isinstance(persistent, bool):
+                issues.append(ConfigIssue(
+                    "error",
+                    "code_execution.persistent must be a boolean",
+                    "Set persistent: false (default) or persistent: true",
+                ))
+
+            numeric_fields = {
+                "timeout": ((int, float), 0),
+                "max_tool_calls": (int, 0),
+                "kernel_idle_ttl": ((int, float), 0),
+                "max_stdout_bytes": (int, 0),
+                "max_stderr_bytes": (int, 0),
+            }
+            for field, (field_types, minimum) in numeric_fields.items():
+                if field not in code_execution:
+                    continue
+                value = code_execution[field]
+                valid_type = isinstance(value, field_types) and not isinstance(value, bool)
+                if not valid_type or value <= minimum:
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"code_execution.{field} must be a number greater than {minimum}",
+                        f"Set code_execution.{field} to a positive value",
+                    ))
+
+            artifact_dir = code_execution.get("artifact_dir")
+            if "artifact_dir" in code_execution and (
+                not isinstance(artifact_dir, str) or not artifact_dir.strip()
+            ):
+                issues.append(ConfigIssue(
+                    "error",
+                    "code_execution.artifact_dir must be a non-empty string",
+                    "Set it to an absolute directory for redacted spill artifacts",
+                ))
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")

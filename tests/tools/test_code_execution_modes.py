@@ -15,11 +15,14 @@ there is no env-var override. Tests patch ``_load_config`` directly.
 import json
 import os
 import sys
+import tempfile
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 os.environ["TERMINAL_ENV"] = "local"
 
@@ -30,6 +33,7 @@ def _force_local_terminal(monkeypatch):
     monkeypatch.setenv("TERMINAL_ENV", "local")
 
 
+from tools import code_execution_tool
 from tools.code_execution_tool import (
     SANDBOX_ALLOWED_TOOLS,
     DEFAULT_EXECUTION_MODE,
@@ -108,6 +112,22 @@ class TestGetExecutionMode(unittest.TestCase):
     def test_execution_modes_tuple(self):
         """Canonical set of modes — tests + config layer rely on this shape."""
         self.assertEqual(set(EXECUTION_MODES), {"project", "strict"})
+
+    def test_temp_hermes_home_config_controls_mode_and_limits(self):
+        with tempfile.TemporaryDirectory() as home:
+            config_path = Path(home) / "config.yaml"
+            config_path.write_text(yaml.safe_dump({
+                "code_execution": {
+                    "mode": "strict",
+                    "max_stdout_bytes": 123,
+                    "artifact_dir": str(Path(home) / "artifacts"),
+                },
+            }), encoding="utf-8")
+            with patch.dict(os.environ, {"HERMES_HOME": home}, clear=False):
+                os.environ.pop("HERMES_CONFIG", None)
+                self.assertEqual(_get_execution_mode(), "strict")
+                self.assertEqual(code_execution_tool._load_config()["max_stdout_bytes"], 123)
+                self.assertIn("123 byte stdout cap", build_execute_code_schema()["description"])
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,8 @@ import threading
 import unittest
 from unittest.mock import patch, MagicMock
 
+import yaml
+
 from tools import code_execution_tool
 from tools.code_execution_tool import (
     SANDBOX_ALLOWED_TOOLS,
@@ -1357,6 +1359,36 @@ class TestInterruptHandling(unittest.TestCase):
         finally:
             set_interrupt(False, main_tid)
             t.join(timeout=3)
+
+
+def test_temp_home_config_controls_output_limit_and_artifact_directory():
+    with tempfile.TemporaryDirectory() as home:
+        artifact_dir = Path(home) / "artifacts"
+        (Path(home) / "config.yaml").write_text(yaml.safe_dump({
+            "code_execution": {
+                "mode": "strict",
+                "max_stdout_bytes": 80,
+                "max_stderr_bytes": 40,
+                "artifact_dir": str(artifact_dir),
+            },
+        }), encoding="utf-8")
+        with patch.dict(os.environ, {"HERMES_HOME": home}, clear=False):
+            os.environ.pop("HERMES_CONFIG", None)
+            with patch("model_tools.handle_function_call", side_effect=_mock_handle_function_call):
+                result = json.loads(execute_code(
+                    "print('HEAD')\nprint('x' * 200)\nprint('TAIL')",
+                    task_id="config-e2e",
+                    enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+                ))
+
+            artifact_path = Path(result["artifact_path"])
+            assert artifact_path.parent == artifact_dir
+            assert artifact_path.read_text(encoding="utf-8").startswith("HEAD")
+
+    assert result["status"] == "success"
+    assert "HEAD" in result["output"]
+    assert "TAIL" in result["output"]
+    assert "TRUNCATED" in result["output"]
 
 
 class TestHeadTailTruncation(unittest.TestCase):

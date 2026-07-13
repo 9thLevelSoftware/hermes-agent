@@ -333,6 +333,7 @@ DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
+DEFAULT_ARTIFACT_DIR = "/tmp/hermes-results"
 
 _IMAGE_SUFFIXES = frozenset({
     ".bmp", ".gif", ".heic", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp",
@@ -424,13 +425,18 @@ def _image_parts_from_output(output: str) -> list[dict]:
 
 
 def _artifact_storage_dir() -> str:
-    """Return the existing durable tool-result directory."""
-    # ponytail: reuse the existing result store; no new retention/config layer.
+    """Return the configured durable tool-result directory."""
     try:
         from tools.tool_result_storage import STORAGE_DIR
-        directory = STORAGE_DIR
+        default_dir = STORAGE_DIR
     except Exception:
-        directory = os.path.join(tempfile.gettempdir(), "hermes-results")
+        default_dir = DEFAULT_ARTIFACT_DIR
+    try:
+        configured = _load_config().get("artifact_dir", default_dir)
+    except Exception:
+        configured = default_dir
+    directory = configured if isinstance(configured, str) and configured.strip() else default_dir
+    directory = os.path.abspath(os.path.expanduser(directory))
     os.makedirs(directory, mode=0o700, exist_ok=True)
     return directory
 
@@ -1721,8 +1727,9 @@ def _execute_remote(
     """
 
     _cfg = _load_config()
-    timeout = timeout if timeout is not None else _cfg.get("timeout", DEFAULT_TIMEOUT)
-    max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+    timeout = timeout if timeout is not None else _config_number(_cfg, "timeout", DEFAULT_TIMEOUT)
+    max_tool_calls = _config_number(_cfg, "max_tool_calls", DEFAULT_MAX_TOOL_CALLS, integer=True)
+    max_stdout_bytes = _config_number(_cfg, "max_stdout_bytes", MAX_STDOUT_BYTES, integer=True)
     context = context or CodeExecutionContext(task_id, None, (), ())
 
     requested_tools = SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())
@@ -1853,7 +1860,7 @@ def _execute_remote(
 
     # --- Post-process output (same as local path) ---
     stdout_text, stdout_artifact_path, stdout_image_parts = _prepare_execute_output(
-        stdout_text, MAX_STDOUT_BYTES,
+        stdout_text, max_stdout_bytes,
     )
 
     # Build response
@@ -2011,6 +2018,9 @@ class ExecutionKernel:
         context: CodeExecutionContext,
         *,
         idle_ttl: float = DEFAULT_KERNEL_IDLE_TTL,
+        max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
+        max_stdout_bytes: int = MAX_STDOUT_BYTES,
+        max_stderr_bytes: int = MAX_STDERR_BYTES,
         clock=time.monotonic,
     ):
         self.task_id = task_id
@@ -2018,6 +2028,9 @@ class ExecutionKernel:
         self.sandbox_tools = frozenset(sandbox_tools)
         self.context = context
         self.idle_ttl = float(idle_ttl)
+        self.max_tool_calls = max_tool_calls
+        self.max_stdout_bytes = max_stdout_bytes
+        self.max_stderr_bytes = max_stderr_bytes
         self.clock = clock
         self.last_activity = clock()
         self.process = None
@@ -2060,7 +2073,7 @@ class ExecutionKernel:
                 target=propagate_context_to_thread(_rpc_server_loop),
                 args=(
                     self._rpc_server, self.task_id, self._tool_call_log,
-                    self._tool_call_counter, DEFAULT_MAX_TOOL_CALLS,
+                    self._tool_call_counter, self.max_tool_calls,
                     self.sandbox_tools, self._stop_event, rpc_token, self.context,
                 ),
                 daemon=True,
@@ -2154,8 +2167,8 @@ class ExecutionKernel:
                     "duration_seconds": 0,
                 }
 
-            stdout = _clean_kernel_output(response.get("stdout", ""), MAX_STDOUT_BYTES)
-            stderr = _clean_kernel_output(response.get("stderr", ""), MAX_STDERR_BYTES)
+            stdout = _clean_kernel_output(response.get("stdout", ""), self.max_stdout_bytes)
+            stderr = _clean_kernel_output(response.get("stderr", ""), self.max_stderr_bytes)
             result = {
                 "status": response.get("status", "error"),
                 "output": stdout,
@@ -2242,7 +2255,18 @@ class ExecutionKernelRegistry:
                 return None
             return kernel
 
-    def get_or_create(self, task_id, kernel_id, sandbox_tools, context, *, idle_ttl=None):
+    def get_or_create(
+        self,
+        task_id,
+        kernel_id,
+        sandbox_tools,
+        context,
+        *,
+        idle_ttl=None,
+        max_tool_calls=DEFAULT_MAX_TOOL_CALLS,
+        max_stdout_bytes=MAX_STDOUT_BYTES,
+        max_stderr_bytes=MAX_STDERR_BYTES,
+    ):
         self.cleanup_expired()
         key = self._key(task_id, kernel_id)
         with self._lock:
@@ -2254,6 +2278,9 @@ class ExecutionKernelRegistry:
             kernel = ExecutionKernel(
                 key[0], key[1], sandbox_tools, context,
                 idle_ttl=self.idle_ttl if idle_ttl is None else idle_ttl,
+                max_tool_calls=max_tool_calls,
+                max_stdout_bytes=max_stdout_bytes,
+                max_stderr_bytes=max_stderr_bytes,
                 clock=self.clock,
             )
             self._kernels[key] = kernel
@@ -2359,7 +2386,7 @@ def execute_code(
     session_id: Optional[str] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
-    persistent: bool = False,
+    persistent: Optional[bool] = None,
     kernel_id: Optional[str] = None,
     session: Optional[str] = None,
     reset: bool = False,
@@ -2393,6 +2420,9 @@ def execute_code(
                      "Use normal tool calls (terminal, read_file, write_file, ...) instead."
         })
 
+    _cfg = _load_config()
+    if persistent is None:
+        persistent = _cfg.get("persistent") is True
     persistent_requested = bool(persistent or session or kernel_id)
     selected_kernel_id = str(kernel_id or session or "default")
     if reset:
@@ -2469,8 +2499,16 @@ def execute_code(
                 "tool_calls_made": 0,
                 "duration_seconds": 0,
             })
-        cfg = _load_config()
-        kernel_timeout = timeout if timeout is not None else cfg.get("timeout", DEFAULT_TIMEOUT)
+        cfg = _cfg
+        kernel_timeout = timeout if timeout is not None else _config_number(cfg, "timeout", DEFAULT_TIMEOUT)
+        max_tool_calls = _config_number(cfg, "max_tool_calls", DEFAULT_MAX_TOOL_CALLS, integer=True)
+        max_stdout_bytes = _config_number(cfg, "max_stdout_bytes", MAX_STDOUT_BYTES, integer=True)
+        max_stderr_bytes = _config_number(cfg, "max_stderr_bytes", MAX_STDERR_BYTES, integer=True)
+        configured_idle_ttl = (
+            _config_number(cfg, "kernel_idle_ttl", DEFAULT_KERNEL_IDLE_TTL)
+            if "kernel_idle_ttl" in cfg
+            else None
+        )
         requested_tools = SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())
         if not requested_tools:
             requested_tools = SANDBOX_ALLOWED_TOOLS
@@ -2481,7 +2519,16 @@ def execute_code(
                 selected_kernel_id,
                 sandbox_tools,
                 context,
-                idle_ttl=kernel_idle_ttl if kernel_idle_ttl is not None else idle_ttl,
+                idle_ttl=(
+                    kernel_idle_ttl
+                    if kernel_idle_ttl is not None
+                    else idle_ttl
+                    if idle_ttl is not None
+                    else configured_idle_ttl
+                ),
+                max_tool_calls=max_tool_calls,
+                max_stdout_bytes=max_stdout_bytes,
+                max_stderr_bytes=max_stderr_bytes,
             )
             kernel_expired = _kernel_registry.consume_expired(task_id, selected_kernel_id)
             result = kernel.execute(code, kernel_timeout)
@@ -2517,9 +2564,10 @@ def execute_code(
     from tools.interrupt import is_interrupted as _is_interrupted
 
     # Resolve config
-    _cfg = _load_config()
-    timeout = timeout if timeout is not None else _cfg.get("timeout", DEFAULT_TIMEOUT)
-    max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
+    timeout = timeout if timeout is not None else _config_number(_cfg, "timeout", DEFAULT_TIMEOUT)
+    max_tool_calls = _config_number(_cfg, "max_tool_calls", DEFAULT_MAX_TOOL_CALLS, integer=True)
+    max_stdout_bytes = _config_number(_cfg, "max_stdout_bytes", MAX_STDOUT_BYTES, integer=True)
+    max_stderr_bytes = _config_number(_cfg, "max_stderr_bytes", MAX_STDERR_BYTES, integer=True)
 
     # Determine which tools the sandbox can call
     requested_tools = SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())
@@ -2726,7 +2774,7 @@ def execute_code(
             target=_drain_full, args=(proc.stdout, stdout_full_chunks), daemon=True,
         )
         stderr_reader = threading.Thread(
-            target=_drain, args=(proc.stderr, stderr_chunks, MAX_STDERR_BYTES), daemon=True
+            target=_drain, args=(proc.stderr, stderr_chunks, max_stderr_bytes), daemon=True
         )
         stdout_reader.start()
         stderr_reader.start()
@@ -2773,7 +2821,7 @@ def execute_code(
             b"".join(stderr_chunks).decode("utf-8", errors="replace")
         )
         stdout_text, stdout_artifact_path, stdout_image_parts = _prepare_execute_output(
-            stdout_full, MAX_STDOUT_BYTES,
+            stdout_full, max_stdout_bytes,
         )
 
         exit_code = proc.returncode if proc.returncode is not None else -1
@@ -2818,7 +2866,7 @@ def execute_code(
             if stderr_text:
                 result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
 
-        artifact_images, artifact_file = _collect_local_artifacts(artifact_dir, MAX_STDOUT_BYTES)
+        artifact_images, artifact_file = _collect_local_artifacts(artifact_dir, max_stdout_bytes)
         ephemeral_prefix = Path(artifact_dir).resolve().as_uri().rstrip("/") + "/"
         stdout_image_parts = [
             part for part in stdout_image_parts
@@ -2933,6 +2981,16 @@ def _load_config() -> dict:
         return cfg if isinstance(cfg, dict) else {}
     except Exception:
         return {}
+
+
+def _config_number(config: dict, key: str, default, *, integer: bool = False) -> Any:
+    """Read a positive code_execution number without trusting raw YAML."""
+    value = config.get(key, default)
+    valid_type = isinstance(value, int if integer else (int, float))
+    if isinstance(value, bool) or not valid_type or value <= 0:
+        logger.warning("Ignoring invalid code_execution.%s=%r; using %r", key, value, default)
+        return default
+    return int(value) if integer else value
 
 
 # ---------------------------------------------------------------------------
@@ -3108,6 +3166,12 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         enabled_sandbox_tools = SANDBOX_ALLOWED_TOOLS
     if mode is None:
         mode = _get_execution_mode()
+    config = _load_config()
+    timeout_limit = _config_number(config, "timeout", DEFAULT_TIMEOUT)
+    max_tool_calls = _config_number(config, "max_tool_calls", DEFAULT_MAX_TOOL_CALLS, integer=True)
+    max_stdout_bytes = _config_number(config, "max_stdout_bytes", MAX_STDOUT_BYTES, integer=True)
+    timeout_label = "5-minute timeout" if timeout_limit == DEFAULT_TIMEOUT else f"{timeout_limit:g}-second timeout"
+    stdout_label = "50KB stdout cap" if max_stdout_bytes == MAX_STDOUT_BYTES else f"{max_stdout_bytes:,} byte stdout cap"
 
     # Build tool documentation lines for only the enabled tools
     tool_lines = "\n".join(
@@ -3148,7 +3212,8 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "or the task requires interactive user input.\n\n"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
-        "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
+        f"Limits: {timeout_label}, {stdout_label}, "
+        f"max {max_tool_calls} tool calls per script. "
         "terminal() is foreground-only (no background or pty).\n\n"
         f"{cwd_note}\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
@@ -3222,7 +3287,7 @@ registry.register(
         session_id=kw.get("session_id"),
         enabled_toolsets=kw.get("enabled_toolsets"),
         disabled_toolsets=kw.get("disabled_toolsets"),
-        persistent=args.get("persistent", False),
+        persistent=args.get("persistent"),
         kernel_id=args.get("kernel_id"),
         session=args.get("session"),
         reset=args.get("reset", False),

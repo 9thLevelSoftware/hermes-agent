@@ -59,6 +59,36 @@ def test_persistent_kernel_preserves_state_and_fresh_calls_do_not():
     assert "NameError" in fresh_second["output"]
 
 
+def test_config_persistent_default_is_opt_in_without_overriding_explicit_false(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(
+        "code_execution:\n  persistent: true\n  kernel_idle_ttl: 900\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_CONFIG", raising=False)
+    try:
+        first = json.loads(execute_code(
+            "counter = 41", task_id="kernel-config", enabled_tools=[], kernel_id="configured",
+        ))
+        second = json.loads(execute_code(
+            "print(counter + 1)", task_id="kernel-config", enabled_tools=[], kernel_id="configured",
+        ))
+        fresh_first = json.loads(execute_code(
+            "counter = 41", task_id="kernel-config-fresh", enabled_tools=[], persistent=False,
+        ))
+        fresh_second = json.loads(execute_code(
+            "print(counter + 1)", task_id="kernel-config-fresh", enabled_tools=[], persistent=False,
+        ))
+    finally:
+        cleanup_execution_kernels("kernel-config")
+        cleanup_execution_kernels("kernel-config-fresh")
+
+    assert first["persistent"] is True
+    assert second["output"].strip() == "42"
+    assert fresh_first["status"] == "success"
+    assert fresh_second["status"] == "error"
+
+
 def test_persistent_kernel_reuses_existing_tool_rpc_channel():
     with patch(
         "model_tools.handle_function_call",

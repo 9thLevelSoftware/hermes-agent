@@ -223,6 +223,21 @@ terminal:
   # sudo_password: "hunter2"  # Optional: pipe a sudo password via sudo -S. SECURITY WARNING: plaintext.
   # sudo_password: ""         # Explicit empty password: try empty and never open the interactive sudo prompt.
 
+# =============================================================================
+# Code Execution Tool Configuration
+# =============================================================================
+# execute_code runs Python scripts with RPC access to the enabled Hermes tools.
+# Fresh processes are the default; persistent kernels are opt-in.
+code_execution:
+  mode: "project"             # project (default) or strict
+  persistent: false            # default for calls that omit persistent=true
+  kernel_idle_ttl: 900         # seconds before an idle persistent kernel is reaped
+  timeout: 300                 # seconds per script
+  max_tool_calls: 50           # RPC calls per script
+  max_stdout_bytes: 50000      # returned stdout cap; oversized text is spilled
+  max_stderr_bytes: 10000      # returned stderr cap
+  artifact_dir: "/tmp/hermes-results"  # redacted durable spill files
+
 # -----------------------------------------------------------------------------
 # OPTION 2: SSH remote execution
 # Commands run on a remote server - agent code stays local (sandboxed)
