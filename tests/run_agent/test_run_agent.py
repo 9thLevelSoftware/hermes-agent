@@ -3301,10 +3301,6 @@ class TestConcurrentToolExecution:
         assert post_call[1]["middleware_trace"] == [{"source": "request-test"}]
 
     def test_sequential_registry_tool_executes_middleware_once(self, agent, monkeypatch):
-        tool_call = _mock_tool_call(
-            name="web_search", arguments='{"query":"test"}', call_id="web-1"
-        )
-        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
         seen_keys = []
 
         def execution_middleware(**kwargs):
@@ -3327,9 +3323,14 @@ class TestConcurrentToolExecution:
             "model_tools.registry.dispatch", lambda *args, **kwargs: '{"ok":true}'
         )
 
-        messages = []
-        agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+        result = agent._invoke_tool(
+            "web_search",
+            {"query": "test"},
+            "task-1",
+            tool_call_id="web-1",
+        )
 
+        assert result == '{"ok":true}'
         assert len(seen_keys) == 1
         assert seen_keys[0]
 
