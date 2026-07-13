@@ -344,6 +344,21 @@ class MemoryStore:
         filename = "USER.md" if target == "user" else "MEMORY.md"
         return get_memory_dir() / "archive" / filename
 
+    def _archive_oldest_to_limit(
+        self, target: str, entries: List[str], limit: int
+    ) -> tuple[List[str], List[str]]:
+        """Return a fitting active list and losslessly persist archived entries."""
+        working = list(entries)
+        archived: List[str] = []
+        while len(working) > 1 and len(ENTRY_DELIMITER.join(working)) > limit:
+            archived.append(working.pop(0))
+        if len(ENTRY_DELIMITER.join(working)) > limit or not archived:
+            return entries, []
+        archive_path = self._archive_path(target)
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_file(archive_path, self._read_file(archive_path) + archived)
+        return working, archived
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -371,25 +386,23 @@ class MemoryStore:
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
 
-            # Calculate what the new total would be
+            # Calculate what the new total would be.
             new_entries = entries + [content]
+            archived: List[str] = []
+            if (
+                len(ENTRY_DELIMITER.join(new_entries)) > limit
+                and self.archive_on_overflow
+            ):
+                # Rotation changes the active file, so re-enable the drift guard
+                # that append-only adds intentionally skip.
+                bak = self._detect_external_drift(target)
+                if bak:
+                    return _drift_error(self._path_for(target), bak)
+                new_entries, archived = self._archive_oldest_to_limit(
+                    target, new_entries, limit
+                )
+
             new_total = len(ENTRY_DELIMITER.join(new_entries))
-            archived_entries = 0
-
-            if new_total > limit and self.archive_on_overflow and len(content) <= limit:
-                working = list(entries)
-                archived: List[str] = []
-                while working and len(ENTRY_DELIMITER.join(working + [content])) > limit:
-                    archived.append(working.pop(0))
-                if len(ENTRY_DELIMITER.join(working + [content])) <= limit:
-                    archive_path = self._archive_path(target)
-                    archive_path.parent.mkdir(parents=True, exist_ok=True)
-                    prior_archive = self._read_file(archive_path)
-                    self._write_file(archive_path, prior_archive + archived)
-                    entries = working
-                    archived_entries = len(archived)
-                    new_total = len(ENTRY_DELIMITER.join(entries + [content]))
-
             if new_total > limit:
                 current = self._char_count(target)
                 return self._consolidation_failure({
@@ -405,13 +418,12 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 })
 
-            entries.append(content)
-            self._set_entries(target, entries)
+            self._set_entries(target, new_entries)
             self.save_to_disk(target)
 
         response = self._success_response(target, "Entry added.")
-        if archived_entries:
-            response["archived_entries"] = archived_entries
+        if archived:
+            response["archived_entries"] = len(archived)
             response["archive_path"] = str(self._archive_path(target))
         return response
 
@@ -611,7 +623,13 @@ class MemoryStore:
                     )
 
             # Budget check against the FINAL state only.
+            archived: List[str] = []
             new_total = len(ENTRY_DELIMITER.join(working)) if working else 0
+            if new_total > limit and self.archive_on_overflow:
+                working, archived = self._archive_oldest_to_limit(
+                    target, working, limit
+                )
+                new_total = len(ENTRY_DELIMITER.join(working)) if working else 0
             if new_total > limit:
                 current = self._char_count(target)
                 return self._consolidation_failure({
@@ -629,7 +647,13 @@ class MemoryStore:
             self._set_entries(target, working)
             self.save_to_disk(target)
 
-        return self._success_response(target, f"Applied {len(operations)} operation(s).")
+        response = self._success_response(
+            target, f"Applied {len(operations)} operation(s)."
+        )
+        if archived:
+            response["archived_entries"] = len(archived)
+            response["archive_path"] = str(self._archive_path(target))
+        return response
 
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
         """Build a batch-abort error that reports live (uncommitted) state."""
