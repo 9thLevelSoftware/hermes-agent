@@ -164,6 +164,20 @@ def _register_capturing_resolver(session_key: str, result):
     return seen
 
 
+def _latest_pending_for_session(session_key: str) -> dict:
+    with A._lock:
+        request_id = next(
+            (
+                request_id
+                for request_id in reversed(A._pending_by_session.get(session_key, []))
+                if request_id in A._pending
+            ),
+            None,
+        )
+        assert request_id is not None
+        return dict(A._pending[request_id])
+
+
 def test_guard_isolated_backend_approved():
     # Container backends already sandbox the child — no-op approve.
     assert A.check_execute_code_guard("import os", "docker")["approved"] is True
@@ -401,8 +415,7 @@ def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkey
     assert result["status"] == "pending_approval"
     assert result["smart_denied"] is True
     assert result["allow_permanent"] is False
-    with A._lock:
-        pending = dict(A._pending[gw_session])
+    pending = _latest_pending_for_session(gw_session)
     assert pending["smart_denied"] is True
     assert pending["allow_permanent"] is False
 
@@ -416,8 +429,7 @@ def test_execute_code_smart_deny_pending_payload_is_one_operation(gw_session, mo
     assert result["status"] == "pending_approval"
     assert result["smart_denied"] is True
     assert result["allow_permanent"] is False
-    with A._lock:
-        pending = dict(A._pending[gw_session])
+    pending = _latest_pending_for_session(gw_session)
     assert pending["smart_denied"] is True
     assert pending["allow_permanent"] is False
 
