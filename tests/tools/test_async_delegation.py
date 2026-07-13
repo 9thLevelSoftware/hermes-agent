@@ -614,13 +614,17 @@ def test_delegate_task_persistence_rejection_releases_unstarted_child(monkeypatc
     parent = MagicMock()
     parent._delegate_depth = 0
     parent.session_id = "sess"
+    parent._current_turn_id = "turn-1"
     parent._interrupt_requested = False
     parent._active_children = []
     parent._active_children_lock = None
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
+    fake_child._subagent_id = "s1"
+    fake_child._delegate_progress_callback = MagicMock()
     fake_child.session_id = "child-session-1"
     child_ran = False
+    stop_hook = MagicMock()
 
     def build_child(**kwargs):
         parent._active_children.append(fake_child)
@@ -638,6 +642,7 @@ def test_delegate_task_persistence_rejection_releases_unstarted_child(monkeypatc
     monkeypatch.setattr(dt, "_build_child_agent", build_child)
     monkeypatch.setattr(dt, "_run_single_child", run_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", stop_hook)
     monkeypatch.setattr(
         ad,
         "dispatch_async_delegation_batch",
@@ -657,6 +662,12 @@ def test_delegate_task_persistence_rejection_releases_unstarted_child(monkeypatc
     assert child_ran is False
     assert fake_child not in parent._active_children
     fake_child.close.assert_called_once_with()
+    completion_call = fake_child._delegate_progress_callback.call_args
+    assert completion_call.args[0] == "subagent.complete"
+    assert completion_call.kwargs["status"] == "failed"
+    stop_call = stop_hook.call_args
+    assert stop_call.args[0] == "subagent_stop"
+    assert stop_call.kwargs["child_status"] == "error"
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
