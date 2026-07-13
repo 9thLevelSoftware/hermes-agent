@@ -3,6 +3,7 @@
 Based on PR #1085 by ismoilh (salvaged).
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -190,6 +191,16 @@ class TestCheckSensitivePathMacOSBypass:
     def test_boot_still_blocked(self):
         from tools.file_tools import _check_sensitive_path
         assert _check_sensitive_path("/boot/grub/grub.cfg") is not None
+
+    def test_approval_state_file_blocked(self):
+        from hermes_constants import get_hermes_home
+        from tools.file_tools import _check_sensitive_path, write_file_tool
+
+        path = get_hermes_home() / "approval_requests.json"
+        assert _check_sensitive_path(str(path)) is not None
+        result = json.loads(write_file_tool(str(path), '{"requests": []}'))
+        assert "error" in result
+        assert "approval state" in result["error"].lower()
 
     def test_safe_path_allowed(self):
         from tools.file_tools import _check_sensitive_path

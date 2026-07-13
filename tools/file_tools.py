@@ -686,6 +686,22 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
         )
+    # Persisted approval outcomes are security policy state. If an agent could
+    # write this file directly it could forge a resolved request and bypass the
+    # terminal approval gate after the next lazy load.
+    try:
+        from hermes_constants import get_hermes_home
+
+        approval_state = str(
+            (get_hermes_home() / "approval_requests.json").resolve()
+        )
+    except Exception:
+        approval_state = ""
+    if approval_state and (resolved == approval_state or normalized == approval_state):
+        return (
+            f"Refusing to write to Hermes approval state: {filepath}\n"
+            "Agent cannot modify persisted security decisions."
+        )
     return None
 
 

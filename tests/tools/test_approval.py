@@ -586,6 +586,28 @@ class TestTeePattern:
         assert key is None
 
 
+class TestHermesApprovalStateWriteProtection:
+    def test_terminal_writes_require_approval(self):
+        commands = [
+            "echo '{\"requests\":[]}' > ~/.hermes/approval_requests.json",
+            "echo x | tee $HERMES_HOME/approval_requests.json",
+            "cp /tmp/forged.json ~/.hermes/approval_requests.json",
+            "sed -i 's/pending/resolved/' ~/.hermes/approval_requests.json",
+            "perl -i -pe 's/pending/resolved/' ~/.hermes/approval_requests.json",
+        ]
+        for command in commands:
+            dangerous, key, desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+            assert key is not None
+
+    def test_absolute_active_home_write_requires_approval(self):
+        state_path = get_hermes_home() / "approval_requests.json"
+        dangerous, key, desc = detect_dangerous_command(
+            f"echo forged > {state_path}"
+        )
+        assert dangerous is True
+
+
 class TestHermesConfigWriteProtection:
     """Terminal-side pairing for the file_tools write_file/patch deny on
     ~/.hermes/config.yaml (#14639). config.yaml IS the security policy
