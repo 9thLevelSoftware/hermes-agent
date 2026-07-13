@@ -3255,6 +3255,8 @@ class TestConcurrentToolExecution:
 
         def execution_middleware(**kwargs):
             seen["middleware_args"] = kwargs["args"]
+            seen["operation_metadata"] = kwargs["operation_metadata"]
+            seen["operation_key"] = kwargs["operation_key"]
             return kwargs["next_call"]({**kwargs["args"], "merge": True})
 
         manager = SimpleNamespace(_middleware={
@@ -3280,11 +3282,57 @@ class TestConcurrentToolExecution:
             agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
 
         assert seen["middleware_args"] == {"todos": [], "request_rewritten": True}
+        assert seen["operation_metadata"] == {
+            "read_only": False,
+            "destructive": True,
+            "idempotent": False,
+        }
+        from model_tools import registry
+        assert seen["operation_key"] == registry.operation_key(
+            "todo",
+            {"todos": [], "request_rewritten": True},
+            task_id="task-1",
+            tool_call_id="todo-1",
+        )
         mock_todo.assert_called_once_with(todos=[], merge=True, store=agent._todo_store)
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
         assert post_call[1]["tool_name"] == "todo"
         assert post_call[1]["args"] == {"todos": [], "request_rewritten": True, "merge": True}
         assert post_call[1]["middleware_trace"] == [{"source": "request-test"}]
+
+    def test_sequential_registry_tool_executes_middleware_once(self, agent, monkeypatch):
+        seen_keys = []
+
+        def execution_middleware(**kwargs):
+            seen_keys.append(kwargs["operation_key"])
+            return kwargs["next_call"]()
+
+        manager = SimpleNamespace(_middleware={
+            "tool_request": [],
+            "tool_execution": [execution_middleware],
+        })
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", lambda *args, **kwargs: [])
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *args, **kwargs: [])
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch", lambda *args, **kwargs: '{"ok":true}'
+        )
+
+        result = agent._invoke_tool(
+            "web_search",
+            {"query": "test"},
+            "task-1",
+            tool_call_id="web-1",
+        )
+
+        assert result == '{"ok":true}'
+        assert len(seen_keys) == 1
+        assert seen_keys[0]
 
     def test_concurrent_agent_level_tool_preserves_request_middleware_trace(self, agent, monkeypatch):
         tool_call = _mock_tool_call(name="todo", arguments='{"todos":[]}', call_id="todo-1")

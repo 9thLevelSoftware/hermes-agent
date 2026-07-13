@@ -11,6 +11,7 @@ from model_tools import (
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
+    registry,
 )
 
 
@@ -161,6 +162,8 @@ class TestHandleFunctionCall:
 
         def execution_middleware(**kwargs):
             seen["execution_args"] = kwargs["args"]
+            seen["operation_metadata"] = kwargs["operation_metadata"]
+            seen["operation_key"] = kwargs["operation_key"]
             return kwargs["next_call"]({**kwargs["args"], "wrapped": True})
 
         def fake_dispatch(tool_name, args, **kwargs):
@@ -193,6 +196,17 @@ class TestHandleFunctionCall:
         )
 
         assert seen["execution_args"] == {"q": "test", "rewritten": True}
+        assert seen["operation_metadata"] == {
+            "read_only": True,
+            "destructive": False,
+            "idempotent": True,
+        }
+        assert seen["operation_key"] == registry.operation_key(
+            "web_search",
+            {"q": "test", "rewritten": True},
+            task_id="task-1",
+            tool_call_id="tool-1",
+        )
         assert seen["dispatch"][1] == {"q": "test", "rewritten": True, "wrapped": True}
         assert result["args"] == {"q": "test", "rewritten": True, "wrapped": True}
         expected_trace = [{"source": "test-middleware", "reason": "rewrite"}]
@@ -200,6 +214,30 @@ class TestHandleFunctionCall:
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
         assert pre_call[1]["middleware_trace"] == expected_trace
         assert post_call[1]["middleware_trace"] == expected_trace
+
+    def test_no_execution_middleware_does_not_hash_arguments(self, monkeypatch):
+        manager = type("Manager", (), {"_middleware": {"tool_execution": []}})()
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(
+            registry,
+            "operation_key",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("operation key should stay lazy")
+            ),
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *args, **kwargs: '{"ok":true}',
+        )
+
+        result = handle_function_call(
+            "web_search",
+            {"q": "x" * 100_000},
+            task_id="task-1",
+            skip_pre_tool_call_hook=True,
+        )
+
+        assert result == '{"ok":true}'
 
 
 # =========================================================================

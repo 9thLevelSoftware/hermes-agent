@@ -1220,6 +1220,8 @@ registry.register(
     requires_env=_web_requires_env(),
     emoji="🔍",
     max_result_size_chars=100_000,
+    read_only=True,
+    idempotent=True,
 )
 registry.register(
     name="web_extract",
@@ -1235,4 +1237,6 @@ registry.register(
     is_async=True,
     emoji="📄",
     max_result_size_chars=100_000,
+    read_only=True,
+    idempotent=True,
 )
