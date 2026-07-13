@@ -5,6 +5,8 @@ onto the shared process_registry.completion_queue, the rich re-injection block
 formatting, capacity rejection, and crash handling.
 """
 
+import json
+import os
 import queue
 import threading
 import time
@@ -89,6 +91,279 @@ def test_async_executor_workers_are_daemon_threads():
     assert worker.daemon is True
     gate.set()
     assert _drain_one() is not None
+
+
+def test_running_record_recovers_as_interrupted_after_restart(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    persisted = {
+        "delegation_id": "deleg_restart",
+        "owner_pid": 99_999_999,
+        "goal": "finish the migration",
+        "context": "continue from the saved child transcript",
+        "toolsets": ["file"],
+        "role": "leaf",
+        "model": "m",
+        "session_key": "session",
+        "parent_session_id": "parent",
+        "child_session_ids": ["child-session-1"],
+        "status": "running",
+        "dispatched_at": time.time() - 30,
+        "completed_at": None,
+    }
+    records_path.write_text(
+        json.dumps({"records": [persisted]}), encoding="utf-8"
+    )
+    with ad._records_lock:
+        ad._records.clear()
+
+    recovered = ad.list_async_delegations()
+
+    assert len(recovered) == 1
+    assert recovered[0]["delegation_id"] == "deleg_restart"
+    assert recovered[0]["status"] == "interrupted"
+    assert recovered[0]["goal"] == "finish the migration"
+    assert recovered[0]["context"] == "continue from the saved child transcript"
+    assert recovered[0]["child_session_ids"] == ["child-session-1"]
+    assert "restart" in recovered[0]["error"].lower()
+
+
+def test_live_foreign_owner_is_not_marked_interrupted(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    records_path.write_text(
+        json.dumps({"records": [{
+            "delegation_id": "foreign-live",
+            "owner_pid": os.getpid(),
+            "goal": "still running",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }]}),
+        encoding="utf-8",
+    )
+
+    records = ad.list_async_delegations()
+
+    assert records[0]["status"] == "running"
+    assert "error" not in records[0]
+
+
+def test_pid_probe_reuses_cross_platform_active_session_helper(monkeypatch):
+    seen = {}
+
+    def safe_probe(pid, process_start_time=None):
+        seen["args"] = (pid, process_start_time)
+        return True
+
+    monkeypatch.setattr("hermes_cli.active_sessions._pid_alive", safe_probe)
+
+    assert ad._pid_alive(12345, 678.9) is True
+    assert seen["args"] == (12345, 678.9)
+
+
+def test_reused_owner_pid_is_recovered_as_interrupted(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    monkeypatch.setattr(
+        ad,
+        "_pid_alive",
+        lambda pid, process_start_time=None: process_start_time == 222.0,
+    )
+    records_path.write_text(
+        json.dumps({"records": [{
+            "delegation_id": "reused-pid",
+            "owner_pid": 12345,
+            "owner_process_start_time": 111.0,
+            "goal": "orphaned",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }]}),
+        encoding="utf-8",
+    )
+
+    records = ad.list_async_delegations()
+
+    assert records[0]["status"] == "interrupted"
+
+
+def test_dispatch_merges_foreign_process_records(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    monkeypatch.setattr(
+        ad,
+        "_pid_alive",
+        lambda pid, process_start_time=None: int(pid) in {12345, os.getpid()},
+    )
+    records_path.write_text(
+        json.dumps({"records": [{
+            "delegation_id": "foreign-live",
+            "owner_pid": 12345,
+            "goal": "other process",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }]}),
+        encoding="utf-8",
+    )
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    result = ad.dispatch_async_delegation(
+        goal="local work",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="local",
+        runner=runner,
+    )
+
+    persisted = json.loads(records_path.read_text(encoding="utf-8"))["records"]
+    assert {record["delegation_id"] for record in persisted} == {
+        "foreign-live", result["delegation_id"]
+    }
+    gate.set()
+    assert _drain_one() is not None
+
+
+def test_locked_capacity_recheck_rejects_foreign_process_race(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    monkeypatch.setattr(ad, "_load_records_locked", lambda: None)
+    monkeypatch.setattr(ad, "_pid_alive", lambda *args: True)
+    records_path.write_text(
+        json.dumps({"records": [{
+            "delegation_id": "foreign-live",
+            "owner_pid": 12345,
+            "owner_process_start_time": 111.0,
+            "goal": "other process",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }]}),
+        encoding="utf-8",
+    )
+    called = False
+
+    def runner():
+        nonlocal called
+        called = True
+        return {"status": "completed"}
+
+    result = ad.dispatch_async_delegation(
+        goal="racing local work",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="local",
+        runner=runner,
+        max_async_children=1,
+    )
+
+    assert result["status"] == "rejected"
+    assert "capacity" in result["error"].lower()
+    assert called is False
+
+
+def test_profile_switch_does_not_drop_another_profiles_running_record(tmp_path, monkeypatch):
+    current = {"path": tmp_path / "profile-a" / "delegations.json"}
+    monkeypatch.setattr(ad, "_records_path", lambda: current["path"])
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    result = ad.dispatch_async_delegation(
+        goal="profile A work",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="profile-a",
+        runner=runner,
+    )
+    delegation_id = result["delegation_id"]
+
+    current["path"] = tmp_path / "profile-b" / "delegations.json"
+    assert ad.list_async_delegations() == []
+    with ad._records_lock:
+        assert delegation_id in ad._records
+
+    gate.set()
+    event = _drain_one()
+    assert event is not None
+    assert event["delegation_id"] == delegation_id
+
+    current["path"] = tmp_path / "profile-a" / "delegations.json"
+    restored = ad.list_async_delegations()
+    assert restored[0]["status"] == "completed"
+
+
+def test_malformed_records_collection_loads_as_empty(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    records_path.write_text('{"records": null}', encoding="utf-8")
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    with ad._records_lock:
+        ad._records.clear()
+
+    assert ad.list_async_delegations() == []
+
+
+def test_persistence_failure_rejects_background_dispatch(monkeypatch):
+    called = False
+
+    def runner():
+        nonlocal called
+        called = True
+        return {"status": "completed"}
+
+    monkeypatch.setattr(ad, "_reserve_record_locked", lambda *args: "error")
+    result = ad.dispatch_async_delegation(
+        goal="must be durable",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+    )
+
+    assert result["status"] == "rejected"
+    assert "persist" in result["error"].lower()
+    assert called is False
+
+
+def test_final_persistence_failure_does_not_resurrect_running_record(
+    tmp_path, monkeypatch
+):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    monkeypatch.setattr(ad, "_persist_records_locked", lambda *args, **kwargs: False)
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    result = ad.dispatch_async_delegation(
+        goal="finish once",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+    )
+    gate.set()
+    assert _drain_one() is not None
+
+    records = ad.list_async_delegations()
+    record = next(item for item in records if item["delegation_id"] == result["delegation_id"])
+    assert record["status"] == "completed"
+    assert ad.active_count() == 0
 
 
 def test_completion_event_lands_on_shared_queue_with_session_key():
@@ -181,6 +456,38 @@ def test_crashed_runner_produces_error_completion():
     assert "subagent exploded" in text
 
 
+def test_interrupts_are_scoped_to_active_profile(tmp_path, monkeypatch):
+    current_path = tmp_path / "profile-b" / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: current_path)
+    interrupted = {"a": 0, "b": 0}
+    with ad._records_lock:
+        ad._records.update({
+            "deleg-a": {
+                "delegation_id": "deleg-a",
+                "_home": str((tmp_path / "profile-a")),
+                "status": "running",
+                "session_key": "same-session",
+                "interrupt_fn": lambda: interrupted.__setitem__(
+                    "a", interrupted["a"] + 1
+                ),
+            },
+            "deleg-b": {
+                "delegation_id": "deleg-b",
+                "_home": str(current_path.parent),
+                "status": "running",
+                "session_key": "same-session",
+                "interrupt_fn": lambda: interrupted.__setitem__(
+                    "b", interrupted["b"] + 1
+                ),
+            },
+        })
+
+    assert ad.interrupt_for_session(session_key="same-session") == 1
+    assert interrupted == {"a": 0, "b": 1}
+    assert ad.interrupt_all(reason="test") == 1
+    assert interrupted == {"a": 0, "b": 2}
+
+
 def test_interrupt_all_signals_running_children():
     ev = threading.Event()
     interrupted = {"count": 0}
@@ -243,6 +550,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
+    fake_child.session_id = "child-session-1"
 
     gate = threading.Event()
 
@@ -277,6 +585,11 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     # blocked on the closed gate, so no completion event exists yet.
     assert process_registry.completion_queue.empty()
     assert ad.active_count() == 1  # one background batch unit, not finished
+    record = next(
+        item for item in ad.list_async_delegations()
+        if item["delegation_id"] == parsed["delegation_id"]
+    )
+    assert record["child_session_ids"] == ["child-session-1"]
 
     gate.set()
     evt = _drain_one()
@@ -284,6 +597,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert evt["type"] == "async_delegation"
     # Single task rides the batch path → carries a 1-item results list.
     assert evt.get("is_batch") is True
+    assert evt["child_session_ids"] == ["child-session-1"]
     assert len(evt["results"]) == 1
     assert evt["results"][0]["summary"] == "done: the real task"
     text = format_process_notification(evt)
@@ -525,6 +839,7 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
+    fake_child.session_id = "child-session-1"
 
     gate = threading.Event()
 

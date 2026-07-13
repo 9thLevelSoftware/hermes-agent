@@ -2846,6 +2846,11 @@ def delegate_task(
             _origin_ui_session_id = ""
         _parent_session_id = getattr(parent_agent, "session_id", None)
         _child_agents = [c for (_, _, c) in children]
+        _child_session_ids = [
+            str(getattr(child, "session_id", "") or "")
+            for child in _child_agents
+            if getattr(child, "session_id", None)
+        ]
 
         # Detach every child from the parent's interrupt-propagation list — the
         # batch's lifecycle is owned by the async registry now, not the parent
@@ -2887,6 +2892,7 @@ def delegate_task(
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             parent_session_id=_parent_session_id,
+            child_session_ids=_child_session_ids,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
