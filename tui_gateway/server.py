@@ -12155,8 +12155,12 @@ def _(rid, params: dict) -> dict:
             )
 
         # Otherwise — treat the remaining text as the new goal.
+        from hermes_cli.goals import parse_contract
+
+        headline, parsed_contract = parse_contract(arg)
+        contract = parsed_contract if not parsed_contract.is_empty() else None
         try:
-            state = mgr.set(arg)
+            state = mgr.set(headline or arg, contract=contract)
         except ValueError as exc:
             return _err(rid, 4004, f"invalid goal: {exc}")
 
@@ -12171,7 +12175,7 @@ def _(rid, params: dict) -> dict:
         # wired in _run_prompt_submit takes over from there.
         return _ok(
             rid,
-            {"type": "send", "notice": notice, "message": state.goal},
+            {"type": "send", "notice": notice, "message": mgr.kickoff_prompt() or state.goal},
         )
 
     if name == "undo":

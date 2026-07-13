@@ -220,14 +220,17 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
 # Adapted from Codex's "let Codex draft the goal" guidance.
 DRAFT_CONTRACT_SYSTEM_PROMPT = (
     "You turn a user's plain-language objective into a structured completion "
-    "contract for an autonomous coding agent. The contract has five fields:\n"
+    "contract for an autonomous coding agent. The contract has eight fields:\n"
     "- outcome: the single end state that must be true when done\n"
     "- verification: the specific test / command / artifact that PROVES the "
     "outcome (must be concrete and checkable)\n"
     "- constraints: what must NOT change or regress\n"
     "- boundaries: which files, dirs, tools, or systems are in scope\n"
     "- stop_when: the condition under which the agent should stop and ask "
-    "for human input instead of pushing on\n\n"
+    "for human input instead of pushing on\n"
+    "- decisions: durable choices already made and why\n"
+    "- blockers: unresolved facts or dependencies preventing progress\n"
+    "- next_action: the next concrete step to take\n\n"
     "Infer sensible, specific values from the objective and any project "
     "context implied by it. Prefer concrete verification (a named test "
     "command, a build, a benchmark) over vague phrases. Keep each field to "
@@ -235,7 +238,8 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
     "empty string for it.\n\n"
     "Reply ONLY with a single JSON object on one line:\n"
     '{"outcome": "...", "verification": "...", "constraints": "...", '
-    '"boundaries": "...", "stop_when": "..."}'
+    '"boundaries": "...", "stop_when": "...", "decisions": "...", '
+    '"blockers": "...", "next_action": "..."}'
 )
 
 
@@ -243,13 +247,16 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
 # Completion contract
 # ──────────────────────────────────────────────────────────────────────
 
-# The five contract fields, in display order. Adapted from OpenAI Codex's
-# "strong goal" guidance: a durable objective works best when it names what
-# "done" means, how to prove it, what must not regress, what tools/paths are
-# in bounds, and when to stop and ask. A bare free-form goal (no contract)
-# stays fully supported — every field defaults empty and is simply omitted
-# from the prompts when unset.
-_CONTRACT_FIELDS = ("outcome", "verification", "constraints", "boundaries", "stop_when")
+# The contract fields, in display order. The first five follow OpenAI Codex's
+# "strong goal" guidance: define done, proof, constraints, scope, and when to
+# stop. The final three are durable working state carried across turns and
+# compression. A bare free-form goal stays fully supported — every field
+# defaults empty and is omitted from prompts when unset.
+_COMPLETION_FIELDS = (
+    "outcome", "verification", "constraints", "boundaries", "stop_when",
+)
+_WORKING_FIELDS = ("decisions", "blockers", "next_action")
+_CONTRACT_FIELDS = _COMPLETION_FIELDS + _WORKING_FIELDS
 
 # Human labels for rendering and for the inline `field: value` parser.
 _CONTRACT_LABELS = {
@@ -258,6 +265,9 @@ _CONTRACT_LABELS = {
     "constraints": "Constraints",
     "boundaries": "Boundaries",
     "stop_when": "Stop when blocked",
+    "decisions": "Decisions",
+    "blockers": "Blockers",
+    "next_action": "Next action",
 }
 
 # Inline-input aliases the user may type before a value, mapped to the
@@ -287,6 +297,16 @@ _CONTRACT_ALIASES = {
     "blocked": "stop_when",
     "stop if blocked": "stop_when",
     "give up when": "stop_when",
+    "decision": "decisions",
+    "decisions": "decisions",
+    "decided": "decisions",
+    "blocker": "blockers",
+    "blockers": "blockers",
+    "blocked by": "blockers",
+    "next": "next_action",
+    "next action": "next_action",
+    "next_action": "next_action",
+    "next step": "next_action",
 }
 
 
@@ -307,9 +327,18 @@ class GoalContract:
     constraints: str = ""
     boundaries: str = ""
     stop_when: str = ""
+    decisions: str = ""
+    blockers: str = ""
+    next_action: str = ""
 
     def is_empty(self) -> bool:
         return not any(getattr(self, f).strip() for f in _CONTRACT_FIELDS)
+
+    def has_completion_criteria(self) -> bool:
+        return any(getattr(self, f).strip() for f in _COMPLETION_FIELDS)
+
+    def has_working_state(self) -> bool:
+        return any(getattr(self, f).strip() for f in _WORKING_FIELDS)
 
     def to_dict(self) -> Dict[str, str]:
         return {f: getattr(self, f) for f in _CONTRACT_FIELDS}
@@ -328,6 +357,14 @@ class GoalContract:
             val = getattr(self, f).strip()
             if val:
                 lines.append(f"- {_CONTRACT_LABELS[f]}: {val}")
+        return "\n".join(lines)
+
+    def render_working_state_block(self) -> str:
+        lines = []
+        for field_name in _WORKING_FIELDS:
+            value = getattr(self, field_name).strip()
+            if value:
+                lines.append(f"- {_CONTRACT_LABELS[field_name]}: {value}")
         return "\n".join(lines)
 
 
@@ -469,7 +506,7 @@ class GoalState:
     # --- contract helpers -------------------------------------------------
 
     def has_contract(self) -> bool:
-        return self.contract is not None and not self.contract.is_empty()
+        return self.contract is not None and self.contract.has_completion_criteria()
 
     # --- subgoals helpers -------------------------------------------------
 
@@ -1111,6 +1148,17 @@ class GoalManager:
     def has_contract(self) -> bool:
         return self._state is not None and self._state.has_contract()
 
+    def kickoff_prompt(self) -> Optional[str]:
+        if self._state is None:
+            return None
+        block = self._state.contract.render_block()
+        if not block:
+            return self._state.goal
+        return (
+            f"{self._state.goal}\n\n"
+            f"Goal contract and durable working state:\n{block}"
+        )
+
     def status_line(self) -> str:
         s = self._state
         if s is None or s.status in {"cleared",}:
@@ -1118,7 +1166,12 @@ class GoalManager:
         turns = f"{s.turns_used}/{s.max_turns} turns"
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
         con = ", contract" if self.has_contract() else ""
-        meta = f"{turns}{sub}{con}"
+        work = (
+            ", working state"
+            if s.contract is not None and s.contract.has_working_state()
+            else ""
+        )
+        meta = f"{turns}{sub}{con}{work}"
         if s.status == "active":
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
                 wr = s.waiting_reason or f"session {s.waiting_on_session}"
@@ -1573,18 +1626,23 @@ class GoalManager:
                 contract_block=contract_block,
             )
         if self._state.subgoals:
-            return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+            prompt = CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
                 goal=self._state.goal,
                 subgoals_block=self._state.render_subgoals_block(),
             )
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        else:
+            prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        working_state = self._state.contract.render_working_state_block()
+        if working_state:
+            prompt += f"\n\nDurable working state:\n{working_state}"
+        return prompt
 
     def render_contract(self) -> str:
         """Public helper for the /goal show + /goal draft slash commands."""
         if self._state is None:
             return "(no active goal)"
-        if not self._state.has_contract():
-            return "(no completion contract — set one with /goal draft <objective> or inline field: value lines)"
+        if self._state.contract.is_empty():
+            return "(no completion contract or working state — set one with /goal draft <objective> or inline field: value lines)"
         return self._state.contract.render_block()
 
 
