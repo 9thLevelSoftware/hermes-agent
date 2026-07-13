@@ -1254,7 +1254,7 @@ class TestParseContract:
             "stop when: a schema change needs product sign-off\n"
             "decisions: use the existing token validator\n"
             "blockers: staging credentials are unavailable\n"
-            "next action: add the failing refresh-token test"
+            "next_action: add the failing refresh-token test"
         )
         headline, contract = parse_contract(text)
         assert headline == "Migrate auth to JWT"
@@ -1361,6 +1361,27 @@ class TestGoalManagerContract:
         assert "keep SQLite as the source of truth" in prompt
         assert "none" in prompt
         assert "add the persistence test" in prompt
+
+    def test_working_state_without_completion_criteria_uses_freeform_judge(self, hermes_home):
+        from hermes_cli.goals import GoalManager, GoalContract
+
+        mgr = GoalManager(session_id="working-only")
+        mgr.set(
+            "ship it",
+            contract=GoalContract(
+                decisions="reuse the existing serializer",
+                blockers="fixture data is missing",
+                next_action="write the failing test",
+            ),
+        )
+
+        prompt = mgr.next_continuation_prompt()
+
+        assert not mgr.has_contract()
+        assert "Completion contract" not in prompt
+        assert "Durable working state" in prompt
+        assert "write the failing test" in prompt
+        assert "working state" in mgr.status_line()
 
     def test_set_contract_after_the_fact(self, hermes_home):
         from hermes_cli.goals import GoalManager, GoalContract

@@ -252,10 +252,11 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
 # stop. The final three are durable working state carried across turns and
 # compression. A bare free-form goal stays fully supported — every field
 # defaults empty and is omitted from prompts when unset.
-_CONTRACT_FIELDS = (
+_COMPLETION_FIELDS = (
     "outcome", "verification", "constraints", "boundaries", "stop_when",
-    "decisions", "blockers", "next_action",
 )
+_WORKING_FIELDS = ("decisions", "blockers", "next_action")
+_CONTRACT_FIELDS = _COMPLETION_FIELDS + _WORKING_FIELDS
 
 # Human labels for rendering and for the inline `field: value` parser.
 _CONTRACT_LABELS = {
@@ -304,6 +305,7 @@ _CONTRACT_ALIASES = {
     "blocked by": "blockers",
     "next": "next_action",
     "next action": "next_action",
+    "next_action": "next_action",
     "next step": "next_action",
 }
 
@@ -332,6 +334,12 @@ class GoalContract:
     def is_empty(self) -> bool:
         return not any(getattr(self, f).strip() for f in _CONTRACT_FIELDS)
 
+    def has_completion_criteria(self) -> bool:
+        return any(getattr(self, f).strip() for f in _COMPLETION_FIELDS)
+
+    def has_working_state(self) -> bool:
+        return any(getattr(self, f).strip() for f in _WORKING_FIELDS)
+
     def to_dict(self) -> Dict[str, str]:
         return {f: getattr(self, f) for f in _CONTRACT_FIELDS}
 
@@ -349,6 +357,14 @@ class GoalContract:
             val = getattr(self, f).strip()
             if val:
                 lines.append(f"- {_CONTRACT_LABELS[f]}: {val}")
+        return "\n".join(lines)
+
+    def render_working_state_block(self) -> str:
+        lines = []
+        for field_name in _WORKING_FIELDS:
+            value = getattr(self, field_name).strip()
+            if value:
+                lines.append(f"- {_CONTRACT_LABELS[field_name]}: {value}")
         return "\n".join(lines)
 
 
@@ -490,7 +506,7 @@ class GoalState:
     # --- contract helpers -------------------------------------------------
 
     def has_contract(self) -> bool:
-        return self.contract is not None and not self.contract.is_empty()
+        return self.contract is not None and self.contract.has_completion_criteria()
 
     # --- subgoals helpers -------------------------------------------------
 
@@ -1139,7 +1155,12 @@ class GoalManager:
         turns = f"{s.turns_used}/{s.max_turns} turns"
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
         con = ", contract" if self.has_contract() else ""
-        meta = f"{turns}{sub}{con}"
+        work = (
+            ", working state"
+            if s.contract is not None and s.contract.has_working_state()
+            else ""
+        )
+        meta = f"{turns}{sub}{con}{work}"
         if s.status == "active":
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
                 wr = s.waiting_reason or f"session {s.waiting_on_session}"
@@ -1594,18 +1615,23 @@ class GoalManager:
                 contract_block=contract_block,
             )
         if self._state.subgoals:
-            return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+            prompt = CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
                 goal=self._state.goal,
                 subgoals_block=self._state.render_subgoals_block(),
             )
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        else:
+            prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        working_state = self._state.contract.render_working_state_block()
+        if working_state:
+            prompt += f"\n\nDurable working state:\n{working_state}"
+        return prompt
 
     def render_contract(self) -> str:
         """Public helper for the /goal show + /goal draft slash commands."""
         if self._state is None:
             return "(no active goal)"
-        if not self._state.has_contract():
-            return "(no completion contract — set one with /goal draft <objective> or inline field: value lines)"
+        if self._state.contract.is_empty():
+            return "(no completion contract or working state — set one with /goal draft <objective> or inline field: value lines)"
         return self._state.contract.render_block()
 
 
