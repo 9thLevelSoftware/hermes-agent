@@ -412,10 +412,11 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        override: bool = False,
+        *,
         read_only: bool = False,
         destructive: Optional[bool] = None,
         idempotent: bool = False,
-        override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 

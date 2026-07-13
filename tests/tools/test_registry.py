@@ -79,6 +79,19 @@ class TestRegisterAndDispatch:
             "idempotent": True,
         }
 
+    def test_positional_override_slot_remains_backward_compatible(self):
+        reg = ToolRegistry()
+        reg.register("same", "built-in", _make_schema("same"), _dummy_handler)
+        replacement = lambda args, **kwargs: json.dumps({"replacement": True})
+
+        reg.register(
+            "same", "plugin", _make_schema("same"), replacement,
+            None, None, False, "", "", None, None, True,
+        )
+
+        assert reg.get_entry("same").handler is replacement
+        assert reg.get_operation_metadata("same")["read_only"] is False
+
     def test_dispatch_passes_args(self):
         reg = ToolRegistry()
 

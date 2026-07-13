@@ -215,6 +215,30 @@ class TestHandleFunctionCall:
         assert pre_call[1]["middleware_trace"] == expected_trace
         assert post_call[1]["middleware_trace"] == expected_trace
 
+    def test_no_execution_middleware_does_not_hash_arguments(self, monkeypatch):
+        manager = type("Manager", (), {"_middleware": {"tool_execution": []}})()
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr(
+            registry,
+            "operation_key",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("operation key should stay lazy")
+            ),
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *args, **kwargs: '{"ok":true}',
+        )
+
+        result = handle_function_call(
+            "web_search",
+            {"q": "x" * 100_000},
+            task_id="task-1",
+            skip_pre_tool_call_hook=True,
+        )
+
+        assert result == '{"ok":true}'
+
 
 # =========================================================================
 # Agent loop tools

@@ -310,19 +310,18 @@ def _run_agent_tool_execution_middleware(
     from model_tools import registry
 
     operation_metadata = registry.get_operation_metadata(function_name)
-    operation_key = registry.operation_key(
-        function_name,
-        function_args,
-        task_id=effective_task_id or "",
-        tool_call_id=tool_call_id or "",
-    )
     result = run_tool_execution_middleware(
         function_name,
         function_args,
         _execute,
         original_args=function_args,
         operation_metadata=operation_metadata,
-        operation_key=operation_key,
+        operation_key_factory=lambda: registry.operation_key(
+            function_name,
+            function_args,
+            task_id=effective_task_id or "",
+            tool_call_id=tool_call_id or "",
+        ),
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",
         tool_call_id=tool_call_id or "",
