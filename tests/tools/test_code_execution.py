@@ -55,6 +55,7 @@ from tools.code_execution_tool import (
     _TOOL_DOC_LINES,
     _execute_remote,
     CodeExecutionContext,
+    _context_from_rpc_request,
     _dispatch_script_call,
     is_structured_image_artifact,
     normalize_image_artifact,
@@ -91,6 +92,34 @@ def _fixture_definition(name):
             "required": ["value"],
         },
     }
+
+
+class TestRpcContextTrustBoundary:
+    def test_rpc_context_cannot_override_parent_scope(self):
+        fallback = CodeExecutionContext(
+            "parent-task", "parent-session", ("safe",), ("blocked",)
+        )
+        request = {
+            "task_id": "child-task",
+            "session_id": "child-session",
+            "enabled_toolsets": ["safe", "admin"],
+            "disabled_toolsets": [],
+        }
+
+        assert _context_from_rpc_request(request, fallback) == fallback
+
+    def test_rpc_context_cannot_clear_parent_scope_with_nulls_or_empty_lists(self):
+        fallback = CodeExecutionContext(
+            "parent-task", "parent-session", ("safe",), ("blocked",)
+        )
+        request = {
+            "task_id": None,
+            "session_id": None,
+            "enabled_toolsets": [],
+            "disabled_toolsets": [],
+        }
+
+        assert _context_from_rpc_request(request, fallback) == fallback
 
 
 def _dispatch_script(code, context, definitions):

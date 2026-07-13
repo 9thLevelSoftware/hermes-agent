@@ -171,25 +171,8 @@ def _context_payload(context: Optional[CodeExecutionContext]) -> Dict[str, objec
 def _context_from_rpc_request(
     request: Dict[str, Any], fallback: CodeExecutionContext,
 ) -> CodeExecutionContext:
-    """Normalize a request's context, falling back to the parent RPC context."""
-    payload = request.get("context")
-    if not isinstance(payload, dict):
-        payload = request
-
-    def _tuple_value(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
-        value = payload.get(key)
-        if value is None:
-            return default
-        if isinstance(value, (list, tuple)):
-            return tuple(str(item) for item in value)
-        return default
-
-    return CodeExecutionContext(
-        task_id=payload.get("task_id", fallback.task_id),
-        session_id=payload.get("session_id", fallback.session_id),
-        enabled_toolsets=_tuple_value("enabled_toolsets", fallback.enabled_toolsets),
-        disabled_toolsets=_tuple_value("disabled_toolsets", fallback.disabled_toolsets),
-    )
+    """Keep the parent RPC context authoritative over untrusted requests."""
+    return fallback
 
 
 def _call_handle_function_call(
