@@ -4,7 +4,7 @@
 
 **Goal:** Make tool effects, delegated children, and in-flight turns survive process death without blindly repeating side effects or asking the model to guess what happened.
 
-**Architecture:** Use `SessionDB` as the durable source of truth. W1 adds a per-session `tool_effect_journal` keyed by the existing `operation_key`; the dispatch middleware returns committed results instead of re-executing them. W2 reuses the kanban detached-process/worktree pattern for an opt-in `delegation.isolation: process` mode and sends completion through the existing completion queue. W3 adds bounded, restart-loop-guarded redispatch. W4 checkpoints the loop at its existing pre-API and post-tool-batch flush barriers and merges durable delegation/checkpoint state into the existing `/agents` and TUI surfaces.
+**Architecture:** Use `SessionDB` as the durable source for transcripts, effects, and turn checkpoints. Keep the existing `delegations.json` only as compatibility control-plane metadata until a deliberate migration/reconciliation step removes the dual store; do not add a third delegation store. W1 adds a per-session `tool_effect_journal` keyed by the existing `operation_key`; the dispatch middleware returns committed results instead of re-executing them. W2 reuses the kanban detached-process/worktree pattern for an opt-in `delegation.isolation: process` mode and sends completion through the existing completion queue. W3 adds bounded, restart-loop-guarded redispatch. W4 checkpoints the loop at its existing pre-API and post-tool-batch flush barriers and merges durable delegation/checkpoint state into the existing `/agents` and TUI surfaces.
 
 **Tech Stack:** Python threads and subprocesses, SQLite/SessionDB, existing `operation_key` and operation metadata, `delegations.json` file locking, `process_registry.completion_queue`, git worktrees, gateway restart-loop guard, and existing CLI/TUI/gateway delegation controls.
 
@@ -31,6 +31,7 @@ The codebase review confirms partial scaffolding but no durable execution:
 - `agent/tool_executor.py` emits `[UNRESOLVED] ... effect is UNKNOWN` on timeout/interrupted tool threads. This is the correct honest fallback until W1 supplies a committed result.
 - `tools/delegate_tool.py` builds child `AIAgent` instances inside the parent process and uses daemon thread pools. Child sessions are durable, but child execution is not.
 - `tools/async_delegation.py` persists records, owner PID/start time, goal/context, and child session ids; dead records become `interrupted` and are surfaced for manual `/resume`, not automatically redispatched.
+- Delegation state is currently dual-persisted in `delegations.json` and `state.db.async_delegations`. W2 must define which fields remain control-plane compatibility metadata, add a reconciliation/read-repair test, and avoid expanding both stores independently.
 - `hermes_cli/kanban_db.py` already spawns detached `hermes` subprocesses and creates per-task worktrees. Reuse this path rather than designing another worker launcher.
 - `run_agent.py` flushes messages before tool effects and at the pre-API barrier; `conversation_loop.py` has the natural post-tool flush. No `turn_checkpoints` table exists.
 - Gateway/CLI/TUI have separate live `/agents` views. Durable records are not merged into the gateway roster.
