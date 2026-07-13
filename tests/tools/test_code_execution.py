@@ -17,6 +17,7 @@ import pytest
 
 import json
 import os
+from pathlib import Path
 import shutil
 import socket
 import subprocess
@@ -53,6 +54,8 @@ from tools.code_execution_tool import (
     _execute_remote,
     CodeExecutionContext,
     _dispatch_script_call,
+    is_structured_image_artifact,
+    normalize_image_artifact,
 )
 
 
@@ -1546,6 +1549,123 @@ def test_unknown_mcp_operation_is_destructive_by_default():
         "mcp__server__write", {"read_only": False, "destructive": True}
     )
     assert decision == "approval_required"
+
+
+def test_execute_code_returns_structured_image_for_data_url():
+    result = json.loads(execute_code(
+        "print('data:image/png;base64,AAAA')",
+        task_id="structured-image-data",
+    ))
+
+    assert result["_multimodal"] is True
+    assert result["status"] == "success"
+    assert isinstance(result["duration_seconds"], (int, float))
+    assert result["tool_calls_made"] == 0
+    assert result["content"] == [{
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,AAAA"},
+    }]
+
+
+def test_execute_code_returns_structured_image_for_local_path(tmp_path):
+    image_path = tmp_path / "generated.webp"
+    image_path.write_bytes(b"RIFF")
+    result = json.loads(execute_code(
+        f"print({str(image_path)!r})",
+        task_id="structured-image-path",
+    ))
+
+    assert result["_multimodal"] is True
+    assert result["content"] == [{
+        "type": "image_url",
+        "image_url": {"url": image_path.resolve().as_uri()},
+    }]
+
+
+def test_execute_code_collects_generated_image_artifact():
+    result = json.loads(execute_code(
+        "import os\nfrom pathlib import Path\n"
+        "p = Path(os.environ['HERMES_ARTIFACTS_DIR']) / 'chart.png'\n"
+        "p.write_bytes(b'PNG')\nprint(p)",
+        task_id="structured-generated-image",
+    ))
+
+    image_url = result["content"][0]["image_url"]["url"]
+    assert result["_multimodal"] is True
+    assert image_url.startswith("file://")
+    assert Path(image_url[7:]).is_file()
+
+
+def test_image_artifact_normalization_accepts_urls_paths_and_structured_values(tmp_path):
+    image_path = tmp_path / "chart.png"
+    image_path.write_bytes(b"\x89PNG\r\n")
+    expected = image_path.resolve().as_uri()
+
+    values = [
+        "https://example.test/chart.png",
+        "data:image/png;base64,AAAA",
+        str(image_path),
+        {"type": "image_url", "image_url": {"url": str(image_path)}},
+    ]
+    for value in values:
+        assert is_structured_image_artifact(value)
+        assert normalize_image_artifact(value) == {
+            "type": "image_url",
+            "image_url": {"url": expected if value in (str(image_path), values[-1]) else (value if isinstance(value, str) else value["image_url"]["url"])},
+        }
+
+    assert not is_structured_image_artifact("ordinary tool result")
+    assert normalize_image_artifact("ordinary tool result") is None
+
+
+def test_execute_code_spills_redacted_large_output_to_durable_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(code_execution_tool, "MAX_STDOUT_BYTES", 128)
+
+    def redact(text, **_kwargs):
+        return text.replace("TOP_SECRET", "[REDACTED]")
+
+    monkeypatch.setattr("agent.redact.redact_sensitive_text", redact)
+    result = json.loads(execute_code(
+        "print('TOP_SECRET')\nprint('x' * 2000)",
+        task_id="structured-image-large-output",
+    ))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    artifact_path = result["artifact_path"]
+    assert os.path.isfile(artifact_path)
+    artifact = open(artifact_path, encoding="utf-8").read()
+    assert "TOP_SECRET" not in artifact
+    assert "[REDACTED]" in artifact
+    assert len(result["output"]) < 2000
+
+
+def test_generated_save_artifact_persists_a_real_file(tmp_path):
+    source = tmp_path / "report.txt"
+    source.write_text("artifact output", encoding="utf-8")
+    result = _dispatch_script(
+        """
+import json
+from hermes_tools import save_artifact
+print(json.dumps(save_artifact(%r)))
+""" % str(source),
+        CodeExecutionContext("save-artifact-task", None, (), ()),
+        [_fixture_definition("fixture")],
+    )
+
+    saved = result
+    assert saved["status"] == "ok"
+    assert os.path.isfile(saved["artifact_path"])
+    assert open(saved["artifact_path"], encoding="utf-8").read() == "artifact output"
+
+
+def test_execute_code_keeps_ordinary_string_output_shape():
+    result = json.loads(execute_code("print('ordinary tool result')", task_id="ordinary-output"))
+
+    assert result["status"] == "success"
+    assert result["output"] == "ordinary tool result\n"
+    assert "_multimodal" not in result
+    assert "artifact_path" not in result
 
 
 if __name__ == "__main__":

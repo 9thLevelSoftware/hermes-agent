@@ -47,6 +47,8 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 _IS_WINDOWS = platform.system() == "Windows"
 from typing import Any, Dict, Iterable, List, Literal, Optional
@@ -218,7 +220,19 @@ def _dispatch_catalog_action(
         "tool_call": "tool_call",
     }.get(action)
     if action == "save_artifact":
-        return {"error": "save_artifact is not available in this code-mode bridge yet."}
+        save_args = arguments.get("arguments", {})
+        if not isinstance(save_args, dict):
+            return {"error": "save_artifact arguments must be an object."}
+        path = save_args.get("path")
+        if not isinstance(path, str) or not path.strip():
+            return {"error": "save_artifact requires a local file path."}
+        name = save_args.get("name")
+        mime_type = save_args.get("mime_type")
+        return _persist_file_artifact(
+            path,
+            name=name if isinstance(name, str) else None,
+            mime_type=mime_type if isinstance(mime_type, str) else None,
+        )
     if bridge_name is None:
         return {"error": f"Unknown code-mode catalog action: {action}"}
     bridge_args = arguments.get("arguments", {})
@@ -319,6 +333,243 @@ DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
+
+_IMAGE_SUFFIXES = frozenset({
+    ".bmp", ".gif", ".heic", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp",
+})
+
+
+def _image_url_candidate(value: Any) -> Optional[str]:
+    """Return a usable image URL/path from one artifact value."""
+    if isinstance(value, dict):
+        if str(value.get("type", "")).lower() != "image_url":
+            return None
+        image_url = value.get("image_url")
+        value = image_url.get("url") if isinstance(image_url, dict) else image_url
+    if not isinstance(value, (str, os.PathLike)):
+        return None
+    raw = os.fspath(value).strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if lowered.startswith("data:image/") and "," in raw:
+        return raw
+    parsed = urlsplit(raw)
+    if parsed.scheme in {"http", "https"}:
+        return raw if os.path.splitext(parsed.path)[1].lower() in _IMAGE_SUFFIXES else None
+    if parsed.scheme == "file":
+        local_path = unquote(parsed.path)
+    elif parsed.scheme:
+        return None
+    else:
+        local_path = os.path.expanduser(raw)
+    if os.path.isfile(local_path) and os.path.splitext(local_path)[1].lower() in _IMAGE_SUFFIXES:
+        return os.path.abspath(local_path)
+    return None
+
+
+def normalize_image_artifact(value: Any) -> Optional[dict]:
+    """Normalize an image URL, data URL, local path, or image part."""
+    candidate = _image_url_candidate(value)
+    if candidate is None:
+        return None
+    if not candidate.lower().startswith(("http://", "https://", "data:", "file://")):
+        candidate = Path(candidate).resolve().as_uri()
+    return {"type": "image_url", "image_url": {"url": candidate}}
+
+
+# Public alias with the more explicit name used by callers that handle
+# structured tool results.
+normalize_structured_image_artifact = normalize_image_artifact
+
+
+def is_structured_image_artifact(value: Any) -> bool:
+    """Return whether *value* identifies an image artifact."""
+    if normalize_image_artifact(value) is not None:
+        return True
+    if isinstance(value, dict) and value.get("_multimodal") is True:
+        return any(
+            normalize_image_artifact(part) is not None
+            for part in value.get("content", [])
+            if isinstance(part, dict)
+        )
+    if isinstance(value, (list, tuple)):
+        return any(is_structured_image_artifact(item) for item in value)
+    return False
+
+
+def _image_parts_from_output(output: str) -> list[dict]:
+    """Find image parts in direct or JSON-encoded execute_code output."""
+    values = [output]
+    try:
+        parsed = json.loads(output.strip())
+    except (TypeError, json.JSONDecodeError, AttributeError):
+        parsed = None
+    if parsed is not None and not isinstance(parsed, str):
+        values.insert(0, parsed)
+
+    parts = []
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            candidates = value
+        elif isinstance(value, dict) and value.get("_multimodal") is True:
+            candidates = value.get("content", [])
+        else:
+            candidates = [value]
+        for candidate in candidates:
+            part = normalize_image_artifact(candidate)
+            if part and part not in parts:
+                parts.append(part)
+    return parts
+
+
+def _artifact_storage_dir() -> str:
+    """Return the existing durable tool-result directory."""
+    # ponytail: reuse the existing result store; no new retention/config layer.
+    try:
+        from tools.tool_result_storage import STORAGE_DIR
+        directory = STORAGE_DIR
+    except Exception:
+        directory = os.path.join(tempfile.gettempdir(), "hermes-results")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    return directory
+
+
+def _persist_execute_artifact(content: str, suffix: str = ".txt") -> str:
+    """Persist already-redacted text and return its durable path."""
+    fd, path = tempfile.mkstemp(
+        prefix="execute_code_", suffix=suffix, dir=_artifact_storage_dir(), text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _persist_file_artifact(path: str, name: Optional[str] = None, mime_type: Optional[str] = None) -> dict:
+    """Copy a child-created artifact out of its disposable execution directory."""
+    source = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(source):
+        return {"error": f"Artifact does not exist: {path}"}
+    filename = os.path.basename(name or source) or "artifact"
+    suffix = os.path.splitext(filename)[1]
+    image_part = normalize_image_artifact(source)
+    if image_part:
+        fd, destination = tempfile.mkstemp(
+            prefix="execute_code_", suffix=suffix or ".bin", dir=_artifact_storage_dir(),
+        )
+        os.close(fd)
+        try:
+            import shutil
+            shutil.copyfile(source, destination)
+        except BaseException:
+            try:
+                os.unlink(destination)
+            except OSError:
+                pass
+            raise
+    else:
+        with open(source, encoding="utf-8", errors="replace") as handle:
+            content = _clean_execute_text(handle.read())
+        destination = _persist_execute_artifact(content, suffix=suffix or ".txt")
+    response = {
+        "status": "ok",
+        "artifact_path": destination,
+        "name": filename,
+    }
+    if mime_type:
+        response["mime_type"] = mime_type
+    if image_part:
+        response.update({
+            "_multimodal": True,
+            "content": [normalize_image_artifact(destination)],
+        })
+    return response
+
+
+def _collect_local_artifacts(artifact_dir: Optional[str], limit: int) -> tuple[list[dict], Optional[str]]:
+    """Copy generated images or spill generated text files before cleanup."""
+    if not artifact_dir or not os.path.isdir(artifact_dir):
+        return [], None
+    image_parts = []
+    text_path = None
+    for name in sorted(os.listdir(artifact_dir)):
+        source = os.path.join(artifact_dir, name)
+        if not os.path.isfile(source):
+            continue
+        image_part = normalize_image_artifact(source)
+        if image_part:
+            copied = _persist_file_artifact(source, name=name)
+            part = copied.get("content", [None])[0]
+            if part and part not in image_parts:
+                image_parts.append(part)
+            continue
+        try:
+            with open(source, encoding="utf-8", errors="replace") as handle:
+                content = _clean_execute_text(handle.read())
+        except OSError:
+            continue
+        if len(content) > limit and text_path is None:
+            text_path = _persist_execute_artifact(content)
+    return image_parts, text_path
+
+
+def _clean_execute_text(text: Any) -> str:
+    from tools.ansi_strip import strip_ansi
+    from agent.redact import redact_sensitive_text
+    return redact_sensitive_text(strip_ansi(str(text or "")), code_file=True)
+
+
+def _truncate_execute_output(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    head = int(limit * 0.4)
+    tail = limit - head
+    omitted = len(text) - head - tail
+    return (
+        text[:head]
+        + f"\n\n... [OUTPUT TRUNCATED - {omitted:,} chars omitted out of {len(text):,} total] ...\n\n"
+        + text[-tail:]
+    )
+
+
+def _prepare_execute_output(text: Any, limit: int) -> tuple[str, Optional[str], list[dict]]:
+    """Clean output, preserve images, and spill oversized text before truncating."""
+    cleaned = _clean_execute_text(text)
+    image_parts = _image_parts_from_output(cleaned)
+    if image_parts:
+        return cleaned, None, image_parts
+    artifact_path = None
+    if len(cleaned) > limit:
+        artifact_path = _persist_execute_artifact(cleaned)
+        cleaned = _truncate_execute_output(cleaned, limit)
+    return cleaned, artifact_path, []
+
+
+def _attach_execute_artifacts(
+    result: Dict[str, Any],
+    image_parts: Iterable[dict] = (),
+    artifact_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Add the common structured-artifact fields without changing text results."""
+    parts = list(image_parts)
+    if parts:
+        result["_multimodal"] = True
+        result["content"] = parts
+        result["text_summary"] = result.get("output", "")
+    if artifact_path:
+        result["truncated"] = True
+        result["artifact_path"] = artifact_path
+    return result
+
 
 # Environment variable scrubbing rules (shared between the local + remote
 # backends).  Secret-substring block is applied first; anything left must
@@ -1485,6 +1736,7 @@ def _execute_remote(
     sandbox_id = uuid.uuid4().hex[:12]
     temp_dir = _env_temp_dir(env)
     sandbox_dir = f"{temp_dir}/hermes_exec_{sandbox_id}"
+    artifact_dir = f"{sandbox_dir}/artifacts"
     quoted_sandbox_dir = shlex.quote(sandbox_dir)
     quoted_rpc_dir = shlex.quote(f"{sandbox_dir}/rpc")
 
@@ -1514,7 +1766,7 @@ def _execute_remote(
 
         # Create sandbox directory on remote
         env.execute(
-            f"mkdir -p {quoted_rpc_dir}", cwd="/", timeout=10,
+            f"mkdir -p {quoted_rpc_dir} {shlex.quote(artifact_dir)}", cwd="/", timeout=10,
         )
 
         rpc_token = secrets.token_urlsafe(32)
@@ -1544,6 +1796,7 @@ def _execute_remote(
         env_prefix = (
             f"HERMES_RPC_DIR={shlex.quote(f'{sandbox_dir}/rpc')} "
             f"HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
+            f"HERMES_ARTIFACTS_DIR={shlex.quote(artifact_dir)} "
             f"PYTHONDONTWRITEBYTECODE=1"
         )
         tz = os.getenv("HERMES_TIMEZONE", "").strip()
@@ -1599,30 +1852,9 @@ def _execute_remote(
     duration = round(time.monotonic() - exec_start, 2)
 
     # --- Post-process output (same as local path) ---
-
-    # Truncate stdout to cap
-    if len(stdout_text) > MAX_STDOUT_BYTES:
-        head_bytes = int(MAX_STDOUT_BYTES * 0.4)
-        tail_bytes = MAX_STDOUT_BYTES - head_bytes
-        head = stdout_text[:head_bytes]
-        tail = stdout_text[-tail_bytes:]
-        omitted = len(stdout_text) - len(head) - len(tail)
-        stdout_text = (
-            head
-            + f"\n\n... [OUTPUT TRUNCATED - {omitted:,} chars omitted "
-            f"out of {len(stdout_text):,} total] ...\n\n"
-            + tail
-        )
-
-    # Strip ANSI escape sequences
-    from tools.ansi_strip import strip_ansi
-    stdout_text = strip_ansi(stdout_text)
-
-    # Redact secrets. code_file=True: execute_code output is code-execution
-    # output that often echoes source/config — skip false-positive ENV/JSON/
-    # f-string-template redaction while still masking real credentials.
-    from agent.redact import redact_sensitive_text
-    stdout_text = redact_sensitive_text(stdout_text, code_file=True)
+    stdout_text, stdout_artifact_path, stdout_image_parts = _prepare_execute_output(
+        stdout_text, MAX_STDOUT_BYTES,
+    )
 
     # Build response
     result: Dict[str, Any] = {
@@ -1653,6 +1885,7 @@ def _execute_remote(
         result["status"] = "error"
         result["error"] = f"Script exited with code {exit_code}"
 
+    _attach_execute_artifacts(result, stdout_image_parts, stdout_artifact_path)
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -2296,6 +2529,8 @@ def execute_code(
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
+    artifact_dir = os.path.join(tmpdir, "artifacts")
+    os.makedirs(artifact_dir, mode=0o700, exist_ok=True)
     # Use /tmp on macOS to avoid the long /var/folders/... path that pushes
     # Unix domain socket paths past the 104-byte macOS AF_UNIX limit.
     # On Linux, tempfile.gettempdir() already returns /tmp.
@@ -2391,6 +2626,7 @@ def execute_code(
         child_env = _scrub_child_env(os.environ)
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
+        child_env["HERMES_ARTIFACTS_DIR"] = artifact_dir
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
         # Force UTF-8 for the child's stdio and default file encoding.
         #
@@ -2458,15 +2694,10 @@ def execute_code(
         deadline = time.monotonic() + timeout
         stderr_chunks: list = []
 
-        # Background readers to avoid pipe buffer deadlocks.
-        # For stdout we use a head+tail strategy: keep the first HEAD_BYTES
-        # and a rolling window of the last TAIL_BYTES so the final print()
-        # output is never lost.  Stderr keeps head-only (errors appear early).
-        _STDOUT_HEAD_BYTES = int(MAX_STDOUT_BYTES * 0.4)   # 40% head
-        _STDOUT_TAIL_BYTES = MAX_STDOUT_BYTES - _STDOUT_HEAD_BYTES  # 60% tail
-
+        # Background readers avoid pipe-buffer deadlocks. Keep complete stdout
+        # so a redacted copy can be persisted before the display value is capped.
         def _drain(pipe, chunks, max_bytes):
-            """Simple head-only drain (used for stderr)."""
+            """Head-only drain for stderr."""
             total = 0
             try:
                 while True:
@@ -2480,48 +2711,19 @@ def execute_code(
             except (ValueError, OSError) as e:
                 logger.debug("Error reading process output: %s", e, exc_info=True)
 
-        stdout_total_bytes = [0]  # mutable ref for total bytes seen
-
-        def _drain_head_tail(pipe, head_chunks, tail_chunks, head_bytes, tail_bytes, total_ref):
-            """Drain stdout keeping both head and tail data."""
-            head_collected = 0
-            from collections import deque
-            tail_buf = deque()
-            tail_collected = 0
+        def _drain_full(pipe, chunks):
             try:
                 while True:
                     data = pipe.read(4096)
                     if not data:
                         break
-                    total_ref[0] += len(data)
-                    # Fill head buffer first
-                    if head_collected < head_bytes:
-                        keep = min(len(data), head_bytes - head_collected)
-                        head_chunks.append(data[:keep])
-                        head_collected += keep
-                        data = data[keep:]  # remaining goes to tail
-                        if not data:
-                            continue
-                    # Everything past head goes into rolling tail buffer
-                    tail_buf.append(data)
-                    tail_collected += len(data)
-                    # Evict old tail data to stay within tail_bytes budget
-                    while tail_collected > tail_bytes and tail_buf:
-                        oldest = tail_buf.popleft()
-                        tail_collected -= len(oldest)
-            except (ValueError, OSError):
-                pass
-            # Transfer final tail to output list
-            tail_chunks.extend(tail_buf)
+                    chunks.append(data)
+            except (ValueError, OSError) as e:
+                logger.debug("Error reading process output: %s", e, exc_info=True)
 
-        stdout_head_chunks: list = []
-        stdout_tail_chunks: list = []
-
+        stdout_full_chunks: list = []
         stdout_reader = threading.Thread(
-            target=_drain_head_tail,
-            args=(proc.stdout, stdout_head_chunks, stdout_tail_chunks,
-                  _STDOUT_HEAD_BYTES, _STDOUT_TAIL_BYTES, stdout_total_bytes),
-            daemon=True
+            target=_drain_full, args=(proc.stdout, stdout_full_chunks), daemon=True,
         )
         stderr_reader = threading.Thread(
             target=_drain, args=(proc.stderr, stderr_chunks, MAX_STDERR_BYTES), daemon=True
@@ -2566,21 +2768,13 @@ def execute_code(
         stdout_reader.join(timeout=3)
         stderr_reader.join(timeout=3)
 
-        stdout_head = b"".join(stdout_head_chunks).decode("utf-8", errors="replace")
-        stdout_tail = b"".join(stdout_tail_chunks).decode("utf-8", errors="replace")
-        stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
-
-        # Assemble stdout with head+tail truncation
-        total_stdout = stdout_total_bytes[0]
-        if total_stdout > MAX_STDOUT_BYTES and stdout_tail:
-            omitted = total_stdout - len(stdout_head) - len(stdout_tail)
-            truncated_notice = (
-                f"\n\n... [OUTPUT TRUNCATED - {omitted:,} chars omitted "
-                f"out of {total_stdout:,} total] ...\n\n"
-            )
-            stdout_text = stdout_head + truncated_notice + stdout_tail
-        else:
-            stdout_text = stdout_head + stdout_tail
+        stdout_full = b"".join(stdout_full_chunks).decode("utf-8", errors="replace")
+        stderr_text = _clean_execute_text(
+            b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        )
+        stdout_text, stdout_artifact_path, stdout_image_parts = _prepare_execute_output(
+            stdout_full, MAX_STDOUT_BYTES,
+        )
 
         exit_code = proc.returncode if proc.returncode is not None else -1
         duration = round(time.monotonic() - exec_start, 2)
@@ -2591,22 +2785,7 @@ def execute_code(
         server_sock = None  # prevent double close in finally
         rpc_thread.join(timeout=3)
 
-        # Strip ANSI escape sequences so the model never sees terminal
-        # formatting — prevents it from copying escapes into file writes.
-        from tools.ansi_strip import strip_ansi
-        stdout_text = strip_ansi(stdout_text)
-        stderr_text = strip_ansi(stderr_text)
-
-        # Redact secrets (API keys, tokens, etc.) from sandbox output.
-        # The sandbox env-var filter (lines 434-454) blocks os.environ access,
-        # but scripts can still read secrets from disk (e.g. open('~/.hermes/.env')).
-        # This ensures leaked secrets never enter the model context.
-        # code_file=True: this is code-execution output — skip false-positive
-        # ENV/JSON/f-string-template redaction; real credentials still masked.
-        from agent.redact import redact_sensitive_text
-        stdout_text = redact_sensitive_text(stdout_text, code_file=True)
-        stderr_text = redact_sensitive_text(stderr_text, code_file=True)
-
+        # Output was normalized before truncation so spill files never contain raw secrets.
         # Build response
         result: Dict[str, Any] = {
             "status": status,
@@ -2639,6 +2818,17 @@ def execute_code(
             if stderr_text:
                 result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
 
+        artifact_images, artifact_file = _collect_local_artifacts(artifact_dir, MAX_STDOUT_BYTES)
+        ephemeral_prefix = Path(artifact_dir).resolve().as_uri().rstrip("/") + "/"
+        stdout_image_parts = [
+            part for part in stdout_image_parts
+            if not str(part.get("image_url", {}).get("url", "")).startswith(ephemeral_prefix)
+        ]
+        _attach_execute_artifacts(
+            result,
+            [*stdout_image_parts, *artifact_images],
+            stdout_artifact_path or artifact_file,
+        )
         return json.dumps(result, ensure_ascii=False)
 
     except Exception as exc:
