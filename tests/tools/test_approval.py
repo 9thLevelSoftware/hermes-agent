@@ -619,6 +619,10 @@ class TestHermesApprovalStateWriteProtection:
         self._assert_dangerous(
             "ln -sf /tmp/forged.json ~/.hermes/approval_requests.json"
         )
+        self._assert_dangerous(
+            "ln -s ~/.hermes/approval_requests.json /tmp/approval-alias && "
+            "echo forged > /tmp/approval-alias"
+        )
 
     def test_sed_in_place_forms(self):
         self._assert_dangerous(
@@ -639,6 +643,12 @@ class TestHermesApprovalStateWriteProtection:
     def test_profile_qualified_and_custom_home(self):
         self._assert_dangerous(
             "echo forged > ~/.hermes/profiles/work/approval_requests.json"
+        )
+        self._assert_dangerous(
+            "echo forged > ~/.hermes/./approval_requests.json"
+        )
+        self._assert_dangerous(
+            "echo forged > ~/.hermes/profiles/work/../work/approval_requests.json"
         )
         self._assert_dangerous(
             "echo x | tee $HERMES_HOME/approval_requests.json"

@@ -233,7 +233,7 @@ _HERMES_APPROVAL_STATE_PATH = (
     r'(?:~\/\.hermes/|'
     r'(?:\$home|\$\{home\})/\.hermes/|'
     r'(?:\$hermes_home|\$\{hermes_home\})/)'
-    r'(?:profiles/[^/\s"\'`]+/)?approval_requests\.json\b'
+    r'(?:[^/\s"\'`]+/)*approval_requests\.json\b'
 )
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
@@ -680,7 +680,7 @@ DANGEROUS_PATTERNS = [
     # The trailing `[^\s"\']*` consumes the rest of the destination filename
     # (e.g. `authorized_keys` after the `~/.ssh/` fragment).
     (rf'\b(cp|mv|install)\b.*\s["\']?{_SENSITIVE_WRITE_TARGET}[^\s"\']*["\']?{_COMMAND_TAIL}', "copy/move file into sensitive credential/SSH/shell-rc/Hermes path"),
-    (rf'\bln\b.*\s["\']?{_SENSITIVE_WRITE_TARGET}[^\s"\']*["\']?{_COMMAND_TAIL}', "link file into sensitive Hermes path"),
+    (rf'\bln\b.*{_SENSITIVE_WRITE_TARGET}', "link sensitive credential/SSH/shell-rc/Hermes path"),
     # In-place edits mutate the target file directly, bypassing redirection,
     # tee, and copy/move/install coverage. Gate the same user-controlled
     # startup/credential files so `sed -i ... ~/.bashrc` and `perl -i ...
