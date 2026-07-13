@@ -89,17 +89,16 @@ def _records_path():
     return get_hermes_home() / "delegations.json"
 
 
-def _pid_alive(pid: Any) -> bool:
-    try:
-        pid = int(pid)
-        if pid <= 0:
-            return False
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
+def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
+    from hermes_cli.active_sessions import _pid_alive as _active_session_pid_alive
+
+    return _active_session_pid_alive(pid, process_start_time)
+
+
+def _current_process_start_time() -> Optional[float]:
+    from hermes_cli.active_sessions import _process_start_time
+
+    return _process_start_time(os.getpid())
 
 
 def _read_persisted_records(path: Path) -> Dict[str, Dict[str, Any]]:
@@ -139,7 +138,10 @@ def _persist_records_locked(
                     continue
                 owner_pid = record.get("owner_pid")
                 if owner_pid != os.getpid() and not (
-                    record.get("status") == "interrupted" and not _pid_alive(owner_pid)
+                    record.get("status") == "interrupted"
+                    and not _pid_alive(
+                        owner_pid, record.get("owner_process_start_time")
+                    )
                 ):
                     continue
                 merged[str(record["delegation_id"])] = {
@@ -191,7 +193,9 @@ def _load_records_locked() -> None:
         record = dict(raw_record)
         record["interrupt_fn"] = None
         record["_home"] = home
-        if record.get("status") == "running" and not _pid_alive(record.get("owner_pid")):
+        if record.get("status") == "running" and not _pid_alive(
+            record.get("owner_pid"), record.get("owner_process_start_time")
+        ):
             record["status"] = "interrupted"
             record["completed_at"] = now
             record["error"] = (
@@ -322,6 +326,7 @@ def dispatch_async_delegation(
         "delegation_id": delegation_id,
         "_home": str(_records_path().parent),
         "owner_pid": os.getpid(),
+        "owner_process_start_time": _current_process_start_time(),
         "goal": goal,
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
@@ -526,6 +531,7 @@ def dispatch_async_delegation_batch(
         "delegation_id": delegation_id,
         "_home": str(_records_path().parent),
         "owner_pid": os.getpid(),
+        "owner_process_start_time": _current_process_start_time(),
         "goal": combined_goal,
         "goals": list(goals),
         "context": context,

@@ -148,10 +148,52 @@ def test_live_foreign_owner_is_not_marked_interrupted(tmp_path, monkeypatch):
     assert "error" not in records[0]
 
 
+def test_pid_probe_reuses_cross_platform_active_session_helper(monkeypatch):
+    seen = {}
+
+    def safe_probe(pid, process_start_time=None):
+        seen["args"] = (pid, process_start_time)
+        return True
+
+    monkeypatch.setattr("hermes_cli.active_sessions._pid_alive", safe_probe)
+
+    assert ad._pid_alive(12345, 678.9) is True
+    assert seen["args"] == (12345, 678.9)
+
+
+def test_reused_owner_pid_is_recovered_as_interrupted(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    monkeypatch.setattr(
+        ad,
+        "_pid_alive",
+        lambda pid, process_start_time=None: process_start_time == 222.0,
+    )
+    records_path.write_text(
+        json.dumps({"records": [{
+            "delegation_id": "reused-pid",
+            "owner_pid": 12345,
+            "owner_process_start_time": 111.0,
+            "goal": "orphaned",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }]}),
+        encoding="utf-8",
+    )
+
+    records = ad.list_async_delegations()
+
+    assert records[0]["status"] == "interrupted"
+
+
 def test_dispatch_merges_foreign_process_records(tmp_path, monkeypatch):
     records_path = tmp_path / "delegations.json"
     monkeypatch.setattr(ad, "_records_path", lambda: records_path)
-    monkeypatch.setattr(ad, "_pid_alive", lambda pid: int(pid) in {12345, os.getpid()})
+    monkeypatch.setattr(
+        ad,
+        "_pid_alive",
+        lambda pid, process_start_time=None: int(pid) in {12345, os.getpid()},
+    )
     records_path.write_text(
         json.dumps({"records": [{
             "delegation_id": "foreign-live",
