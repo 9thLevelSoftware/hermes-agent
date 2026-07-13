@@ -586,6 +586,83 @@ class TestTeePattern:
         assert key is None
 
 
+class TestHermesApprovalStateWriteProtection:
+    @staticmethod
+    def _assert_dangerous(command):
+        dangerous, key, desc = detect_dangerous_command(command)
+        assert dangerous is True, command
+        assert key is not None
+        assert desc
+
+    def test_redirect_overwrite(self):
+        self._assert_dangerous(
+            "echo '{\"requests\":[]}' > ~/.hermes/approval_requests.json"
+        )
+
+    def test_append(self):
+        self._assert_dangerous(
+            "echo forged >> ~/.hermes/approval_requests.json"
+        )
+
+    def test_tee(self):
+        self._assert_dangerous(
+            "echo x | tee ~/.hermes/approval_requests.json"
+        )
+
+    def test_cp_mv_and_install(self):
+        for command in ("cp", "mv", "install"):
+            self._assert_dangerous(
+                f"{command} /tmp/forged.json ~/.hermes/approval_requests.json"
+            )
+
+    def test_symlink(self):
+        self._assert_dangerous(
+            "ln -sf /tmp/forged.json ~/.hermes/approval_requests.json"
+        )
+        self._assert_dangerous(
+            "ln -s ~/.hermes/approval_requests.json /tmp/approval-alias && "
+            "echo forged > /tmp/approval-alias"
+        )
+        for option in ("-s", "-l", "--symbolic-link", "--link"):
+            self._assert_dangerous(
+                f"cp {option} ~/.hermes/approval_requests.json /tmp/approval-alias"
+            )
+
+    def test_sed_in_place_forms(self):
+        self._assert_dangerous(
+            "sed -i 's/pending/resolved/' ~/.hermes/approval_requests.json"
+        )
+        self._assert_dangerous(
+            "sed --in-place 's/pending/resolved/' ~/.hermes/approval_requests.json"
+        )
+
+    def test_perl_and_ruby_in_place(self):
+        self._assert_dangerous(
+            "perl -i -pe 's/pending/resolved/' ~/.hermes/approval_requests.json"
+        )
+        self._assert_dangerous(
+            "ruby -i -pe 'gsub(/pending/, \"resolved\")' ~/.hermes/approval_requests.json"
+        )
+
+    def test_profile_qualified_and_custom_home(self):
+        self._assert_dangerous(
+            "echo forged > ~/.hermes/profiles/work/approval_requests.json"
+        )
+        self._assert_dangerous(
+            "echo forged > ~/.hermes/./approval_requests.json"
+        )
+        self._assert_dangerous(
+            "echo forged > ~/.hermes/profiles/work/../work/approval_requests.json"
+        )
+        self._assert_dangerous(
+            "echo x | tee $HERMES_HOME/approval_requests.json"
+        )
+
+    def test_absolute_active_home_write_requires_approval(self):
+        state_path = get_hermes_home() / "approval_requests.json"
+        self._assert_dangerous(f"echo forged > {state_path}")
+
+
 class TestHermesConfigWriteProtection:
     """Terminal-side pairing for the file_tools write_file/patch deny on
     ~/.hermes/config.yaml (#14639). config.yaml IS the security policy
