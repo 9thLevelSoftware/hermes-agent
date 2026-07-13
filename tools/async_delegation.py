@@ -186,7 +186,6 @@ def _load_records_locked() -> None:
             current is not None
             and current.get("_home") == home
             and current.get("owner_pid") == os.getpid()
-            and current.get("status") == "running"
         ):
             continue
         record = dict(raw_record)

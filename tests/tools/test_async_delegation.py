@@ -255,6 +255,45 @@ def test_persistence_failure_rejects_background_dispatch(monkeypatch):
     assert called is False
 
 
+def test_final_persistence_failure_does_not_resurrect_running_record(
+    tmp_path, monkeypatch
+):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    original_persist = ad._persist_records_locked
+    calls = {"count": 0}
+
+    def flaky_persist(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return original_persist(*args, **kwargs)
+        return False
+
+    monkeypatch.setattr(ad, "_persist_records_locked", flaky_persist)
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    result = ad.dispatch_async_delegation(
+        goal="finish once",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+    )
+    gate.set()
+    assert _drain_one() is not None
+
+    records = ad.list_async_delegations()
+    record = next(item for item in records if item["delegation_id"] == result["delegation_id"])
+    assert record["status"] == "completed"
+    assert ad.active_count() == 0
+
+
 def test_completion_event_lands_on_shared_queue_with_session_key():
     def runner():
         return {"status": "completed", "summary": "the result",
