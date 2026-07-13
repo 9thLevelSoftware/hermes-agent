@@ -228,6 +228,45 @@ def test_dispatch_merges_foreign_process_records(tmp_path, monkeypatch):
     assert _drain_one() is not None
 
 
+def test_locked_capacity_recheck_rejects_foreign_process_race(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    monkeypatch.setattr(ad, "_load_records_locked", lambda: None)
+    monkeypatch.setattr(ad, "_pid_alive", lambda *args: True)
+    records_path.write_text(
+        json.dumps({"records": [{
+            "delegation_id": "foreign-live",
+            "owner_pid": 12345,
+            "owner_process_start_time": 111.0,
+            "goal": "other process",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }]}),
+        encoding="utf-8",
+    )
+    called = False
+
+    def runner():
+        nonlocal called
+        called = True
+        return {"status": "completed"}
+
+    result = ad.dispatch_async_delegation(
+        goal="racing local work",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="local",
+        runner=runner,
+        max_async_children=1,
+    )
+
+    assert result["status"] == "rejected"
+    assert "capacity" in result["error"].lower()
+    assert called is False
+
+
 def test_profile_switch_does_not_drop_another_profiles_running_record(tmp_path, monkeypatch):
     current = {"path": tmp_path / "profile-a" / "delegations.json"}
     monkeypatch.setattr(ad, "_records_path", lambda: current["path"])
@@ -281,7 +320,7 @@ def test_persistence_failure_rejects_background_dispatch(monkeypatch):
         called = True
         return {"status": "completed"}
 
-    monkeypatch.setattr(ad, "_persist_records_locked", lambda: False)
+    monkeypatch.setattr(ad, "_reserve_record_locked", lambda *args: "error")
     result = ad.dispatch_async_delegation(
         goal="must be durable",
         context=None,
@@ -302,16 +341,7 @@ def test_final_persistence_failure_does_not_resurrect_running_record(
 ):
     records_path = tmp_path / "delegations.json"
     monkeypatch.setattr(ad, "_records_path", lambda: records_path)
-    original_persist = ad._persist_records_locked
-    calls = {"count": 0}
-
-    def flaky_persist(*args, **kwargs):
-        calls["count"] += 1
-        if calls["count"] == 1:
-            return original_persist(*args, **kwargs)
-        return False
-
-    monkeypatch.setattr(ad, "_persist_records_locked", flaky_persist)
+    monkeypatch.setattr(ad, "_persist_records_locked", lambda *args, **kwargs: False)
     gate = threading.Event()
 
     def runner():
@@ -424,6 +454,38 @@ def test_crashed_runner_produces_error_completion():
     assert text is not None
     assert "did not complete successfully" in text
     assert "subagent exploded" in text
+
+
+def test_interrupts_are_scoped_to_active_profile(tmp_path, monkeypatch):
+    current_path = tmp_path / "profile-b" / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: current_path)
+    interrupted = {"a": 0, "b": 0}
+    with ad._records_lock:
+        ad._records.update({
+            "deleg-a": {
+                "delegation_id": "deleg-a",
+                "_home": str((tmp_path / "profile-a")),
+                "status": "running",
+                "session_key": "same-session",
+                "interrupt_fn": lambda: interrupted.__setitem__(
+                    "a", interrupted["a"] + 1
+                ),
+            },
+            "deleg-b": {
+                "delegation_id": "deleg-b",
+                "_home": str(current_path.parent),
+                "status": "running",
+                "session_key": "same-session",
+                "interrupt_fn": lambda: interrupted.__setitem__(
+                    "b", interrupted["b"] + 1
+                ),
+            },
+        })
+
+    assert ad.interrupt_for_session(session_key="same-session") == 1
+    assert interrupted == {"a": 0, "b": 1}
+    assert ad.interrupt_all(reason="test") == 1
+    assert interrupted == {"a": 0, "b": 2}
 
 
 def test_interrupt_all_signals_running_children():
