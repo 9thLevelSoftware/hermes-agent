@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -76,7 +77,6 @@ _records_lock = threading.Lock()
 # delegation_id -> record dict. Kept for the lifetime of the run plus a short
 # tail after completion so `list_async_delegations()` can show recent results.
 _records: Dict[str, Dict[str, Any]] = {}
-_records_loaded_homes: set[str] = set()
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # How many completed records to retain for status queries before pruning.
@@ -89,28 +89,84 @@ def _records_path():
     return get_hermes_home() / "delegations.json"
 
 
-def _persist_records_locked(home: Optional[str] = None) -> bool:
+def _pid_alive(pid: Any) -> bool:
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _read_persisted_records(path: Path) -> Dict[str, Dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        return {}
+    records = payload.get("records", [])
+    if not isinstance(records, list):
+        return {}
+    return {
+        str(record["delegation_id"]): dict(record)
+        for record in records
+        if isinstance(record, dict) and record.get("delegation_id")
+    }
+
+
+def _persist_records_locked(
+    home: Optional[str] = None,
+    *,
+    remove_ids: Optional[set[str]] = None,
+) -> bool:
     """Atomically persist one profile's records; never break completion delivery."""
     from utils import atomic_json_write
 
     home = home or str(_records_path().parent)
-    records = [
-        {
-            key: value
-            for key, value in record.items()
-            if key not in {"interrupt_fn", "_home"}
-        }
-        for record in _records.values()
-        if record.get("_home") == home
-    ]
     path = Path(home) / "delegations.json"
     try:
-        atomic_json_write(
-            path,
-            {"records": records},
-            mode=0o600,
-            default=str,
-        )
+        from hermes_cli.active_sessions import _FileLock
+
+        with _FileLock(Path(home) / "delegations.lock"):
+            merged = _read_persisted_records(path)
+            for record in _records.values():
+                if record.get("_home") != home:
+                    continue
+                owner_pid = record.get("owner_pid")
+                if owner_pid != os.getpid() and not (
+                    record.get("status") == "interrupted" and not _pid_alive(owner_pid)
+                ):
+                    continue
+                merged[str(record["delegation_id"])] = {
+                    key: value
+                    for key, value in record.items()
+                    if key not in {"interrupt_fn", "_home"}
+                }
+            for delegation_id in remove_ids or set():
+                merged.pop(delegation_id, None)
+            terminal = [
+                (delegation_id, record)
+                for delegation_id, record in merged.items()
+                if record.get("status") != "running"
+            ]
+            terminal.sort(
+                key=lambda item: item[1].get("completed_at")
+                or item[1].get("dispatched_at")
+                or 0
+            )
+            for delegation_id, _ in terminal[:-_MAX_RETAINED_COMPLETED]:
+                merged.pop(delegation_id, None)
+            atomic_json_write(
+                path,
+                {"records": list(merged.values())},
+                mode=0o600,
+                default=str,
+            )
     except Exception as exc:
         logger.error("Could not persist async delegation records: %s", exc)
         return False
@@ -118,32 +174,25 @@ def _persist_records_locked(home: Optional[str] = None) -> bool:
 
 
 def _load_records_locked() -> None:
-    """Load the active profile once without evicting other profiles' workers."""
+    """Refresh one profile without evicting this process's live workers."""
     path = _records_path()
     home = str(path.parent)
-    if home in _records_loaded_homes:
-        return
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except (OSError, ValueError, TypeError):
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
+    persisted = _read_persisted_records(path)
     recovered = False
     now = time.time()
-    records = payload.get("records", [])
-    if not isinstance(records, list):
-        records = []
-    for record in records:
-        if not isinstance(record, dict):
+    for delegation_id, raw_record in persisted.items():
+        current = _records.get(delegation_id)
+        if (
+            current is not None
+            and current.get("_home") == home
+            and current.get("owner_pid") == os.getpid()
+            and current.get("status") == "running"
+        ):
             continue
-        delegation_id = str(record.get("delegation_id") or "")
-        if not delegation_id:
-            continue
-        record = dict(record)
+        record = dict(raw_record)
         record["interrupt_fn"] = None
         record["_home"] = home
-        if record.get("status") == "running":
+        if record.get("status") == "running" and not _pid_alive(record.get("owner_pid")):
             record["status"] = "interrupted"
             record["completed_at"] = now
             record["error"] = (
@@ -152,7 +201,14 @@ def _load_records_locked() -> None:
             )
             recovered = True
         _records[delegation_id] = record
-    _records_loaded_homes.add(home)
+    persisted_ids = set(persisted)
+    for delegation_id, record in list(_records.items()):
+        if (
+            record.get("_home") == home
+            and record.get("owner_pid") != os.getpid()
+            and delegation_id not in persisted_ids
+        ):
+            _records.pop(delegation_id, None)
     before_prune = sum(1 for record in _records.values() if record.get("_home") == home)
     _prune_completed_locked(home)
     after_prune = sum(1 for record in _records.values() if record.get("_home") == home)
@@ -266,6 +322,7 @@ def dispatch_async_delegation(
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
         "_home": str(_records_path().parent),
+        "owner_pid": os.getpid(),
         "goal": goal,
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
@@ -335,7 +392,9 @@ def dispatch_async_delegation(
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
-            _persist_records_locked()
+            _persist_records_locked(
+                record.get("_home"), remove_ids={delegation_id}
+            )
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -467,6 +526,7 @@ def dispatch_async_delegation_batch(
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
         "_home": str(_records_path().parent),
+        "owner_pid": os.getpid(),
         "goal": combined_goal,
         "goals": list(goals),
         "context": context,
@@ -542,7 +602,9 @@ def dispatch_async_delegation_batch(
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
-            _persist_records_locked()
+            _persist_records_locked(
+                record.get("_home"), remove_ids={delegation_id}
+            )
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
@@ -728,7 +790,6 @@ def _reset_for_tests() -> None:
         _executor_max_workers = 0
     with _records_lock:
         _records.clear()
-        _records_loaded_homes.clear()
         try:
             _records_path().unlink(missing_ok=True)
         except OSError:

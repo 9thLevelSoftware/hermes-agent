@@ -5,6 +5,8 @@ onto the shared process_registry.completion_queue, the rich re-injection block
 formatting, capacity rejection, and crash handling.
 """
 
+import json
+import os
 import queue
 import threading
 import time
@@ -94,27 +96,26 @@ def test_async_executor_workers_are_daemon_threads():
 def test_running_record_recovers_as_interrupted_after_restart(tmp_path, monkeypatch):
     records_path = tmp_path / "delegations.json"
     monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    persisted = {
+        "delegation_id": "deleg_restart",
+        "owner_pid": 99_999_999,
+        "goal": "finish the migration",
+        "context": "continue from the saved child transcript",
+        "toolsets": ["file"],
+        "role": "leaf",
+        "model": "m",
+        "session_key": "session",
+        "parent_session_id": "parent",
+        "child_session_ids": ["child-session-1"],
+        "status": "running",
+        "dispatched_at": time.time() - 30,
+        "completed_at": None,
+    }
+    records_path.write_text(
+        json.dumps({"records": [persisted]}), encoding="utf-8"
+    )
     with ad._records_lock:
-        ad._records_loaded_homes.clear()
-        ad._records["deleg_restart"] = {
-            "delegation_id": "deleg_restart",
-            "_home": str(records_path.parent),
-            "goal": "finish the migration",
-            "context": "continue from the saved child transcript",
-            "toolsets": ["file"],
-            "role": "leaf",
-            "model": "m",
-            "session_key": "session",
-            "parent_session_id": "parent",
-            "child_session_ids": ["child-session-1"],
-            "status": "running",
-            "dispatched_at": time.time() - 30,
-            "completed_at": None,
-            "interrupt_fn": None,
-        }
-        ad._persist_records_locked()
         ad._records.clear()
-        ad._records_loaded_homes.clear()
 
     recovered = ad.list_async_delegations()
 
@@ -125,6 +126,64 @@ def test_running_record_recovers_as_interrupted_after_restart(tmp_path, monkeypa
     assert recovered[0]["context"] == "continue from the saved child transcript"
     assert recovered[0]["child_session_ids"] == ["child-session-1"]
     assert "restart" in recovered[0]["error"].lower()
+
+
+def test_live_foreign_owner_is_not_marked_interrupted(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    records_path.write_text(
+        json.dumps({"records": [{
+            "delegation_id": "foreign-live",
+            "owner_pid": os.getpid(),
+            "goal": "still running",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }]}),
+        encoding="utf-8",
+    )
+
+    records = ad.list_async_delegations()
+
+    assert records[0]["status"] == "running"
+    assert "error" not in records[0]
+
+
+def test_dispatch_merges_foreign_process_records(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    monkeypatch.setattr(ad, "_pid_alive", lambda pid: int(pid) in {12345, os.getpid()})
+    records_path.write_text(
+        json.dumps({"records": [{
+            "delegation_id": "foreign-live",
+            "owner_pid": 12345,
+            "goal": "other process",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }]}),
+        encoding="utf-8",
+    )
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    result = ad.dispatch_async_delegation(
+        goal="local work",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="local",
+        runner=runner,
+    )
+
+    persisted = json.loads(records_path.read_text(encoding="utf-8"))["records"]
+    assert {record["delegation_id"] for record in persisted} == {
+        "foreign-live", result["delegation_id"]
+    }
+    gate.set()
+    assert _drain_one() is not None
 
 
 def test_profile_switch_does_not_drop_another_profiles_running_record(tmp_path, monkeypatch):
@@ -168,7 +227,6 @@ def test_malformed_records_collection_loads_as_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(ad, "_records_path", lambda: records_path)
     with ad._records_lock:
         ad._records.clear()
-        ad._records_loaded_homes.clear()
 
     assert ad.list_async_delegations() == []
 
