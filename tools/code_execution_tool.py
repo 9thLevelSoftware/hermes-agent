@@ -260,16 +260,18 @@ def _dispatch_script_call(
             logger.error("Code-mode catalog action failed: %s", exc, exc_info=True)
             return {"error": str(exc)}
 
-    decision = _script_operation_decision(
-        tool_name, _operation_metadata_for(tool_name),
-    )
-    if decision == "deny":
+    if tool_name in SCRIPT_DENIED_TOOLS:
         return {"error": f"Tool '{tool_name}' is not available to execute_code scripts."}
 
     try:
         from tools.registry import registry
         if registry.get_entry(tool_name) is None:
             return {"error": f"Unknown scripted tool: {tool_name}"}
+
+        operation_metadata = _operation_metadata_for(tool_name)
+        decision = _script_operation_decision(tool_name, operation_metadata)
+        if decision == "deny":
+            return {"error": f"Tool '{tool_name}' is not available to execute_code scripts."}
 
         # Reuse the active model-facing scope when the parent supplied one;
         # the empty tuple preserves the legacy unrestricted RPC behavior.
@@ -285,6 +287,22 @@ def _dispatch_script_call(
             if tool_name not in scoped_tool_names(definitions):
                 return {"error": f"Tool '{tool_name}' is not available in this session."}
 
+        if decision == "approval_required":
+            try:
+                from hermes_cli.plugins import has_middleware
+                has_approval_middleware = has_middleware("tool_execution")
+            except Exception:
+                has_approval_middleware = False
+            if not has_approval_middleware:
+                return {
+                    "status": "approval_required",
+                    "tool_name": tool_name,
+                    "requester": context.session_id or "",
+                    "task_id": context.task_id,
+                    "session_id": context.session_id,
+                    "operation_metadata": operation_metadata,
+                }
+
         from model_tools import handle_function_call
         dispatch_kwargs: Dict[str, Any] = {"task_id": context.task_id}
         if context.session_id is not None:
@@ -293,7 +311,7 @@ def _dispatch_script_call(
             dispatch_kwargs["enabled_toolsets"] = list(context.enabled_toolsets)
         if context.disabled_toolsets:
             dispatch_kwargs["disabled_toolsets"] = list(context.disabled_toolsets)
-        dispatch_kwargs["operation_metadata"] = _operation_metadata_for(tool_name)
+        dispatch_kwargs["operation_metadata"] = operation_metadata
         raw_result = _call_handle_function_call(
             handle_function_call, tool_name, arguments, dispatch_kwargs,
         )

@@ -18,6 +18,7 @@ import pytest
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import shutil
 import socket
 import subprocess
@@ -192,7 +193,6 @@ class TestCodeModeDispatchIntegration:
 
     def test_scripted_calls_keep_middleware_context_metadata_and_approval(self, monkeypatch):
         import model_tools
-        from types import SimpleNamespace
         from tools.registry import registry
 
         read_name = "code_mode_read_fixture"
@@ -231,7 +231,10 @@ class TestCodeModeDispatchIntegration:
             manager = SimpleNamespace(_middleware={"tool_execution": [execution_middleware]})
             monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
             monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", request_middleware)
-            monkeypatch.setattr("hermes_cli.plugins.has_middleware", lambda kind: kind == "tool_request")
+            monkeypatch.setattr(
+                "hermes_cli.plugins.has_middleware",
+                lambda kind: kind in {"tool_request", "tool_execution"},
+            )
             monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: True)
             monkeypatch.setattr(
                 "hermes_cli.plugins.invoke_hook",
@@ -303,6 +306,51 @@ print(json.dumps([
             registry.deregister(read_name)
             registry.deregister(write_name)
 
+    def test_destructive_scripted_call_requires_approval_without_execution_middleware(self, monkeypatch):
+        from tools.registry import registry
+
+        tool_name = "code_mode_destructive_without_middleware"
+        called = []
+
+        def handler(args, **kwargs):
+            called.append((dict(args), dict(kwargs)))
+            return json.dumps({"ok": True})
+
+        registry.register(
+            tool_name,
+            "mcp-code-mode-approval-fixture",
+            _fixture_definition(tool_name),
+            handler,
+            read_only=False,
+            destructive=True,
+            idempotent=False,
+        )
+        try:
+            monkeypatch.setattr(
+                "hermes_cli.plugins.get_plugin_manager",
+                lambda: SimpleNamespace(_middleware={}),
+            )
+            context = CodeExecutionContext(
+                "approval-task", "approval-session", (), (),
+            )
+            result = _dispatch_script_call(tool_name, {"value": "secret"}, context)
+
+            assert result == {
+                "status": "approval_required",
+                "tool_name": tool_name,
+                "requester": "approval-session",
+                "task_id": "approval-task",
+                "session_id": "approval-session",
+                "operation_metadata": {
+                    "read_only": False,
+                    "destructive": True,
+                    "idempotent": False,
+                },
+            }
+            assert called == []
+        finally:
+            registry.deregister(tool_name)
+
     def test_catalog_bridge_scopes_tool_call_before_handler(self, monkeypatch):
         import model_tools
         from tools.registry import registry
@@ -336,7 +384,6 @@ print(json.dumps([
             assert "not available in this session" in str(out_of_scope.get("error"))
 
             real_handle = model_tools.handle_function_call
-            from types import SimpleNamespace
 
             def request_middleware(kind, **kwargs):
                 if kind == "tool_request":
@@ -551,6 +598,7 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("with _seq_lock:", src)
 
     def test_dispatch_keeps_context_with_legacy_handler_signature(self):
+
         seen = {}
 
         def legacy_handler(function_name, function_args, task_id=None, user_task=None):
@@ -559,7 +607,10 @@ class TestHermesToolsGeneration(unittest.TestCase):
             return json.dumps({"ok": True})
 
         context = CodeExecutionContext("task", "session", ("terminal",), ())
-        with patch("model_tools.get_tool_definitions",
+        with patch(
+            "hermes_cli.plugins.get_plugin_manager",
+            return_value=SimpleNamespace(_middleware={"tool_execution": [object()]}),
+        ), patch("model_tools.get_tool_definitions",
                    return_value=[{"function": {"name": "terminal"}}]), \
              patch("model_tools.handle_function_call", side_effect=legacy_handler):
             result = _dispatch_script_call(
@@ -660,8 +711,16 @@ class TestExecuteCode(unittest.TestCase):
         with patch("tools.code_execution_tool._rpc_server_loop") as mock_rpc:
             # Use real execution but mock the tool dispatcher
             pass
-        # Actually run with full integration, mocking at the model_tools level
-        with patch("model_tools.handle_function_call", side_effect=_mock_handle_function_call):
+        # Actually run with full integration, mocking at the model_tools level.
+        execution_manager = SimpleNamespace(
+            _middleware={"tool_execution": [
+                lambda **kwargs: kwargs["next_call"](kwargs["args"]),
+            ]},
+        )
+        with (
+            patch("hermes_cli.plugins.get_plugin_manager", return_value=execution_manager),
+            patch("model_tools.handle_function_call", side_effect=_mock_handle_function_call),
+        ):
             result = execute_code(
                 code=code,
                 task_id="test-task",
@@ -775,7 +834,15 @@ else:
                 function_name, function_args, task_id=task_id, user_task=user_task
             )
 
-        with patch("model_tools.handle_function_call", side_effect=slow_mock):
+        execution_manager = SimpleNamespace(
+            _middleware={"tool_execution": [
+                lambda **kwargs: kwargs["next_call"](kwargs["args"]),
+            ]},
+        )
+        with (
+            patch("hermes_cli.plugins.get_plugin_manager", return_value=execution_manager),
+            patch("model_tools.handle_function_call", side_effect=slow_mock),
+        ):
             raw = execute_code(
                 code=code,
                 task_id="test-concurrent",
@@ -1514,9 +1581,15 @@ class TestRpcTokenAuthorization(unittest.TestCase):
         tool_call_counter = [0]
 
         def _run():
-            with patch(
-                "model_tools.handle_function_call",
-                side_effect=_mock_handle_function_call,
+            with (
+                patch(
+                    "hermes_cli.plugins.get_plugin_manager",
+                    return_value=SimpleNamespace(_middleware={"tool_execution": [object()]}),
+                ),
+                patch(
+                    "model_tools.handle_function_call",
+                    side_effect=_mock_handle_function_call,
+                ),
             ):
                 _rpc_server_loop(
                     listener,
