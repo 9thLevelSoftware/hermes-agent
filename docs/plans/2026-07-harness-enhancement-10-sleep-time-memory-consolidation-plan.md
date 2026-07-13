@@ -27,6 +27,7 @@
 - `agent/curator.py` has idle/interval gates, background fork/runtime resolution, skill backup/reporting, and CLI status/run/pause/rollback.
 - `tools/memory_tool.MemoryStore` has exact dedupe, archive overflow, file locks, drift guard, threat scan, and write approval, but no consolidation curator or archive review action before A6.
 - `agent/memory_manager.commit_session_boundary_async` only extracts through external providers; builtin session-end extraction is the gap A6/A10 close together.
+- The `on_session_end` hook exposed from `agent/turn_finalizer.py` runs at the end of each `run_conversation()` call, not only at a true `/new` or session-close boundary. Never enqueue a dreaming record directly from that hook without an idempotent session watermark; use the existing true boundary path for short-session capture.
 - `agent/background_review.py` already has the restricted fork and `write_origin="background_review"` pattern, but its interval nudges do not review whole memory stores or short/post-nudge sessions.
 - `agent/curator_backup.py` snapshots skills/cron only and must generalize to a supplied memory root without weakening existing skill rollback.
 - `hermes_state`/`session_search` expose recent sessions and anchored windows suitable for bounded unreviewed-episode input.
@@ -50,7 +51,8 @@ The plan skips embeddings/semantic contradiction detection until A6’s retrieva
 - Modify: `tools/write_approval.py` — ensure memory-curator origin stages writes and reports `staged` vs `success`.
 - Modify: `agent/memory_manager.py` — queue builtin session-end extraction signal without external-provider duplication.
 - Modify: `agent/turn_finalizer.py` — add bounded pending-review/session candidate marker if needed.
-- Modify: `cli.py`, `gateway/run.py` — idle tick alongside skill Curator.
+- Modify: `cli.py` — use the true `/new` boundary snapshot/commit path for the pending-session marker; do not treat every turn finalizer call as a session close.
+- Modify: `gateway/run.py` — idle tick alongside skill Curator.
 - Modify: `hermes_cli/curator.py` or create `hermes_cli/memory_curator.py` — run/status/pause/rollback/dry-run commands.
 - Modify: `gateway/slash_commands.py`, `tui_gateway/server.py` — memory curator status/review actions.
 - Modify: `hermes_cli/config.py`, example config/docs.
@@ -285,7 +287,7 @@ def test_short_session_is_queued_for_builtin_dreaming(tmp_path):
     assert memory_curator_pending_sessions(tmp_path)
 ```
 
-- [ ] Step 2: At session boundary, record an eligible session id/last-reviewed cursor in the memory-curator state/queue. Do not run the LLM synchronously in finalization.
+- [ ] Step 2: At the true session boundary (`/new`/handoff/reset path), record an eligible session id/last-reviewed cursor in the memory-curator state/queue. Add a regression assertion that ordinary `run_conversation()` finalization, including its `on_session_end` hook, does not enqueue duplicate “session end” records. Do not run the LLM synchronously in finalization.
 
 - [ ] Step 3: Add `maybe_run_memory_curator()` alongside skill Curator tick sites in CLI/gateway. Reuse idle gates; one run handles bounded pending sessions and marks reviewed cursors only after successful candidate collection/report.
 
