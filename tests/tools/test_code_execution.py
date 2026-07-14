@@ -1458,11 +1458,46 @@ class TestEnvVarFiltering(unittest.TestCase):
             os.environ.update(env_backup)
 
 
-# ---------------------------------------------------------------------------
-# execute_code edge cases
-# ---------------------------------------------------------------------------
+class TestScriptSurfaceAndSecurity(unittest.TestCase):
+    def test_active_registry_definitions_are_used_for_explicit_tools(self):
+        import model_tools
+        from tools.registry import registry
 
-class TestExecuteCodeEdgeCases(unittest.TestCase):
+        fixture = [{"type": "function", "function": _fixture_definition("vision_analyze")}]
+        with patch.object(registry, "get_definitions", return_value=fixture):
+            sandbox_tools, active_definitions = code_execution_tool._script_tool_surface(
+                ["vision_analyze"], None, None,
+            )
+        assert "vision_analyze" in sandbox_tools
+        assert active_definitions == fixture
+
+    def test_explicit_recursive_only_scope_does_not_expand_to_legacy_tools(self):
+        sandbox_tools, active_definitions = code_execution_tool._script_tool_surface(
+            ["execute_code"], None, None,
+        )
+        assert sandbox_tools == set()
+        assert active_definitions == []
+
+    def test_control_plane_and_browser_tools_are_denied(self):
+        denied = code_execution_tool.SCRIPT_DENIED_TOOLS
+        for name in (
+            "workflow_tick", "project_list", "browser_cdp", "browser_dialog",
+            "computer_use",
+        ):
+            assert name in denied
+
+    def test_multimodal_content_obeys_output_cap(self):
+        payload = base64.b64encode(b"\\x89PNG\\r\\n" + b"x" * 200_000).decode()
+        cleaned, artifact, parts = code_execution_tool._prepare_execute_output(
+            "data:image/png;base64," + payload,
+            50_000,
+        )
+        assert artifact
+        assert len(cleaned) <= 50_100
+        assert parts
+        assert len(parts[0]["image_url"]["url"]) <= 50_000
+
+
 
     def test_windows_returns_error(self):
         """When SANDBOX_AVAILABLE is False (e.g. when the backend deems
@@ -1482,9 +1517,49 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("No code", result["error"])
 
+    def test_config_include_narrows_legacy_surface(self):
+        with patch(
+            "tools.code_execution_tool._load_config",
+            return_value={"tools": {"include": ["terminal"], "exclude": []}},
+        ):
+            allowed = json.loads(execute_code(
+                "from hermes_tools import terminal; print('included')",
+                task_id="config-include-allowed",
+                enabled_tools=[],
+            ))
+            denied = json.loads(execute_code(
+                "from hermes_tools import web_search",
+                task_id="config-include-denied",
+                enabled_tools=[],
+            ))
+        assert allowed["status"] == "success"
+        assert "included" in allowed["output"]
+        assert denied["status"] == "error"
+        assert "ImportError" in denied["output"]
+
+    def test_catalog_bridge_honors_explicit_allowed_tools_snapshot(self):
+        context = CodeExecutionContext(
+            "catalog-deny-task",
+            "catalog-deny-session",
+            (),
+            (),
+            allowed_tools=("terminal",),
+        )
+        result = code_execution_tool._dispatch_script_call(
+            "__code_mode_catalog__",
+            {
+                "action": "tool_call",
+                "arguments": {
+                    "name": "project_list",
+                    "arguments": {"path": "outside", "content": "blocked"},
+                },
+            },
+            context,
+        )
+        assert "not available in this session" in str(result["error"])
+
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
     def test_none_enabled_tools_uses_all(self):
-        """When enabled_tools is None, all sandbox tools should be available."""
         code = (
             "from hermes_tools import terminal, web_search, read_file\n"
             "print('all imports ok')\n"
@@ -1495,6 +1570,19 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
                                              enabled_tools=None))
         self.assertEqual(result["status"], "success")
         self.assertIn("all imports ok", result["output"])
+
+    @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
+    def test_script_denylist_blocks_control_plane_and_lifecycle_tools(self):
+        denied_names = {
+            "execute_code", "delegate_task", "tool_call", "clarify", "memory",
+            "todo", "cronjob", "kanban_create", "project_create", "project_list",
+            "workflow_run", "browser_cdp", "browser_dialog", "computer_use",
+        }
+        assert not (denied_names & code_execution_tool._scriptable_tool_names(denied_names))
+        context = CodeExecutionContext("deny-task", "deny-session", ("all",), ())
+        for name in sorted(denied_names):
+            result = code_execution_tool._dispatch_script_call(name, {}, context)
+            assert "not available" in str(result["error"])
 
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
     def test_empty_enabled_tools_uses_all(self):
@@ -1511,21 +1599,18 @@ class TestExecuteCodeEdgeCases(unittest.TestCase):
         self.assertIn("imports ok", result["output"])
 
     @unittest.skipIf(sys.platform == "win32", "UDS not available on Windows")
-    def test_nonoverlapping_tools_fallback(self):
-        """When enabled_tools has no overlap with SANDBOX_ALLOWED_TOOLS,
-        should fall back to all allowed tools."""
+    def test_nonoverlapping_tools_do_not_expand_scope(self):
+        """An explicit scope with no legacy tools remains restricted."""
         code = (
             "from hermes_tools import terminal\n"
-            "print('fallback ok')\n"
+            "print('should not run')\n"
         )
-        with patch("model_tools.handle_function_call",
-                    return_value=json.dumps({"ok": True})):
-            result = json.loads(execute_code(
-                code, task_id="test-nonoverlap",
-                enabled_tools=["vision_analyze", "browser_snapshot"],
-            ))
-        self.assertEqual(result["status"], "success")
-        self.assertIn("fallback ok", result["output"])
+        result = json.loads(execute_code(
+            code, task_id="test-nonoverlap",
+            enabled_tools=["vision_analyze", "browser_snapshot"],
+        ))
+        self.assertEqual(result["status"], "error")
+        self.assertIn("ImportError", result["output"])
 
 
 # ---------------------------------------------------------------------------

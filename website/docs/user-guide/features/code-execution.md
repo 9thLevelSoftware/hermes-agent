@@ -91,7 +91,8 @@ names directly:
   `tool_search`, `tool_describe`, and `tool_call`.
 - **Interactive or memory state:** `clarify` and `memory`.
 - **Lifecycle/control-plane operations:** process and terminal lifecycle tools,
-  todo/cron tools, and the `kanban_*` tools.
+  todo/cron tools, `kanban_*`, `workflow_*`, `project_*`, `browser_cdp`,
+  `browser_dialog`, and `computer_use`.
 
 The generic catalog helpers use an internal bridge action and still reach the
 same parent dispatcher; they do not grant a second execution path. Read-only,
@@ -136,9 +137,33 @@ In `project` mode, a missing, unusable, or too-old active environment falls back
 to `sys.executable`. In `strict` mode, relative paths resolve inside the
 staging directory and project-only dependencies are not expected to be present.
 
-## Resource and artifact limits
+## Resource, session, and artifact limits
 
-The defaults are deliberately the same as the execution constants:
+The canonical nested settings are:
+
+```yaml
+code_execution:
+  sessions:
+    enabled: false
+    idle_timeout_seconds: 900
+  tools:
+    include: []
+    exclude: []
+  artifacts:
+    max_bytes: 10485760
+    max_total_bytes: 52428800
+```
+
+`tools.include` and `tools.exclude` only narrow the model/session tool scope;
+they cannot expand it. Unknown and MCP tools are conservative by default and
+must be present in the active session snapshot. Persistent sessions retain
+Python variables until reset or idle cleanup, and artifacts are size-capped and
+subject to the same approval, path-confinement, and redaction rails as normal
+execution results.
+
+The existing top-level `persistent`, `kernel_idle_ttl`, and `artifact_dir` keys
+remain accepted as backward-compatible aliases. When both forms are present,
+the explicit top-level alias wins for that setting. Other resource defaults are:
 
 | Setting | Default | Effect |
 |---------|---------|--------|
@@ -146,15 +171,23 @@ The defaults are deliberately the same as the execution constants:
 | `max_tool_calls` | `50` | Caps RPC calls in one execution |
 | `max_stdout_bytes` | `50000` | Caps returned stdout; oversized redacted text is spilled |
 | `max_stderr_bytes` | `10000` | Caps returned stderr |
-| `artifact_dir` | `/tmp/hermes-results` | Durable directory for redacted text spills and copied artifacts |
+| `artifacts.max_bytes` | `10485760` | Caps one persisted artifact |
+| `artifacts.max_total_bytes` | `52428800` | Caps all artifacts in one execution |
+| `artifact_dir` | `/tmp/hermes-results` | Durable directory for redacted spills and copied artifacts |
 
-All settings are under `code_execution` in `config.yaml`:
+All settings are under `code_execution` in `config.yaml`. For example:
 
 ```yaml
 code_execution:
-  mode: project
-  persistent: false
-  kernel_idle_ttl: 900
+  sessions:
+    enabled: false
+    idle_timeout_seconds: 900
+  tools:
+    include: []
+    exclude: []
+  artifacts:
+    max_bytes: 10485760
+    max_total_bytes: 52428800
   timeout: 300
   max_tool_calls: 50
   max_stdout_bytes: 50000
@@ -220,15 +253,17 @@ print(sum(state["rows"]))
 At the tool API boundary, use `persistent: true` with an optional `kernel_id`
 (or the compatibility alias `session`). The same task ID and kernel ID reuse
 one child interpreter, so Python globals, imported modules, and state survive
-between calls. An omitted `persistent` argument uses `code_execution.persistent`
-from YAML; its default is `false`. An explicit `persistent: false` always keeps
-fresh-process behavior, and an explicit `persistent: true` remains an opt-in
-regardless of that default.
+between calls. An omitted `persistent` argument uses
+`code_execution.sessions.enabled` from YAML; its default is `false`. The
+legacy `code_execution.persistent` key remains an alias and wins when present.
+An explicit `persistent: false` always keeps fresh-process behavior, while an
+explicit `persistent: true` opts in regardless of the configured default.
 
 ```yaml
 code_execution:
-  persistent: false       # default; omitted calls use fresh processes
-  kernel_idle_ttl: 900    # reap an idle persistent kernel after 15 minutes
+  sessions:
+    enabled: false
+    idle_timeout_seconds: 900
 ```
 
 Lifecycle controls:

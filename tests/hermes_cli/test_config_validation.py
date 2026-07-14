@@ -251,3 +251,33 @@ class TestCodeExecutionValidation:
     def test_code_execution_must_be_a_mapping(self):
         issues = validate_config_structure({"code_execution": []})
         assert any("code_execution must be a mapping" in issue.message for issue in issues)
+
+    def test_nested_code_execution_defaults_match_plan_contract(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        section = DEFAULT_CONFIG["code_execution"]
+        assert section["sessions"] == {
+            "enabled": False,
+            "idle_timeout_seconds": 900,
+        }
+        assert section["tools"] == {"include": [], "exclude": []}
+        assert section["artifacts"] == {
+            "max_bytes": 10_485_760,
+            "max_total_bytes": 52_428_800,
+        }
+
+    def test_nested_code_execution_validation_rejects_bad_shapes(self):
+        issues = validate_config_structure({
+            "code_execution": {
+                "sessions": {"enabled": "yes", "idle_timeout_seconds": 0},
+                "tools": {"include": "read_file", "exclude": [1]},
+                "artifacts": {"max_bytes": 0, "max_total_bytes": -1},
+            },
+        })
+        messages = "\n".join(issue.message for issue in issues)
+        assert "code_execution.sessions.enabled" in messages
+        assert "code_execution.sessions.idle_timeout_seconds" in messages
+        assert "code_execution.tools.include" in messages
+        assert "code_execution.tools.exclude" in messages
+        assert "code_execution.artifacts.max_bytes" in messages
+        assert "code_execution.artifacts.max_total_bytes" in messages

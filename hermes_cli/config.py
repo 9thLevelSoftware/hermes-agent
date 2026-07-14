@@ -2789,6 +2789,18 @@ DEFAULT_CONFIG = {
         "max_tool_calls": 50,
         "max_stdout_bytes": 50_000,
         "max_stderr_bytes": 10_000,
+        "sessions": {
+            "enabled": False,
+            "idle_timeout_seconds": 900,
+        },
+        "tools": {
+            "include": [],
+            "exclude": [],
+        },
+        "artifacts": {
+            "max_bytes": 10_485_760,
+            "max_total_bytes": 52_428_800,
+        },
         # Durable spill files (already-redacted) are written here.
         "artifact_dir": "/tmp/hermes-results",
     },
@@ -5336,7 +5348,77 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                     "Set it to an absolute directory for redacted spill artifacts",
                 ))
 
-    # ── custom_providers must be a list, not a dict ──────────────────────
+            sessions = code_execution.get("sessions")
+            if sessions is not None:
+                if not isinstance(sessions, dict):
+                    issues.append(ConfigIssue(
+                        "error",
+                        "code_execution.sessions must be a mapping",
+                        "Use sessions: with enabled and idle_timeout_seconds underneath it",
+                    ))
+                else:
+                    enabled = sessions.get("enabled")
+                    if "enabled" in sessions and not isinstance(enabled, bool):
+                        issues.append(ConfigIssue(
+                            "error",
+                            "code_execution.sessions.enabled must be a boolean",
+                            "Set sessions.enabled: false (default) or true",
+                        ))
+                    idle_timeout = sessions.get("idle_timeout_seconds")
+                    if "idle_timeout_seconds" in sessions and (
+                        not isinstance(idle_timeout, (int, float))
+                        or isinstance(idle_timeout, bool)
+                        or idle_timeout <= 0
+                    ):
+                        issues.append(ConfigIssue(
+                            "error",
+                            "code_execution.sessions.idle_timeout_seconds must be a number greater than 0",
+                            "Set a positive idle timeout in seconds",
+                        ))
+
+            tools = code_execution.get("tools")
+            if tools is not None:
+                if not isinstance(tools, dict):
+                    issues.append(ConfigIssue(
+                        "error",
+                        "code_execution.tools must be a mapping",
+                        "Use tools: with include and exclude lists underneath it",
+                    ))
+                else:
+                    for list_name in ("include", "exclude"):
+                        values = tools.get(list_name)
+                        if list_name in tools and (
+                            not isinstance(values, list)
+                            or any(not isinstance(item, str) or not item.strip() for item in values)
+                        ):
+                            issues.append(ConfigIssue(
+                                "error",
+                                f"code_execution.tools.{list_name} must be a list of strings",
+                                f"Set tools.{list_name}: [] or a list of tool names",
+                            ))
+
+            artifacts = code_execution.get("artifacts")
+            if artifacts is not None:
+                if not isinstance(artifacts, dict):
+                    issues.append(ConfigIssue(
+                        "error",
+                        "code_execution.artifacts must be a mapping",
+                        "Use artifacts: with max_bytes and max_total_bytes underneath it",
+                    ))
+                else:
+                    for field in ("max_bytes", "max_total_bytes"):
+                        value = artifacts.get(field)
+                        if field in artifacts and (
+                            not isinstance(value, int)
+                            or isinstance(value, bool)
+                            or value <= 0
+                        ):
+                            issues.append(ConfigIssue(
+                                "error",
+                                f"code_execution.artifacts.{field} must be an integer greater than 0",
+                                f"Set artifacts.{field} to a positive byte limit",
+                            ))
+
     cp = config.get("custom_providers")
     if cp is not None:
         if isinstance(cp, dict):

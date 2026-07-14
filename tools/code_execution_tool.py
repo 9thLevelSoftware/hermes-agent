@@ -114,6 +114,8 @@ class CodeExecutionContext:
     # never taken from an untrusted RPC request; they are bound per execution.
     artifact_roots: tuple[str, ...] = ()
     artifact_budget: Optional["ArtifactBudget"] = None
+    # Immutable parent-authorized script names used by generic catalog calls.
+    allowed_tools: tuple[str, ...] = ()
 
 
 # Keep policy names centralized so every RPC transport applies the same
@@ -129,11 +131,19 @@ SCRIPT_LIFECYCLE_TOOLS = frozenset({
     "kanban_heartbeat", "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
 })
+SCRIPT_CONTROL_PLANE_TOOLS = frozenset({
+    "browser_cdp", "browser_dialog", "computer_use",
+    "project_create", "project_list", "project_switch",
+    "workflow_cancel", "workflow_deploy", "workflow_draft",
+    "workflow_execution_show", "workflow_list", "workflow_refine",
+    "workflow_run", "workflow_show", "workflow_tick", "workflow_validate",
+})
 SCRIPT_DENIED_TOOLS = frozenset().union(
     SCRIPT_RECURSION_TOOLS,
     SCRIPT_INTERACTIVE_TOOLS,
     SCRIPT_MEMORY_TOOLS,
     SCRIPT_LIFECYCLE_TOOLS,
+    SCRIPT_CONTROL_PLANE_TOOLS,
 )
 # Internal request kind used by generated catalog helpers. It is not exposed
 # as a registry tool and is handled by the parent adapter below.
@@ -175,6 +185,100 @@ def _scriptable_tool_names(
     return names - SCRIPT_DENIED_TOOLS
 
 
+def _script_tool_surface(
+    enabled_tools: Optional[Iterable[str]],
+    enabled_toolsets: Optional[Iterable[str]],
+    disabled_toolsets: Optional[Iterable[str]],
+    *,
+    include_tools: Optional[Iterable[str]] = None,
+    exclude_tools: Optional[Iterable[str]] = None,
+    explicit_scope: Optional[bool] = None,
+) -> tuple[set[str], list[dict]]:
+    """Resolve the parent-authorized script tools and generated definitions.
+
+    ``None`` and the historical empty list retain the seven-tool compatibility
+    surface. A non-empty explicit list is authoritative: an empty intersection
+    is intentionally empty rather than expanding to the compatibility surface.
+    Toolset-only callers use the same raw registry definitions as the model.
+    """
+    enabled_names = list(enabled_tools) if enabled_tools is not None else None
+    include_names = {str(name) for name in (include_tools or ())}
+    exclude_names = {str(name) for name in (exclude_tools or ())}
+    explicit_names = (
+        bool(enabled_names)
+        if explicit_scope is None
+        else bool(explicit_scope)
+    ) or bool(include_names)
+    requested: set[str]
+    definitions: list[dict] = []
+    if explicit_names:
+        requested = set(enabled_names or ())
+        if include_names:
+            requested = (
+                requested & include_names
+                if enabled_names
+                else set(include_names)
+            )
+    elif enabled_toolsets or disabled_toolsets:
+        from model_tools import get_tool_definitions
+        definitions = get_tool_definitions(
+            enabled_toolsets=list(enabled_toolsets) if enabled_toolsets is not None else None,
+            disabled_toolsets=list(disabled_toolsets) if disabled_toolsets else None,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        requested = {
+            str(item.get("function", {}).get("name", ""))
+            for item in definitions
+            if isinstance(item, dict) and isinstance(item.get("function"), dict)
+        }
+    else:
+        requested = set(SANDBOX_ALLOWED_TOOLS)
+
+    requested -= exclude_names
+    if explicit_names:
+        try:
+            from tools.registry import registry
+            definitions = registry.get_definitions(requested, quiet=True)
+        except Exception:
+            definitions = []
+
+    requested = _scriptable_tool_names(requested)
+    definitions = [
+        item for item in definitions
+        if isinstance(item, dict)
+        and str((item.get("function") or {}).get("name", "")) in requested
+    ]
+    return requested, definitions
+
+
+
+def _legacy_generation_needed(
+    enabled_tools: Optional[Iterable[str]],
+    active_tool_definitions: Iterable[dict],
+    *,
+    include_tools: Optional[Iterable[str]] = None,
+    exclude_tools: Optional[Iterable[str]] = None,
+    enabled_toolsets: Optional[Iterable[str]] = None,
+    disabled_toolsets: Optional[Iterable[str]] = None,
+) -> bool:
+    """Use legacy stubs only for the historical sandbox compatibility surface."""
+    names = {str(name) for name in (enabled_tools or ())}
+    if not names:
+        names = {str(name) for name in (include_tools or ())}
+    names -= {str(name) for name in (exclude_tools or ())}
+    if not names or names - SANDBOX_ALLOWED_TOOLS:
+        return False
+    if enabled_toolsets or disabled_toolsets:
+        return False
+    available = {
+        str((item.get("function") or {}).get("name", ""))
+        for item in (active_tool_definitions or ())
+        if isinstance(item, dict)
+    }
+    return not names.issubset(available)
+
+
 def _script_operation_decision(
     tool_name: str,
     metadata: Optional[Dict[str, bool]],
@@ -196,6 +300,7 @@ def _context_payload(context: Optional[CodeExecutionContext]) -> Dict[str, objec
         "session_id": context.session_id,
         "enabled_toolsets": list(context.enabled_toolsets),
         "disabled_toolsets": list(context.disabled_toolsets),
+        "allowed_tools": list(context.allowed_tools),
         "artifact_roots": list(context.artifact_roots),
         "artifact_max_bytes": int(budget.max_bytes if budget else MAX_ARTIFACT_BYTES),
     }
@@ -271,8 +376,42 @@ def _dispatch_catalog_action(
     if not isinstance(bridge_args, dict):
         return {"error": "Code-mode catalog arguments must be an object."}
 
-    from model_tools import handle_function_call
+    from model_tools import get_tool_definitions, handle_function_call
     dispatch_kwargs: Dict[str, Any] = {"task_id": context.task_id}
+    if context.allowed_tools:
+        try:
+            from tools.registry import registry
+            current_defs = registry.get_definitions(set(context.allowed_tools), quiet=True) or []
+        except Exception:
+            current_defs = []
+    else:
+        try:
+            # Use skip_tool_search_assembly=True so we see the real catalog,
+            # not the already-collapsed bridge-only list (the bridge would
+            # otherwise be searching only itself).
+            current_defs = get_tool_definitions(
+                enabled_toolsets=list(context.enabled_toolsets) or None,
+                disabled_toolsets=list(context.disabled_toolsets) or None,
+                quiet_mode=True, skip_tool_search_assembly=True,
+            ) or []
+        except Exception:
+            current_defs = []
+
+    if bridge_name == "tool_call":
+        from tools import tool_search as _tool_search
+        underlying_name, _, err = _tool_search.resolve_underlying_call(bridge_args)
+        if err or not underlying_name:
+            return {"error": err or "tool_call could not be resolved"}
+        scoped_names = {
+            str((item.get("function") or {}).get("name", ""))
+            for item in current_defs
+            if isinstance(item, dict)
+        }
+        if context.allowed_tools and (
+            underlying_name not in scoped_names
+            or underlying_name in SCRIPT_DENIED_TOOLS
+        ):
+            return {"error": f"'{underlying_name}' is not available in this session."}
     if context.session_id is not None:
         dispatch_kwargs["session_id"] = context.session_id
     if context.enabled_toolsets:
@@ -472,6 +611,42 @@ def _image_parts_from_output(output: str) -> list[dict]:
             if part and part not in parts:
                 parts.append(part)
     return parts
+
+
+def _bound_image_parts(
+    parts: Iterable[dict],
+    limit: int,
+    *,
+    budget: Optional[ArtifactBudget] = None,
+) -> list[dict]:
+    """Keep multimodal payloads bounded, persisting oversized data URLs."""
+    bounded = []
+    for part in parts:
+        url = ((part.get("image_url") or {}).get("url") if isinstance(part, dict) else None)
+        if not isinstance(url, str) or len(url) <= limit:
+            if part not in bounded:
+                bounded.append(part)
+            continue
+        if not url.startswith("data:") or "," not in url:
+            continue
+        header, encoded = url.split(",", 1)
+        if ";base64" not in header.lower():
+            continue
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            continue
+        mime_type = header[5:].split(";", 1)[0] or None
+        persisted = _persist_file_artifact(
+            data,
+            name="execute_image",
+            mime_type=mime_type,
+            budget=budget,
+        )
+        replacement = persisted.get("content", [None])[0]
+        if replacement and replacement not in bounded:
+            bounded.append(replacement)
+    return bounded
 
 
 def _artifact_storage_dir() -> str:
@@ -712,7 +887,11 @@ def _prepare_execute_output(
 ) -> tuple[str, Optional[str], list[dict]]:
     """Clean output, preserve images, and spill oversized text before truncating."""
     cleaned = _clean_execute_text(text)
-    image_parts = _image_parts_from_output(cleaned)
+    image_parts = _bound_image_parts(
+        _image_parts_from_output(cleaned),
+        limit,
+        budget=budget,
+    )
     artifact_path = None
     if len(cleaned) > limit:
         artifact_path = _persist_execute_artifact(cleaned, budget=budget)
@@ -2037,15 +2216,29 @@ def _execute_remote(
     """
 
     _cfg = _load_config()
+    tool_include, tool_exclude = _config_tool_filters(_cfg)
     timeout = timeout if timeout is not None else _config_number(_cfg, "timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _config_number(_cfg, "max_tool_calls", DEFAULT_MAX_TOOL_CALLS, integer=True)
     max_stdout_bytes = _config_number(_cfg, "max_stdout_bytes", MAX_STDOUT_BYTES, integer=True)
     context = context or CodeExecutionContext(task_id, None, (), ())
 
-    requested_tools = SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())
-    if not requested_tools:
-        requested_tools = SANDBOX_ALLOWED_TOOLS
-    sandbox_tools = frozenset(_scriptable_tool_names(requested_tools, {}))
+    sandbox_tools, active_tool_definitions = _script_tool_surface(
+        enabled_tools,
+        context.enabled_toolsets,
+        context.disabled_toolsets,
+        include_tools=tool_include,
+        exclude_tools=tool_exclude,
+        explicit_scope=bool(enabled_tools),
+    )
+    context = replace(context, allowed_tools=tuple(sorted(sandbox_tools)))
+    legacy_generation = _legacy_generation_needed(
+        enabled_tools,
+        active_tool_definitions,
+        include_tools=tool_include,
+        exclude_tools=tool_exclude,
+        enabled_toolsets=context.enabled_toolsets,
+        disabled_toolsets=context.disabled_toolsets,
+    )
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -2097,7 +2290,16 @@ def _execute_remote(
 
         # Generate and ship files
         tools_src = generate_hermes_tools_module(
-            list(sandbox_tools), transport="file", context=context,
+            list(sandbox_tools),
+            transport="file",
+            context=context,
+            active_tool_definitions=(
+                None
+                if legacy_generation
+                else active_tool_definitions
+                if enabled_tools or tool_include or context.enabled_toolsets or context.disabled_toolsets
+                else None
+            ),
         )
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py", tools_src)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
@@ -2358,6 +2560,7 @@ class ExecutionKernel:
         sandbox_tools: frozenset,
         context: CodeExecutionContext,
         *,
+        active_tool_definitions: Optional[list[dict]] = None,
         idle_ttl: float = DEFAULT_KERNEL_IDLE_TTL,
         max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
         max_stdout_bytes: int = MAX_STDOUT_BYTES,
@@ -2367,6 +2570,7 @@ class ExecutionKernel:
         self.task_id = task_id
         self.kernel_id = kernel_id
         self.sandbox_tools = frozenset(sandbox_tools)
+        self.active_tool_definitions = active_tool_definitions
         self.context = context
         self.idle_ttl = float(idle_ttl)
         self.max_tool_calls = int(max_tool_calls)
@@ -2377,6 +2581,7 @@ class ExecutionKernel:
         self.last_activity = clock()
         self.process = None
         self._tmpdir = None
+        self._artifact_dir = None
         self._rpc_server = None
         self._rpc_path = None
         self._control_server = None
@@ -2401,6 +2606,7 @@ class ExecutionKernel:
                 return
             self._tmpdir = tempfile.mkdtemp(prefix="hermes_kernel_")
             artifact_dir = os.path.join(self._tmpdir, "artifacts")
+            self._artifact_dir = artifact_dir
             os.makedirs(artifact_dir, mode=0o700, exist_ok=True)
             self.context = replace(
                 self.context,
@@ -2409,7 +2615,9 @@ class ExecutionKernel:
             )
             self._rpc_context[0] = self.context
             tools_src = generate_hermes_tools_module(
-                list(self.sandbox_tools), context=self.context,
+                list(self.sandbox_tools),
+                context=self.context,
+                active_tool_definitions=self.active_tool_definitions,
             )
             with open(os.path.join(self._tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as handle:
                 handle.write(tools_src)
@@ -2436,6 +2644,7 @@ class ExecutionKernel:
                 "HERMES_RPC_SOCKET": rpc_endpoint,
                 "HERMES_RPC_TOKEN": rpc_token,
                 "HERMES_KERNEL_SOCKET": control_endpoint,
+                "HERMES_ARTIFACTS_DIR": os.path.join(self._tmpdir, "artifacts"),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONIOENCODING": "utf-8",
                 "PYTHONUTF8": "1",
@@ -2563,7 +2772,16 @@ class ExecutionKernel:
                     "duration_seconds": 0,
                 }
 
-            stdout = _clean_kernel_output(response.get("stdout", ""), self.max_stdout_bytes)
+            stdout, output_artifact, output_images = _prepare_execute_output(
+                response.get("stdout", ""),
+                self.max_stdout_bytes,
+                budget=self.context.artifact_budget,
+            )
+            artifact_images, artifact_file = _collect_local_artifacts(
+                self._artifact_dir,
+                self.max_stdout_bytes,
+                budget=self.context.artifact_budget,
+            )
             stderr = _clean_kernel_output(response.get("stderr", ""), self.max_stderr_bytes)
             result = {
                 "status": response.get("status", "error"),
@@ -2579,6 +2797,11 @@ class ExecutionKernel:
                 result["error"] = stderr
                 result["output"] = (stdout + "\n--- stderr ---\n" + stderr).strip()
                 result["stdout"] = stdout
+            _attach_execute_artifacts(
+                result,
+                [*output_images, *artifact_images],
+                output_artifact or artifact_file,
+            )
             return result
 
     def reset(self) -> None:
@@ -2684,6 +2907,7 @@ class ExecutionKernelRegistry:
         sandbox_tools,
         context,
         *,
+        active_tool_definitions=None,
         idle_ttl=None,
         max_tool_calls=DEFAULT_MAX_TOOL_CALLS,
         max_stdout_bytes=MAX_STDOUT_BYTES,
@@ -2694,7 +2918,27 @@ class ExecutionKernelRegistry:
         with self._lock:
             kernel = self._kernels.get(key)
             if kernel is not None and kernel.alive:
-                return kernel
+                incoming_names = {
+                    str((item.get("function") or {}).get("name", ""))
+                    for item in (active_tool_definitions or [])
+                    if isinstance(item, dict)
+                }
+                existing_names = {
+                    str((item.get("function") or {}).get("name", ""))
+                    for item in (kernel.active_tool_definitions or [])
+                    if isinstance(item, dict)
+                }
+                same_scope = (
+                    kernel.sandbox_tools == frozenset(sandbox_tools)
+                    and existing_names == incoming_names
+                    and kernel.context.session_id == context.session_id
+                    and kernel.context.enabled_toolsets == context.enabled_toolsets
+                    and kernel.context.disabled_toolsets == context.disabled_toolsets
+                )
+                if same_scope:
+                    return kernel
+                kernel.close()
+                self._kernels.pop(key, None)
             if kernel is not None:
                 kernel.close()
             kernel = ExecutionKernel(
@@ -2851,8 +3095,14 @@ def execute_code(
         })
 
     _cfg = _load_config()
+    tool_include, tool_exclude = _config_tool_filters(_cfg)
     if persistent is None:
-        persistent = _cfg.get("persistent") is True
+        sessions_cfg = _config_section(_cfg, "sessions")
+        persistent = (
+            _cfg.get("persistent") is True
+            if "persistent" in _cfg
+            else sessions_cfg.get("enabled") is True
+        )
     persistent_requested = bool(persistent or session or kernel_id or reset)
     selected_kernel_id = str(kernel_id or session or "default")
     if persistent_requested and (task_id is None or not str(task_id).strip()):
@@ -2886,7 +3136,7 @@ def execute_code(
         session_id=session_id,
         enabled_toolsets=tuple(str(name) for name in (enabled_toolsets or ())),
         disabled_toolsets=tuple(str(name) for name in (disabled_toolsets or ())),
-        artifact_budget=ArtifactBudget(),
+        artifact_budget=_config_artifact_budget(_cfg),
     )
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
@@ -2947,18 +3197,48 @@ def execute_code(
         configured_idle_ttl = (
             _config_number(cfg, "kernel_idle_ttl", DEFAULT_KERNEL_IDLE_TTL)
             if "kernel_idle_ttl" in cfg
+            else _config_number_nested(
+                cfg,
+                "kernel_idle_ttl",
+                "sessions",
+                "idle_timeout_seconds",
+                DEFAULT_KERNEL_IDLE_TTL,
+            )
+            if "idle_timeout_seconds" in _config_section(cfg, "sessions")
             else None
         )
-        requested_tools = SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())
-        if not requested_tools:
-            requested_tools = SANDBOX_ALLOWED_TOOLS
-        sandbox_tools = frozenset(_scriptable_tool_names(requested_tools, {}))
+        sandbox_tools, active_tool_definitions = _script_tool_surface(
+            enabled_tools,
+            context.enabled_toolsets,
+            context.disabled_toolsets,
+            include_tools=tool_include,
+            exclude_tools=tool_exclude,
+            explicit_scope=bool(enabled_tools),
+        )
+        context = replace(context, allowed_tools=tuple(sorted(sandbox_tools)))
+        legacy_generation = _legacy_generation_needed(
+            enabled_tools,
+            active_tool_definitions,
+            include_tools=tool_include,
+            enabled_toolsets=context.enabled_toolsets,
+            disabled_toolsets=context.disabled_toolsets,
+        )
+        explicit_tool_surface = bool(
+            enabled_tools
+            or context.enabled_toolsets
+            or context.disabled_toolsets
+            or tool_include
+        )
+        active_tool_definitions = (
+            None if legacy_generation else active_tool_definitions
+        ) if explicit_tool_surface else None
         try:
             kernel = _kernel_registry.get_or_create(
                 task_id,
                 selected_kernel_id,
                 sandbox_tools,
                 context,
+                active_tool_definitions=active_tool_definitions,
                 idle_ttl=(
                     kernel_idle_ttl
                     if kernel_idle_ttl is not None
@@ -3015,10 +3295,23 @@ def execute_code(
     max_stderr_bytes = _config_number(_cfg, "max_stderr_bytes", MAX_STDERR_BYTES, integer=True)
 
     # Determine which tools the sandbox can call
-    requested_tools = SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())
-    if not requested_tools:
-        requested_tools = SANDBOX_ALLOWED_TOOLS
-    sandbox_tools = frozenset(_scriptable_tool_names(requested_tools, {}))
+    sandbox_tools, active_tool_definitions = _script_tool_surface(
+        enabled_tools,
+        context.enabled_toolsets,
+        context.disabled_toolsets,
+        include_tools=tool_include,
+        exclude_tools=tool_exclude,
+        explicit_scope=bool(enabled_tools),
+    )
+    context = replace(context, allowed_tools=tuple(sorted(sandbox_tools)))
+    legacy_generation = _legacy_generation_needed(
+        enabled_tools,
+        active_tool_definitions,
+        include_tools=tool_include,
+        exclude_tools=tool_exclude,
+        enabled_toolsets=context.enabled_toolsets,
+        disabled_toolsets=context.disabled_toolsets,
+    )
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
@@ -3063,7 +3356,15 @@ def execute_code(
         # sandbox_tools is already the correct set (intersection with session
         # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
         tools_src = generate_hermes_tools_module(
-            list(sandbox_tools), context=context,
+            list(sandbox_tools),
+            context=context,
+            active_tool_definitions=(
+                None
+                if legacy_generation
+                else active_tool_definitions
+                if enabled_tools or tool_include or context.enabled_toolsets or context.disabled_toolsets
+                else None
+            ),
         )
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)
@@ -3441,6 +3742,51 @@ def _config_number(config: dict, key: str, default, *, integer: bool = False) ->
         logger.warning("Ignoring invalid code_execution.%s=%r; using %r", key, value, default)
         return default
     return int(value) if integer else value
+
+
+def _config_section(config: dict, key: str) -> dict:
+    value = config.get(key, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _config_number_nested(
+    config: dict,
+    key: str,
+    nested_section: str,
+    nested_key: str,
+    default,
+    *,
+    integer: bool = False,
+) -> Any:
+    if key in config:
+        return _config_number(config, key, default, integer=integer)
+    nested = _config_section(config, nested_section)
+    if nested_key in nested:
+        return _config_number(nested, nested_key, default, integer=integer)
+    return default
+
+
+def _config_tool_filters(config: dict) -> tuple[list[str], list[str]]:
+    tools = _config_section(config, "tools")
+    include = tools.get("include", [])
+    exclude = tools.get("exclude", [])
+    return (
+        [str(name) for name in include] if isinstance(include, list) else [],
+        [str(name) for name in exclude] if isinstance(exclude, list) else [],
+    )
+
+
+def _config_artifact_budget(config: dict) -> ArtifactBudget:
+    return ArtifactBudget(
+        max_bytes=_config_number_nested(
+            config, "max_bytes", "artifacts", "max_bytes",
+            MAX_ARTIFACT_BYTES, integer=True,
+        ),
+        max_total_bytes=_config_number_nested(
+            config, "max_total_bytes", "artifacts", "max_total_bytes",
+            MAX_TOTAL_ARTIFACT_BYTES, integer=True,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

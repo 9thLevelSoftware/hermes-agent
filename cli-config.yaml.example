@@ -227,16 +227,24 @@ terminal:
 # Code Execution Tool Configuration
 # =============================================================================
 # execute_code runs Python scripts with RPC access to the enabled Hermes tools.
-# Fresh processes are the default; persistent kernels are opt-in.
+# Fresh processes are the default; persistent sessions are opt-in.
 code_execution:
   mode: "project"             # project (default) or strict
-  persistent: false            # default for calls that omit persistent=true
-  kernel_idle_ttl: 900         # seconds before an idle persistent kernel is reaped
+  sessions:
+    enabled: false             # default for calls that omit persistent=true
+    idle_timeout_seconds: 900  # seconds before an idle persistent kernel is reaped
+  tools:
+    include: []                # local narrowing filter; cannot expand session scope
+    exclude: []                # local narrowing filter
+  artifacts:
+    max_bytes: 10485760        # cap for one persisted artifact
+    max_total_bytes: 52428800  # aggregate cap for one execution
   timeout: 300                 # seconds per script
   max_tool_calls: 50           # RPC calls per script
   max_stdout_bytes: 50000      # returned stdout cap; oversized text is spilled
   max_stderr_bytes: 10000      # returned stderr cap
   artifact_dir: "/tmp/hermes-results"  # redacted durable spill files
+  # Legacy aliases persistent/kernel_idle_ttl remain accepted.
 
 # -----------------------------------------------------------------------------
 # OPTION 2: SSH remote execution

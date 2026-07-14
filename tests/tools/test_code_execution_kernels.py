@@ -1,5 +1,6 @@
 import json
 import os
+import base64
 import threading
 import time
 from types import SimpleNamespace
@@ -91,7 +92,24 @@ def test_config_persistent_default_is_opt_in_without_overriding_explicit_false(t
     assert fresh_second["status"] == "error"
 
 
-def test_persistent_kernel_reuses_existing_tool_rpc_channel():
+def test_persistent_kernel_exports_artifact_root_and_multimodal_results():
+    env_probe = _run(
+        "import os; print(bool(os.environ.get('HERMES_ARTIFACTS_DIR')))",
+        "kernel-test",
+        kernel_id="artifacts",
+    )
+    assert env_probe["output"].strip() == "True"
+
+    payload = base64.b64encode(b"\\x89PNG\\r\\n" + b"x" * 1024).decode()
+    image_result = _run(
+        f"print('data:image/png;base64,{payload}')",
+        "kernel-test",
+        kernel_id="artifacts",
+    )
+    assert image_result.get("_multimodal") is True
+    assert image_result.get("content")
+
+
     execution_manager = SimpleNamespace(_middleware={"tool_execution": [object()]})
     with (
         patch(
@@ -110,6 +128,28 @@ def test_persistent_kernel_reuses_existing_tool_rpc_channel():
     assert result["status"] == "success"
     assert "rpc-ok" in result["output"]
     assert result["tool_calls_made"] == 1
+
+
+def test_nested_sessions_config_enables_persistent_reuse():
+    config = {
+        "sessions": {"enabled": True, "idle_timeout_seconds": 30},
+    }
+    try:
+        with patch("tools.code_execution_tool._load_config", return_value=config):
+            first = json.loads(execute_code(
+                "nested_value = 41",
+                task_id="kernel-nested-config",
+                enabled_tools=[],
+            ))
+            second = json.loads(execute_code(
+                "print(nested_value + 1)",
+                task_id="kernel-nested-config",
+                enabled_tools=[],
+            ))
+    finally:
+        cleanup_execution_kernels("kernel-nested-config")
+    assert first["persistent"] is True
+    assert second["output"].strip() == "42"
 
 
 def test_persistent_kernel_interrupt_kills_worker_and_returns_interrupted_result():
