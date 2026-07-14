@@ -5868,10 +5868,10 @@ class AIAgent:
         self,
         tool_name: str,
         function_args: dict,
-        function_result: str,
+        function_result: Any,
         *,
         failed: bool,
-    ) -> str:
+    ) -> Any:
         decision = self._tool_guardrails.after_call(
             tool_name,
             function_args,
@@ -5879,7 +5879,19 @@ class AIAgent:
             failed=failed,
         )
         if decision.action in {"warn", "halt"}:
-            function_result = append_toolguard_guidance(function_result, decision)
+            if _is_multimodal_tool_result(function_result):
+                function_result = dict(function_result)
+                content = list(function_result.get("content") or [])
+                summary = append_toolguard_guidance(
+                    _multimodal_text_summary(function_result), decision,
+                )
+                function_result["text_summary"] = summary
+                function_result["content"] = [
+                    {"type": "text", "text": summary},
+                    *content,
+                ]
+            else:
+                function_result = append_toolguard_guidance(function_result, decision)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
         return function_result

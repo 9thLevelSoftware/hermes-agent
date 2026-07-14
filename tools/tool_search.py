@@ -672,6 +672,15 @@ def dispatch_tool_describe(args: Dict[str, Any],
     }, ensure_ascii=False)
 
 
+def scoped_tool_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
+    """Return every tool name in a pre-assembly session scope."""
+    return frozenset(
+        name
+        for td in tool_defs
+        if (name := (td.get("function") or td).get("name", ""))
+    )
+
+
 def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     """Return the set of deferrable tool names present in ``tool_defs``.
 
@@ -684,12 +693,10 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     ``tool_executor`` unwrap so a restricted-toolset session can never invoke
     an out-of-scope tool via the bridge.
     """
-    names: set[str] = set()
-    for td in tool_defs:
-        name = (td.get("function") or {}).get("name", "")
-        if name and is_deferrable_tool_name(name):
-            names.add(name)
-    return frozenset(names)
+    return frozenset(
+        name for name in scoped_tool_names(tool_defs)
+        if is_deferrable_tool_name(name)
+    )
 
 
 def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
@@ -746,5 +753,6 @@ __all__ = [
     "dispatch_tool_search",
     "dispatch_tool_describe",
     "resolve_underlying_call",
+    "scoped_tool_names",
     "scoped_deferrable_names",
 ]
