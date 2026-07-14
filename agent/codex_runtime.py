@@ -568,22 +568,40 @@ def run_codex_app_server_turn(
         except Exception as _bump_err:
             logger.debug("skill sidecar bump skipped: %s", _bump_err)
 
-    # Background review fork — same cadence + signature as the default
-    # path (line ~15449). Only fires when a trigger actually tripped AND
-    # we have a verified final response.
-    if (
-        turn_outcome["outcome"] == "verified"
-        and turn.final_text
-        and not turn.interrupted
-        and (should_review_memory or should_review_skills)
-    ):
+    # Background review fork — interval nudges remain a fallback, while
+    # failure/correction/tool-streak signals can review non-verified turns.
+    try:
+        from agent.reflection_triggers import (
+            _tool_results,
+            evaluate_reflection_triggers,
+            should_trigger_review,
+        )
+        reflection_trigger = evaluate_reflection_triggers(
+            turn_outcome,
+            original_user_message,
+            _tool_results(messages),
+        )
+        run_review = should_trigger_review({
+            "agent": agent,
+            "trigger": reflection_trigger,
+            "outcome": turn_outcome["outcome"],
+            "has_response": bool(turn.final_text),
+            "interrupted": turn.interrupted,
+            "interval_triggered": should_review_memory or should_review_skills,
+        })
+    except Exception:
+        reflection_trigger = None
+        run_review = False
+    if run_review:
         try:
+            agent._background_review_trigger = reflection_trigger
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=should_review_memory,
-                review_skills=should_review_skills,
+                review_skills=bool(should_review_skills or reflection_trigger),
             )
         except Exception:
+            agent._background_review_in_flight = False
             logger.debug("background review spawn raised", exc_info=True)
 
     return {

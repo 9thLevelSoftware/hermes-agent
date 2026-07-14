@@ -737,6 +737,7 @@ class PhotonAdapter(BasePlatformAdapter):
                     reply_to_text=content.get("targetText") or None,
                     reply_to_is_own_message=True,
                     raw_message=event,
+                    metadata={"feedback_already_annotated": True},
                     timestamp=timestamp,
                 )
             )

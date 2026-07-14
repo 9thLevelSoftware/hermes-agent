@@ -2357,6 +2357,7 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        self._feedback_handler: Optional[Callable[..., Any]] = self._record_feedback
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
@@ -2804,6 +2805,127 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    async def _record_feedback(
+        self,
+        platform: str,
+        conversation_id: str,
+        message_id: str,
+        actor_id: str,
+        reaction: str,
+        event_id: str,
+    ) -> bool:
+        """Resolve the active session/latest turn and annotate feedback."""
+        if self._is_sender_authorized(actor_id, None, conversation_id) is False:
+            return False
+        store = getattr(self, "_session_store", None)
+        db = getattr(store, "_db", None)
+        if store is None or db is None:
+            return False
+        candidates = [
+            entry for entry in store.list_sessions()
+            if entry.platform == self.platform
+            and entry.origin is not None
+            and str(entry.origin.chat_id) == conversation_id
+        ]
+        if not candidates:
+            return False
+        entry = max(candidates, key=lambda item: item.updated_at)
+        session_id = entry.session_id
+        try:
+            row = db._execute_read(
+                lambda conn: conn.execute(
+                    "SELECT turn_id FROM turn_outcomes WHERE session_id = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+            )
+        except Exception:
+            return False
+        if row is None:
+            return False
+        turn_id = row["turn_id"] if hasattr(row, "keys") else row[0]
+        from agent.reflection_triggers import (
+            evaluate_reflection_triggers,
+            record_feedback_event,
+            should_trigger_review,
+        )
+        recorded = record_feedback_event(
+            platform,
+            conversation_id,
+            message_id,
+            actor_id,
+            reaction,
+            event_id,
+            session_db=db,
+            session_id=session_id,
+            turn_id=turn_id,
+            actor_authorized=True,
+        )
+        if not recorded:
+            return False
+
+        # Annotation succeeds even when a review is already in flight. If this
+        # process still owns the session agent, reuse its existing review state.
+        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        agent = None
+        if runner is not None:
+            agent = getattr(runner, "_running_agents", {}).get(entry.session_key)
+            if agent is None:
+                lock = getattr(runner, "_agent_cache_lock", None)
+                cache = getattr(runner, "_agent_cache", None)
+                if lock is not None and cache is not None:
+                    with lock:
+                        cached = cache.get(entry.session_key)
+                    agent = cached[0] if isinstance(cached, tuple) else cached
+        trigger = evaluate_reflection_triggers("reaction", "", [reaction, event_id])
+        if agent is not None and should_trigger_review({"agent": agent, "trigger": trigger}):
+            try:
+                agent._background_review_trigger = trigger
+                agent._spawn_background_review(
+                    messages_snapshot=list(getattr(agent, "_session_messages", []) or []),
+                    review_memory=False,
+                    review_skills=True,
+                )
+            except Exception:
+                agent._background_review_in_flight = False
+        return True
+
+    def set_feedback_handler(self, callback: Optional[Callable[..., Any]]) -> None:
+        """Register a non-blocking normalized reaction-feedback callback."""
+        self._feedback_handler = callback
+
+    def publish_feedback(
+        self,
+        platform: object,
+        conversation_id: object,
+        message_id: object,
+        actor_id: object,
+        reaction: object,
+        event_id: object,
+    ) -> bool:
+        """Publish feedback; awaitables are scheduled without blocking intake."""
+        callback = getattr(self, "_feedback_handler", None)
+        if callback is None:
+            return False
+        try:
+            result = callback(
+                str(getattr(platform, "value", platform) or ""),
+                str(conversation_id or ""),
+                str(message_id or ""),
+                str(actor_id or ""),
+                str(reaction or ""),
+                str(event_id or ""),
+            )
+            if inspect.isawaitable(result):
+                task = asyncio.ensure_future(result)
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+                return True
+            return bool(result)
+        except Exception:
+            logger.debug("[%s] feedback callback failed", self.name, exc_info=True)
+            return False
 
     def set_topic_recovery_fn(
         self,

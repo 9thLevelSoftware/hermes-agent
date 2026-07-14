@@ -563,20 +563,38 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if (
-        _turn_outcome["outcome"] == "verified"
-        and final_response
-        and not interrupted
-        and (_should_review_memory or _should_review_skills)
-    ):
+    try:
+        from agent.reflection_triggers import (
+            _tool_results,
+            evaluate_reflection_triggers,
+            should_trigger_review,
+        )
+        _reflection_trigger = evaluate_reflection_triggers(
+            _turn_outcome,
+            original_user_message,
+            _tool_results(messages),
+        )
+        _run_review = should_trigger_review({
+            "agent": agent,
+            "trigger": _reflection_trigger,
+            "outcome": _turn_outcome["outcome"],
+            "has_response": bool(final_response),
+            "interrupted": interrupted,
+            "interval_triggered": _should_review_memory or _should_review_skills,
+        })
+    except Exception:
+        _reflection_trigger = None
+        _run_review = False
+    if _run_review:
         try:
+            agent._background_review_trigger = _reflection_trigger
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=_should_review_memory,
-                review_skills=_should_review_skills,
+                review_skills=bool(_should_review_skills or _reflection_trigger),
             )
         except Exception:
-            pass  # Background review is best-effort
+            agent._background_review_in_flight = False
 
     # Note: Memory provider on_session_end() + shutdown_all() are NOT
     # called here — run_conversation() is called once per user message in

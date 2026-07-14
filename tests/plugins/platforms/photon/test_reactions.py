@@ -238,6 +238,7 @@ async def test_inbound_reaction_on_bot_message_routed(
     assert event.reply_to_message_id == "bot-msg-1"
     assert event.reply_to_text == "the bot's earlier reply"
     assert event.reply_to_is_own_message is True
+    assert event.metadata["feedback_already_annotated"] is True
 
 
 @pytest.mark.asyncio

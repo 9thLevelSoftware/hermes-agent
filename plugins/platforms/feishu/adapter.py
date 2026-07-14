@@ -2949,6 +2949,7 @@ class FeishuAdapter(BasePlatformAdapter):
             raw_message=data,
             message_id=message_id,
             channel_prompt=self._resolve_channel_prompt(chat_id),
+            metadata={"feedback_already_annotated": True},
             timestamp=datetime.now(),
         )
         logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
