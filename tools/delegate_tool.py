@@ -1317,46 +1317,87 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
-    child = AIAgent(
-        base_url=effective_base_url,
-        api_key=effective_api_key,
-        model=effective_model,
-        provider=effective_provider,
-        api_mode=effective_api_mode,
-        acp_command=effective_acp_command,
-        acp_args=effective_acp_args,
-        max_iterations=max_iterations,
+    parent_session_db = getattr(parent_agent, "_session_db", None)
+    child_session_db = None
+    child_owns_session_db = False
+    child = None
+    child_cleanup_closed_db = False
+    try:
+        if parent_session_db is not None:
+            child_session_db = parent_session_db.fork()
+            child_owns_session_db = True
 
-        reasoning_config=child_reasoning,
-        prefill_messages=getattr(parent_agent, "prefill_messages", None),
-        fallback_model=parent_fallback,
-        enabled_toolsets=child_toolsets,
-        quiet_mode=True,
-        ephemeral_system_prompt=child_prompt,
-        log_prefix=f"[subagent-{task_index}]",
-        platform="subagent",
-        skip_context_files=True,
-        skip_memory=True,
-        clarify_callback=None,
-        thinking_callback=child_thinking_cb,
-        session_db=getattr(parent_agent, "_session_db", None),
-        parent_session_id=getattr(parent_agent, "session_id", None),
-        providers_allowed=child_providers_allowed,
-        providers_ignored=child_providers_ignored,
-        providers_order=child_providers_order,
-        provider_sort=child_provider_sort,
-        provider_require_parameters=child_provider_require_parameters,
-        provider_data_collection=child_provider_data_collection,
-        request_overrides=(
-            dict(override_request_overrides or {})
-            if override_provider
-            else dict(getattr(parent_agent, "request_overrides", {}) or {})
-        ),
-        openrouter_min_coding_score=child_openrouter_min_coding_score,
-        tool_progress_callback=child_progress_cb,
-        iteration_budget=None,  # fresh budget per subagent
-        **child_optional_kwargs,
-    )
+        child_kwargs: Dict[str, Any] = dict(
+            base_url=effective_base_url,
+            api_key=effective_api_key,
+            model=effective_model,
+            provider=effective_provider,
+            api_mode=effective_api_mode,
+            acp_command=effective_acp_command,
+            acp_args=effective_acp_args,
+            max_iterations=max_iterations,
+            reasoning_config=child_reasoning,
+            prefill_messages=getattr(parent_agent, "prefill_messages", None),
+            fallback_model=parent_fallback,
+            enabled_toolsets=child_toolsets,
+            quiet_mode=True,
+            ephemeral_system_prompt=child_prompt,
+            log_prefix=f"[subagent-{task_index}]",
+            platform="subagent",
+            skip_context_files=True,
+            skip_memory=True,
+            clarify_callback=None,
+            thinking_callback=child_thinking_cb,
+            session_db=child_session_db,
+            owns_session_db=child_owns_session_db,
+            parent_session_id=getattr(parent_agent, "session_id", None),
+            providers_allowed=child_providers_allowed,
+            providers_ignored=child_providers_ignored,
+            providers_order=child_providers_order,
+            provider_sort=child_provider_sort,
+            provider_require_parameters=child_provider_require_parameters,
+            provider_data_collection=child_provider_data_collection,
+            request_overrides=(
+                dict(override_request_overrides or {})
+                if override_provider
+                else dict(getattr(parent_agent, "request_overrides", {}) or {})
+            ),
+            openrouter_min_coding_score=child_openrouter_min_coding_score,
+            tool_progress_callback=child_progress_cb,
+            iteration_budget=None,
+            **child_optional_kwargs,
+        )
+        if isinstance(AIAgent, type):
+            child = AIAgent.__new__(AIAgent)
+            AIAgent.__init__(child, **child_kwargs)
+        else:
+            # Keep patched constructor doubles working in unit tests.
+            child = AIAgent(**child_kwargs)
+    except Exception:
+        try:
+            if child is not None:
+                child.close()
+                # ponytail: close() may have torn down _conn and then
+                # raised. Observe the post-attempt state to decide
+                # whether the fallback path is even needed — calling
+                # close() again on a non-idempotent DB that already
+                # dropped its connection would double-close.
+                child_cleanup_closed_db = (
+                    getattr(child, "_session_db", None) is child_session_db
+                    and bool(getattr(child, "_session_db_closed", False))
+                ) or not getattr(child_session_db, "is_open", True)
+        except Exception:
+            pass
+        if (
+            child_session_db is not None
+            and not child_cleanup_closed_db
+            and getattr(child_session_db, "is_open", True)
+        ):
+            try:
+                child_session_db.close()
+            except Exception:
+                pass
+        raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
@@ -2537,6 +2578,26 @@ def delegate_task(
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
+    except Exception:
+        for _, _, child in children:
+            try:
+                if hasattr(parent_agent, "_active_children"):
+                    lock = getattr(parent_agent, "_active_children_lock", None)
+                    if lock:
+                        with lock:
+                            try:
+                                parent_agent._active_children.remove(child)
+                            except ValueError:
+                                pass
+                    else:
+                        try:
+                            parent_agent._active_children.remove(child)
+                        except ValueError:
+                            pass
+                child.close()
+            except Exception:
+                pass
+        raise
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names

@@ -5444,7 +5444,7 @@ def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
-    return finalize_turn(
+    result = finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -5460,6 +5460,11 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
     )
+    if _turn_exit_reason == "guardrail_halt":
+        # A controlled guardrail stop is a completed public turn, even though
+        # its durable outcome remains blocked for audit/recovery semantics.
+        result["completed"] = True
+    return result
 
 
 

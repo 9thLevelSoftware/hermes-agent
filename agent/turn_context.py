@@ -400,6 +400,12 @@ def build_turn_context(
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
 
+    # Conservative session lease (Task4): first turn claims, subsequent
+    # turns extend. Best-effort — never raises; lease is informational.
+    _claim_or_touch_session_lease = getattr(agent, "_claim_or_touch_session_lease", None)
+    if callable(_claim_or_touch_session_lease):
+        _claim_or_touch_session_lease()
+
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.
     # See ``_should_run_preflight_estimate`` for the OR semantics that fix

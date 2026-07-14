@@ -56,6 +56,29 @@ def test_is_destructive_command_treats_install_as_mutating():
     assert run_agent._is_destructive_command("install template.env .env") is True
 
 
+def test_session_db_ownership_parameter_preserves_parent_session_positional_order():
+    from agent.agent_init import init_agent
+
+    agent_parameters = list(inspect.signature(AIAgent.__init__).parameters)
+    init_parameters = list(inspect.signature(init_agent).parameters)
+
+    assert agent_parameters.index("owns_session_db") > agent_parameters.index("parent_session_id")
+    assert init_parameters.index("owns_session_db") > init_parameters.index("parent_session_id")
+
+
+def test_lazy_recall_marks_new_session_db_as_owned():
+    agent = object.__new__(AIAgent)
+    agent._session_db = None
+    agent._owns_session_db = False
+    agent._persist_disabled = False
+    session_db = MagicMock()
+
+    with patch("hermes_state.SessionDB", return_value=session_db):
+        assert agent._get_session_db_for_recall() is session_db
+
+    assert agent._owns_session_db is True
+
+
 def test_run_conversation_dict_returns_include_final_response():
     """Structurally enforce final_response on dict returns from run_conversation().
 
@@ -8216,3 +8239,139 @@ class TestMemoryProviderTurnStart:
         # The extracted body uses ``agent.X`` rather than ``self.X``;
         # assert the extracted-form spelling directly.
         assert "on_turn_start(agent._user_turn_count" in src
+
+
+class TestSessionLeaseLifecycle:
+    """Task4: AIAgent must claim on first turn prologue, touch on subsequent
+    turns, and release on close. The lease is informational — never raises,
+    never blocks. Verifies the wiring without driving the full loop."""
+
+    def test_first_turn_claims_then_subsequent_touch(self, agent):
+        session_db = MagicMock()
+        agent._session_db = session_db
+        agent.session_id = "s1"
+        agent._persist_disabled = False
+        # No prior lease — touch returns False, claim is then attempted.
+        session_db.touch_session_lease.return_value = False
+        session_db.claim_session_lease.return_value = True
+
+        agent._claim_or_touch_session_lease()
+
+        session_db.touch_session_lease.assert_called_once()
+        session_db.claim_session_lease.assert_called_once()
+        # Owner id is stable across calls.
+        first_owner = session_db.claim_session_lease.call_args[0][1]
+        assert first_owner.startswith("pid=")
+        assert "tid=" in first_owner
+        assert "agent=" in first_owner
+
+    def test_touch_only_when_already_leased(self, agent):
+        session_db = MagicMock()
+        agent._session_db = session_db
+        agent.session_id = "s1"
+
+        # Subsequent turn: touch succeeds, claim is skipped.
+        session_db.touch_session_lease.return_value = True
+
+        agent._claim_or_touch_session_lease()
+
+        session_db.touch_session_lease.assert_called_once()
+        session_db.claim_session_lease.assert_not_called()
+
+    def test_no_session_db_is_noop(self, agent):
+        agent._session_db = None
+        agent.session_id = "s1"
+        # Must not raise.
+        agent._claim_or_touch_session_lease()
+
+    def test_persist_disabled_skips_lease(self, agent):
+        session_db = MagicMock()
+        agent._session_db = session_db
+        agent.session_id = "s1"
+        agent._persist_disabled = True
+
+        agent._claim_or_touch_session_lease()
+        agent._release_session_lease()
+
+        session_db.touch_session_lease.assert_not_called()
+        session_db.claim_session_lease.assert_not_called()
+        session_db.release_session_lease.assert_not_called()
+
+    def test_release_uses_owner_id_from_claim(self, agent):
+        session_db = MagicMock()
+        agent._session_db = session_db
+        agent.session_id = "s1"
+
+        # Claim first to populate _lease_owner_id.
+        session_db.touch_session_lease.return_value = False
+        session_db.claim_session_lease.return_value = True
+        agent._claim_or_touch_session_lease()
+        owner = agent._lease_owner_id
+
+        session_db.release_session_lease.return_value = True
+        agent._release_session_lease()
+
+        session_db.release_session_lease.assert_called_once_with("s1", owner)
+
+    def test_release_without_prior_claim_is_noop(self, agent):
+        """No owner id has been minted — release must short-circuit
+        without ever touching the DB."""
+        session_db = MagicMock()
+        agent._session_db = session_db
+        agent.session_id = "s1"
+        agent._lease_owner_id = None
+
+        agent._release_session_lease()
+        session_db.release_session_lease.assert_not_called()
+
+    def test_prologue_calls_claim_or_touch(self, agent):
+        """Source-level check: build_turn_context invokes the lease helper
+        right after _persist_session — the standard per-turn prologue wiring."""
+        import inspect
+        from agent.turn_context import build_turn_context as _btc
+        src = inspect.getsource(_btc)
+        assert "_claim_or_touch_session_lease" in src
+        # Ordering: lease claim/touch fires AFTER persist_session.
+        assert src.index("_claim_or_touch_session_lease") > src.index("_persist_session")
+
+    def test_close_releases_lease(self, agent):
+        """close() must invoke _release_session_lease after end_session."""
+        session_db = MagicMock()
+        agent._session_db = session_db
+        agent.session_id = "s1"
+        agent._lease_owner_id = "pid=1:owner"
+        # Stubs to keep close() focused on the lease path.
+        agent._end_session_on_close = True
+        agent._session_end_called = False
+        agent._owns_session_db = False
+        agent._session_db_closed = False
+        agent._cached_system_prompt = None
+        agent._save_session_log = lambda *a, **k: None
+        agent._flush_messages_to_session_db = lambda *a, **k: None
+
+        with patch("run_agent.time.sleep", return_value=None):
+            agent.close()
+
+        session_db.release_session_lease.assert_called_once_with("s1", "pid=1:owner")
+
+
+def test_close_closes_owned_db_when_end_session_fails(agent):
+    class FailingEndSessionDB:
+        def __init__(self):
+            self.closed = False
+
+        def end_session(self, *_args):
+            raise RuntimeError("end failed")
+
+        def close(self):
+            self.closed = True
+
+    db = FailingEndSessionDB()
+    agent._session_db = db
+    agent.session_id = "session-123"
+    agent._owns_session_db = True
+    agent._end_session_on_close = True
+
+    agent.close()
+
+    assert db.closed is True

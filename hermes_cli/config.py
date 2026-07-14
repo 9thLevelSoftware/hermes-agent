@@ -2846,6 +2846,10 @@ DEFAULT_CONFIG = {
             # Percentage of context length at which "auto" mode kicks in.
             # 10 matches the Claude Code default. Range 0..100.
             "threshold_pct": 10,
+            # Absolute schema-token ceiling for "auto" mode. The effective
+            # threshold is the lower of this value and threshold_pct of context.
+            # Range 1,000..100,000.
+            "absolute_threshold_tokens": 20_000,
             # When the model calls tool_search without a ``limit`` argument,
             # how many hits to return. Range 1..max_search_limit.
             "search_default_limit": 5,

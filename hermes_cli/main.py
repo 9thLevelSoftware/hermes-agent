@@ -4260,6 +4260,19 @@ def cmd_status(args):
     show_status(args)
 
 
+def cmd_reliability(args):
+    """Offline harness fault matrix (deterministic, no network)."""
+    from hermes_cli.reliability import cmd_reliability as _run_reliability
+
+    # ponytail: hermes_cli/main.py's dispatcher discards the handler's
+    # return value, so cmd_reliability must translate rc → sys.exit()
+    # itself to honor its documented 0/1/2 exit-code contract.
+    rc = _run_reliability(args)
+    if rc:
+        sys.exit(rc)
+    return rc
+
+
 def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
@@ -12417,6 +12430,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
+        "reliability",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
@@ -13171,6 +13185,35 @@ def main():
     # status command  (parser built in hermes_cli/subcommands/status.py)
     # =========================================================================
     build_status_parser(subparsers, cmd_status=cmd_status)
+
+    # =========================================================================
+    # reliability command — offline harness fault matrix
+    # =========================================================================
+    reliability_parser = subparsers.add_parser(
+        "reliability",
+        help="Offline harness fault matrix (end-state reliability scenarios).",
+        description=(
+            "Deterministic, offline. Runs the eight end-state fault "
+            "scenarios from agent.reliability_scenarios against the "
+            "in-process OperationJournal + FakeDelivery fakes. Exits "
+            "0 when every scenario passes, 1 when any fails, 2 on "
+            "invalid usage."
+        ),
+    )
+    reliability_sub = reliability_parser.add_subparsers(
+        dest="reliability_command",
+        required=True,
+    )
+    reliability_check = reliability_sub.add_parser(
+        "check",
+        help="Run the eight end-state fault scenarios and render the matrix.",
+    )
+    reliability_check.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the matrix as JSON (summary + per-scenario rows).",
+    )
+    reliability_check.set_defaults(func=cmd_reliability)
 
     # =========================================================================
     # cron command  (parser built in hermes_cli/subcommands/cron.py)
