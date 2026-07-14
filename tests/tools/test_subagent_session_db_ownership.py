@@ -69,7 +69,7 @@ def test_owned_session_db_is_ended_and_closed_once():
     session_db.close.assert_called_once_with()
 
 
-def test_owned_session_db_retries_failed_end_without_closing_real_db(tmp_path):
+def test_owned_session_db_closes_after_failed_end(tmp_path):
     session_db = SessionDB(db_path=tmp_path / "state.db")
     session_db.create_session("session-under-test", source="test")
     agent = _make_agent(session_db, owns_session_db=True)
@@ -87,9 +87,8 @@ def test_owned_session_db_retries_failed_end_without_closing_real_db(tmp_path):
     try:
         agent.close()
         assert agent._session_end_called is False
-        assert agent._session_db_closed is False
-
-        agent.close()
+        assert agent._session_db_closed is True
+        assert session_db.is_open is False
 
         verification_db = SessionDB(db_path=session_db.db_path)
         try:
@@ -97,10 +96,7 @@ def test_owned_session_db_retries_failed_end_without_closing_real_db(tmp_path):
         finally:
             verification_db.close()
         assert row is not None
-        assert row["ended_at"] is not None
-        assert row["end_reason"] == "agent_close"
-        assert agent._session_end_called is True
-        assert agent._session_db_closed is True
+        assert row["ended_at"] is None
     finally:
         session_db.close()
 

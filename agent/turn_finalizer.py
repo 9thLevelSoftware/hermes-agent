@@ -156,7 +156,10 @@ def finalize_turn(
         _turn_exit_reason=_turn_exit_reason,
         verification_status=getattr(agent, "_turn_verification_status", None),
     )
-    completed = _turn_outcome["outcome"] in {"verified", "completed_unverified"}
+    completed = (
+        _turn_outcome["outcome"] in {"verified", "completed_unverified"}
+        or _turn_exit_reason == "guardrail_halt"
+    )
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
