@@ -1578,8 +1578,12 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
         try:
             from tools.code_execution_tool import cleanup_execution_kernels
             cleanup_execution_kernels(task_id)
-        except ImportError:
-            pass
+        except Exception:
+            logger.warning(
+                "Could not clean up execute_code kernels for task %s",
+                task_id,
+                exc_info=True,
+            )
 
         # Invalidate stale file_ops cache entry (Bug fix: prevents
         # ShellFileOperations from referencing a dead sandbox)
@@ -1733,8 +1737,12 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     try:
         from tools.code_execution_tool import cleanup_execution_kernels
         cleanup_execution_kernels(task_id)
-    except ImportError:
-        pass
+    except Exception:
+        logger.warning(
+            "Could not clean up execute_code kernels for task %s",
+            task_id,
+            exc_info=True,
+        )
 
     # Invalidate stale file_ops cache entry
     try:

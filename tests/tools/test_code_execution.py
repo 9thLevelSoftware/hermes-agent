@@ -349,7 +349,12 @@ print(json.dumps([
             result = _dispatch_script_call(tool_name, {"value": "secret"}, context)
 
             assert result == {
-                "status": "approval_required",
+                "status": "error",
+                "error": (
+                    f"Tool '{tool_name}' requires interactive approval, but the "
+                    "tool_execution approval middleware is not configured."
+                ),
+                "approval_required": True,
                 "tool_name": tool_name,
                 "requester": "approval-session",
                 "task_id": "approval-task",
@@ -491,7 +496,12 @@ print(json.dumps([
             )
 
             assert result == {
-                "status": "approval_required",
+                "status": "error",
+                "error": (
+                    f"Tool '{tool_name}' requires interactive approval, but the "
+                    "tool_execution approval middleware is not configured."
+                ),
+                "approval_required": True,
                 "tool_name": tool_name,
                 "requester": "catalog-approval-session",
                 "task_id": "catalog-approval-task",
@@ -759,7 +769,7 @@ class TestHermesToolsGeneration(unittest.TestCase):
         self.assertIn("_seq_lock = threading.Lock()", src)
         self.assertIn("with _seq_lock:", src)
 
-    def test_dispatch_keeps_context_with_legacy_handler_signature(self):
+    def test_dispatch_rejects_legacy_handler_that_cannot_receive_operation_metadata(self):
 
         seen = {}
 
@@ -779,12 +789,8 @@ class TestHermesToolsGeneration(unittest.TestCase):
                 "terminal", {"command": "echo hi"}, context,
             )
 
-        self.assertEqual(result, {"ok": True})
-        self.assertEqual(seen, {
-            "function_name": "terminal",
-            "function_args": {"command": "echo hi"},
-            "task_id": "task",
-        })
+        self.assertIn("unexpected keyword argument", result["error"])
+        self.assertEqual(seen, {})
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):

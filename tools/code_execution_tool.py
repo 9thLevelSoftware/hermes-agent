@@ -39,6 +39,7 @@ import platform
 import re
 import secrets
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -320,17 +321,29 @@ def _context_from_rpc_request(
 def _call_handle_function_call(
     handler, tool_name: str, arguments: dict, dispatch_kwargs: Dict[str, Any],
 ):
-    """Call current or legacy dispatchers without dropping real context."""
-    try:
-        return handler(tool_name, dict(arguments), **dispatch_kwargs)
-    except TypeError as exc:
-        if "unexpected keyword argument" not in str(exc):
-            raise
-        return handler(
-            tool_name,
-            dict(arguments),
-            task_id=dispatch_kwargs.get("task_id"),
-        )
+    """Call the dispatcher without dropping security-sensitive context."""
+    return handler(tool_name, dict(arguments), **dispatch_kwargs)
+
+
+def _approval_required_response(
+    tool_name: str,
+    context: CodeExecutionContext,
+    operation_metadata: Dict[str, bool],
+) -> dict[str, object]:
+    """Fail closed when scripted execution has no approval prompt channel."""
+    return {
+        "status": "error",
+        "error": (
+            f"Tool '{tool_name}' requires interactive approval, but the "
+            "tool_execution approval middleware is not configured."
+        ),
+        "approval_required": True,
+        "tool_name": tool_name,
+        "requester": context.session_id or "",
+        "task_id": context.task_id,
+        "session_id": context.session_id,
+        "operation_metadata": operation_metadata,
+    }
 
 
 def _dispatch_catalog_action(
@@ -429,14 +442,9 @@ def _dispatch_catalog_action(
             except Exception:
                 has_approval_middleware = False
             if not has_approval_middleware:
-                return {
-                    "status": "approval_required",
-                    "tool_name": underlying_name,
-                    "requester": context.session_id or "",
-                    "task_id": context.task_id,
-                    "session_id": context.session_id,
-                    "operation_metadata": operation_metadata,
-                }
+                return _approval_required_response(
+                    underlying_name, context, operation_metadata,
+                )
     if context.session_id is not None:
         dispatch_kwargs["session_id"] = context.session_id
     if context.enabled_toolsets:
@@ -507,14 +515,9 @@ def _dispatch_script_call(
             except Exception:
                 has_approval_middleware = False
             if not has_approval_middleware:
-                return {
-                    "status": "approval_required",
-                    "tool_name": tool_name,
-                    "requester": context.session_id or "",
-                    "task_id": context.task_id,
-                    "session_id": context.session_id,
-                    "operation_metadata": operation_metadata,
-                }
+                return _approval_required_response(
+                    tool_name, context, operation_metadata,
+                )
 
         from model_tools import handle_function_call
         dispatch_kwargs: Dict[str, Any] = {"task_id": context.task_id}
@@ -552,6 +555,9 @@ DEFAULT_ARTIFACT_DIR = "/tmp/hermes-results"
 _IMAGE_SUFFIXES = frozenset({
     ".bmp", ".gif", ".heic", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp",
 })
+_SAFE_IMAGE_MIME_TYPES = frozenset({
+    "image/gif", "image/jpeg", "image/png", "image/webp",
+})
 
 
 def _image_url_candidate(value: Any) -> Optional[str]:
@@ -568,12 +574,18 @@ def _image_url_candidate(value: Any) -> Optional[str]:
         return None
     lowered = raw.lower()
     if lowered.startswith("data:image/") and "," in raw:
-        return raw
+        data_mime = raw[5:raw.index(",")].split(";", 1)[0].lower()
+        return raw if data_mime in _SAFE_IMAGE_MIME_TYPES else None
+    if re.match(r"^[A-Za-z]:[\\/]", raw):
+        local_path = os.path.expanduser(raw)
+        return os.path.abspath(local_path) if os.path.isfile(local_path) else None
     parsed = urlsplit(raw)
     if parsed.scheme in {"http", "https"}:
         return raw if os.path.splitext(parsed.path)[1].lower() in _IMAGE_SUFFIXES else None
     if parsed.scheme == "file":
         local_path = unquote(parsed.path)
+        if _IS_WINDOWS and re.match(r"^/[A-Za-z]:[\\/]?", local_path):
+            local_path = local_path[1:]
     elif parsed.scheme:
         return None
     else:
@@ -711,6 +723,19 @@ def _persist_execute_artifact(
     data = str(content or "").encode("utf-8")
     if len(data) > MAX_ARTIFACT_BYTES:
         data = data[:MAX_ARTIFACT_BYTES].decode("utf-8", errors="ignore").encode("utf-8")
+    return _persist_artifact_bytes(data, suffix=suffix, budget=budget)
+
+
+def _persist_artifact_bytes(
+    data: bytes,
+    suffix: str = ".bin",
+    *,
+    budget: Optional[ArtifactBudget] = None,
+) -> str:
+    """Persist bounded bytes without decoding or rewriting their contents."""
+    data = bytes(data)
+    if len(data) > MAX_ARTIFACT_BYTES:
+        raise ValueError("Artifact exceeds the maximum byte limit.")
     budget = budget or ArtifactBudget()
     if not budget.reserve(len(data)):
         raise ValueError("Artifact byte budget exceeded.")
@@ -722,6 +747,39 @@ def _persist_execute_artifact(
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _persist_execute_artifact_file(
+    source_path: str,
+    *,
+    budget: Optional[ArtifactBudget] = None,
+) -> str:
+    """Copy a redacted, bounded spill file into durable artifact storage."""
+    size = os.path.getsize(source_path)
+    if size > MAX_ARTIFACT_BYTES:
+        raise ValueError("Artifact exceeds the maximum byte limit.")
+    budget = budget or ArtifactBudget()
+    if not budget.reserve(size):
+        raise ValueError("Artifact byte budget exceeded.")
+    fd, path = tempfile.mkstemp(
+        prefix="execute_code_", suffix=".txt", dir=_artifact_storage_dir(), text=False,
+    )
+    try:
+        with open(source_path, "rb") as source, os.fdopen(fd, "wb") as destination:
+            while True:
+                chunk = source.read(64 * 1024)
+                if not chunk:
+                    break
+                destination.write(chunk)
+            destination.flush()
+            os.fsync(destination.fileno())
     except BaseException:
         try:
             os.unlink(path)
@@ -757,9 +815,12 @@ def _safe_mime_type(mime_type: Optional[str]) -> Optional[str]:
     if not isinstance(mime_type, str):
         return None
     cleaned = _clean_execute_text(mime_type).strip()
-    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*", cleaned):
-        return cleaned
-    return None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*", cleaned):
+        return None
+    normalized = cleaned.lower()
+    if normalized.startswith("image/") and normalized not in _SAFE_IMAGE_MIME_TYPES:
+        return None
+    return normalized
 
 
 def _persist_file_artifact(
@@ -800,8 +861,12 @@ def _persist_file_artifact(
         return {"error": f"Artifact exceeds the {MAX_ARTIFACT_BYTES}-byte limit."}
 
     safe_mime = _safe_mime_type(mime_type)
+    if mime_type is not None and safe_mime is None:
+        return {"error": "Unsupported or unsafe artifact MIME type."}
     filename = _safe_artifact_name(name, fallback_name)
     suffix = os.path.splitext(filename)[1].lower()
+    if suffix in {".svg", ".svgz"}:
+        return {"error": "SVG artifacts are not supported because they can contain active content."}
     if safe_mime and safe_mime.startswith("image/") and suffix not in _IMAGE_SUFFIXES:
         import mimetypes
         suffix = mimetypes.guess_extension(safe_mime) or ".bin"
@@ -826,10 +891,9 @@ def _persist_file_artifact(
             raise
         image_part = normalize_image_artifact(destination)
     else:
-        content = _clean_execute_text(data.decode("utf-8", errors="replace"))
-        destination = _persist_execute_artifact(
-            content,
-            suffix=suffix or ".txt",
+        destination = _persist_artifact_bytes(
+            data,
+            suffix=suffix or ".bin",
             budget=budget,
         )
         image_part = None
@@ -901,6 +965,47 @@ def _clean_execute_text(text: Any) -> str:
     return redact_sensitive_text(strip_ansi(str(text or "")), code_file=True)
 
 
+class _RedactedOutputSpill:
+    """Stream redacted stdout to a bounded temporary file."""
+
+    _OVERLAP_CHARS = 8192
+
+    def __init__(self, path: str, max_bytes: int = MAX_ARTIFACT_BYTES):
+        self._handle = open(path, "wb")
+        self._pending = ""
+        self._max_bytes = max_bytes
+        self.bytes_written = 0
+        self.truncated = False
+
+    def _write_clean(self, text: str) -> None:
+        data = _clean_execute_text(text).encode("utf-8")
+        remaining = self._max_bytes - self.bytes_written
+        if remaining <= 0:
+            self.truncated = self.truncated or bool(data)
+            return
+        if len(data) > remaining:
+            data = data[:remaining].decode("utf-8", errors="ignore").encode("utf-8")
+            self.truncated = True
+        self._handle.write(data)
+        self.bytes_written += len(data)
+
+    def write(self, data: bytes) -> None:
+        self._pending += bytes(data).decode("utf-8", errors="replace")
+        flush_length = len(self._pending) - self._OVERLAP_CHARS
+        if flush_length > 0:
+            self._write_clean(self._pending[:flush_length])
+            self._pending = self._pending[flush_length:]
+
+    def close(self) -> None:
+        if self._handle.closed:
+            return
+        self._write_clean(self._pending)
+        self._pending = ""
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+        self._handle.close()
+
+
 def _truncate_execute_output(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -920,6 +1025,7 @@ def _prepare_execute_output(
     *,
     budget: Optional[ArtifactBudget] = None,
     already_truncated: bool = False,
+    existing_artifact_path: Optional[str] = None,
 ) -> tuple[str, Optional[str], list[dict]]:
     """Clean output, preserve images, and spill oversized text before truncating."""
     cleaned = _clean_execute_text(text)
@@ -930,7 +1036,9 @@ def _prepare_execute_output(
     )
     artifact_path = None
     if len(cleaned) > limit:
-        artifact_path = _persist_execute_artifact(cleaned, budget=budget)
+        artifact_path = existing_artifact_path or _persist_execute_artifact(
+            cleaned, budget=budget,
+        )
         if not already_truncated:
             cleaned = _truncate_execute_output(cleaned, limit)
     return cleaned, artifact_path, image_parts
@@ -2477,6 +2585,7 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
 import traceback
 
@@ -2493,6 +2602,14 @@ def _connect():
     return sock
 
 
+def _watch_parent(parent_pid):
+    """Exit orphaned workers after the parent process disappears."""
+    while True:
+        time.sleep(0.5)
+        if os.getppid() != parent_pid:
+            os._exit(1)
+
+
 def _new_globals():
     return {"__name__": "__main__", "__builtins__": __builtins__}
 
@@ -2500,6 +2617,14 @@ def _new_globals():
 sock = _connect()
 reader = sock.makefile("rb")
 writer = sock.makefile("wb")
+writer.write((json.dumps({"token": os.environ["HERMES_KERNEL_TOKEN"]}) + "\n").encode("utf-8"))
+writer.flush()
+threading.Thread(
+    target=_watch_parent,
+    args=(os.getppid(),),
+    name="hermes-kernel-parent-watch",
+    daemon=True,
+).start()
 globals_ns = _new_globals()
 for raw in reader:
     try:
@@ -2559,8 +2684,46 @@ def _kernel_listener(prefix: str):
         listener.bind(path)
         os.chmod(path, 0o600)
         endpoint = path
-    listener.listen(1)
+    listener.listen(4)
     return listener, endpoint, path
+
+
+def _accept_kernel_control_connection(
+    listener: socket.socket,
+    token: str,
+    *,
+    timeout: float = 5.0,
+) -> tuple[socket.socket, bytes]:
+    """Accept only a worker that proves possession of the control token."""
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Persistent execute_code kernel failed to start.")
+        listener.settimeout(min(0.2, remaining))
+        try:
+            conn, _ = listener.accept()
+        except socket.timeout:
+            continue
+        try:
+            conn.settimeout(min(1.0, remaining))
+            buffer = b""
+            while b"\n" not in buffer:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    raise ValueError("control connection closed before authentication")
+                buffer += chunk
+            line, remainder = buffer.split(b"\n", 1)
+            hello = json.loads(line.decode("utf-8"))
+            if not secrets.compare_digest(str(hello.get("token") or ""), token):
+                raise ValueError("invalid control token")
+            conn.settimeout(None)
+            return conn, remainder
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            try:
+                conn.close()
+            except OSError:
+                pass
 
 
 def _truncate_kernel_output(text: str, limit: int) -> str:
@@ -2583,6 +2746,15 @@ def _clean_kernel_output(text: str, limit: int) -> str:
         strip_ansi(_truncate_kernel_output(text or "", limit)),
         code_file=True,
     )
+
+
+def _drain_kernel_pipe(pipe) -> None:
+    """Keep worker stdout/stderr pipes flowing without exposing raw output."""
+    try:
+        while pipe.read(64 * 1024):
+            pass
+    except (ValueError, OSError):
+        pass
 
 
 class ExecutionKernel:
@@ -2624,6 +2796,7 @@ class ExecutionKernel:
         self._control_conn = None
         self._control_buffer = b""
         self._rpc_thread = None
+        self._pipe_threads = []
         self._stop_event = threading.Event()
         self._tool_call_log = []
         self._tool_call_counter = [0]
@@ -2663,6 +2836,7 @@ class ExecutionKernel:
             self._rpc_server, rpc_endpoint, self._rpc_path = _kernel_listener("hermes_kernel_rpc")
             self._control_server, control_endpoint, self._control_path = _kernel_listener("hermes_kernel_ctl")
             rpc_token = secrets.token_urlsafe(32)
+            control_token = secrets.token_urlsafe(32)
             self._rpc_thread = threading.Thread(
                 target=propagate_context_to_thread(_rpc_server_loop),
                 args=(
@@ -2679,17 +2853,17 @@ class ExecutionKernel:
                 "HERMES_RPC_SOCKET": rpc_endpoint,
                 "HERMES_RPC_TOKEN": rpc_token,
                 "HERMES_KERNEL_SOCKET": control_endpoint,
+                "HERMES_KERNEL_TOKEN": control_token,
                 "HERMES_ARTIFACTS_DIR": os.path.join(self._tmpdir, "artifacts"),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONIOENCODING": "utf-8",
                 "PYTHONUTF8": "1",
             })
-            hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            existing_pp = child_env.get("PYTHONPATH", "")
-            pp_parts = [self._tmpdir, hermes_root]
-            if existing_pp:
-                pp_parts.append(existing_pp)
-            child_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
+            # Only the generated helper module belongs on the kernel import
+            # path.  Exposing the Hermes source tree (or an inherited
+            # PYTHONPATH) lets persistent scripts import internal modules and
+            # read configuration/secrets outside the execution boundary.
+            child_env["PYTHONPATH"] = self._tmpdir
             tz = os.getenv("HERMES_TIMEZONE", "").strip()
             if tz:
                 child_env["TZ"] = tz
@@ -2708,12 +2882,22 @@ class ExecutionKernel:
                 start_new_session=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
             )
-            self._control_server.settimeout(5)
-            try:
-                self._control_conn, _ = self._control_server.accept()
-            except (socket.timeout, OSError):
-                raise RuntimeError("Persistent execute_code kernel failed to start.")
-            self._control_conn.settimeout(None)
+            self._pipe_threads = []
+            for stream, name in (
+                (self.process.stdout, "stdout"),
+                (self.process.stderr, "stderr"),
+            ):
+                reader = threading.Thread(
+                    target=_drain_kernel_pipe,
+                    args=(stream,),
+                    name=f"hermes-kernel-{name}-drain",
+                    daemon=True,
+                )
+                reader.start()
+                self._pipe_threads.append(reader)
+            self._control_conn, self._control_buffer = _accept_kernel_control_connection(
+                self._control_server, control_token,
+            )
             self.last_activity = self.clock()
 
     def execute(
@@ -2868,6 +3052,8 @@ class ExecutionKernel:
                     pass
             if self._rpc_thread is not None:
                 self._rpc_thread.join(timeout=3)
+            for reader in self._pipe_threads:
+                reader.join(timeout=3)
             for pipe in (getattr(self.process, "stdout", None), getattr(self.process, "stderr", None)):
                 if pipe is not None:
                     try:
@@ -2885,7 +3071,7 @@ class ExecutionKernel:
 
 
 class ExecutionKernelRegistry:
-    """Thread-safe registry scoped by parent task and explicit kernel id."""
+    """Thread-safe registry scoped by Hermes profile, session, task, and id."""
 
     def __init__(self, *, clock=time.monotonic, idle_ttl=DEFAULT_KERNEL_IDLE_TTL):
         self.clock = clock
@@ -2919,14 +3105,29 @@ class ExecutionKernelRegistry:
                 logger.debug("Persistent kernel reaper failed", exc_info=True)
 
     @staticmethod
-    def _key(task_id, kernel_id):
+    def _profile_scope():
+        home = os.path.realpath(
+            os.path.abspath(os.path.expanduser(os.getenv("HERMES_HOME") or "~/.hermes"))
+        )
+        profile = os.getenv("HERMES_PROFILE", "default").strip() or "default"
+        return home, profile
+
+    @classmethod
+    def _key(cls, task_id, kernel_id, session_id=None):
         if task_id is None or not str(task_id).strip():
             raise ValueError("Persistent kernels require an explicit task_id.")
-        return (str(task_id), str(kernel_id or "default"))
+        home, profile = cls._profile_scope()
+        return (
+            home,
+            profile,
+            str(task_id),
+            str(session_id or "default"),
+            str(kernel_id or "default"),
+        )
 
-    def get(self, task_id, kernel_id):
+    def get(self, task_id, kernel_id, *, session_id=None):
         self.cleanup_expired()
-        key = self._key(task_id, kernel_id)
+        key = self._key(task_id, kernel_id, session_id)
         with self._lock:
             kernel = self._kernels.get(key)
             if kernel is not None and not kernel.alive:
@@ -2949,7 +3150,7 @@ class ExecutionKernelRegistry:
         max_stderr_bytes=MAX_STDERR_BYTES,
     ):
         self.cleanup_expired()
-        key = self._key(task_id, kernel_id)
+        key = self._key(task_id, kernel_id, context.session_id)
         with self._lock:
             kernel = self._kernels.get(key)
             if kernel is not None and kernel.alive:
@@ -2977,7 +3178,7 @@ class ExecutionKernelRegistry:
             if kernel is not None:
                 kernel.close()
             kernel = ExecutionKernel(
-                key[0], key[1], sandbox_tools, context,
+                key[2], key[4], sandbox_tools, context,
                 active_tool_definitions=active_tool_definitions,
                 idle_ttl=self.idle_ttl if idle_ttl is None else idle_ttl,
                 max_tool_calls=max_tool_calls,
@@ -2994,8 +3195,8 @@ class ExecutionKernelRegistry:
                 raise
             return kernel
 
-    def reset(self, task_id, kernel_id):
-        key = self._key(task_id, kernel_id)
+    def reset(self, task_id, kernel_id, *, session_id=None):
+        key = self._key(task_id, kernel_id, session_id)
         with self._lock:
             self._expired_keys.discard(key)
             kernel = self._kernels.pop(key, None)
@@ -3004,8 +3205,8 @@ class ExecutionKernelRegistry:
             return True
         return False
 
-    def remove(self, task_id, kernel_id, *, close=True):
-        key = self._key(task_id, kernel_id)
+    def remove(self, task_id, kernel_id, *, close=True, session_id=None):
+        key = self._key(task_id, kernel_id, session_id)
         with self._lock:
             self._expired_keys.discard(key)
             kernel = self._kernels.pop(key, None)
@@ -3018,8 +3219,8 @@ class ExecutionKernelRegistry:
             return 0
         task = str(task_id)
         with self._lock:
-            kernels = [self._kernels.pop(key) for key in list(self._kernels) if key[0] == task]
-            self._expired_keys = {key for key in self._expired_keys if key[0] != task}
+            kernels = [self._kernels.pop(key) for key in list(self._kernels) if key[2] == task]
+            self._expired_keys = {key for key in self._expired_keys if key[2] != task}
         for kernel in kernels:
             kernel.close()
         return len(kernels)
@@ -3029,7 +3230,11 @@ class ExecutionKernelRegistry:
             return {}
         task = str(task_id)
         with self._lock:
-            return {key[1]: kernel for key, kernel in self._kernels.items() if key[0] == task}
+            return {
+                (key[3], key[4]): kernel
+                for key, kernel in self._kernels.items()
+                if key[2] == task
+            }
 
     def cleanup_expired(self):
         now = self.clock()
@@ -3044,8 +3249,8 @@ class ExecutionKernelRegistry:
             kernel.close()
         return len(expired)
 
-    def consume_expired(self, task_id, kernel_id):
-        key = self._key(task_id, kernel_id)
+    def consume_expired(self, task_id, kernel_id, *, session_id=None):
+        key = self._key(task_id, kernel_id, session_id)
         with self._lock:
             if key not in self._expired_keys:
                 return False
@@ -3066,7 +3271,33 @@ class ExecutionKernelRegistry:
 
 
 _kernel_registry = ExecutionKernelRegistry()
-atexit.register(_kernel_registry.close_all)
+
+
+def _install_kernel_cleanup_handlers(registry: ExecutionKernelRegistry) -> None:
+    """Clean child kernels on normal shutdown and TERM/INT signals."""
+    atexit.register(registry.close_all)
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous = signal.getsignal(signum)
+
+            def _cleanup(signum, frame, previous=previous):
+                try:
+                    registry.close_all()
+                finally:
+                    if previous == signal.SIG_DFL:
+                        signal.signal(signum, signal.SIG_DFL)
+                        os.kill(os.getpid(), signum)
+                    elif callable(previous) and previous is not _cleanup:
+                        previous(signum, frame)
+
+            signal.signal(signum, _cleanup)
+        except (OSError, ValueError):
+            logger.debug("Could not install kernel cleanup handler", exc_info=True)
+
+
+_install_kernel_cleanup_handlers(_kernel_registry)
 
 
 def _kernel_registry_for_task(task_id):
@@ -3151,7 +3382,9 @@ def execute_code(
             "duration_seconds": 0,
         }, ensure_ascii=False)
     if reset:
-        reset_done = _kernel_registry.reset(task_id, selected_kernel_id)
+        reset_done = _kernel_registry.reset(
+            task_id, selected_kernel_id, session_id=session_id,
+        )
         if not code or not code.strip():
             return json.dumps({
                 "status": "success",
@@ -3286,7 +3519,9 @@ def execute_code(
                 max_stdout_bytes=max_stdout_bytes,
                 max_stderr_bytes=max_stderr_bytes,
             )
-            kernel_expired = _kernel_registry.consume_expired(task_id, selected_kernel_id)
+            kernel_expired = _kernel_registry.consume_expired(
+                task_id, selected_kernel_id, session_id=session_id,
+            )
             result = kernel.execute(
                 code,
                 kernel_timeout,
@@ -3296,10 +3531,14 @@ def execute_code(
             if kernel_expired:
                 result["kernel_expired"] = True
             if result.get("status") == "timeout" or not kernel.alive:
-                _kernel_registry.remove(task_id, selected_kernel_id)
+                _kernel_registry.remove(
+                    task_id, selected_kernel_id, session_id=session_id,
+                )
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:
-            _kernel_registry.reset(task_id, selected_kernel_id)
+            _kernel_registry.reset(
+                task_id, selected_kernel_id, session_id=session_id,
+            )
             return json.dumps({
                 "status": "error",
                 "error": str(exc),
@@ -3308,16 +3547,9 @@ def execute_code(
             }, ensure_ascii=False)
 
     if env_type != "local":
-        try:
-            if timeout is None:
-                return _execute_remote(code, task_id, enabled_tools, context)
-            return _execute_remote(code, task_id, enabled_tools, context, timeout=timeout)
-        except TypeError as exc:
-            # Preserve tiny legacy test/integration adapters that still expose
-            # the pre-context three-argument remote seam.
-            if "positional argument" not in str(exc) and "unexpected keyword" not in str(exc):
-                raise
-            return _execute_remote(code, task_id, enabled_tools)
+        return _execute_remote(
+            code, task_id, enabled_tools, context, timeout=timeout,
+        )
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -3546,7 +3778,9 @@ def execute_code(
         _stdout_tail_bytes = max_stdout_bytes - _stdout_head_bytes
         stdout_total_bytes = [0]
 
-        def _drain_head_tail(pipe, head_chunks, tail_chunks, head_bytes, tail_bytes, total_ref):
+        def _drain_head_tail(
+            pipe, head_chunks, tail_chunks, head_bytes, tail_bytes, total_ref, spill,
+        ):
             """Drain stdout while retaining bounded head and tail data."""
             head_collected = 0
             from collections import deque
@@ -3558,6 +3792,7 @@ def execute_code(
                     if not data:
                         break
                     total_ref[0] += len(data)
+                    spill.write(data)
                     if head_collected < head_bytes:
                         keep = min(len(data), head_bytes - head_collected)
                         head_chunks.append(data[:keep])
@@ -3582,11 +3817,14 @@ def execute_code(
 
         stdout_head_chunks: list = []
         stdout_tail_chunks: list = []
+        stdout_spill_path = os.path.join(tmpdir, "stdout_redacted.txt")
+        stdout_spill = _RedactedOutputSpill(stdout_spill_path)
         stdout_reader = threading.Thread(
             target=_drain_head_tail,
             args=(
                 proc.stdout, stdout_head_chunks, stdout_tail_chunks,
                 _stdout_head_bytes, _stdout_tail_bytes, stdout_total_bytes,
+                stdout_spill,
             ),
             daemon=True,
         )
@@ -3632,6 +3870,7 @@ def execute_code(
         # Wait for readers to finish draining
         stdout_reader.join(timeout=3)
         stderr_reader.join(timeout=3)
+        stdout_spill.close()
 
         stdout_head = b"".join(stdout_head_chunks).decode("utf-8", errors="replace")
         stdout_tail = b"".join(stdout_tail_chunks).decode("utf-8", errors="replace")
@@ -3648,11 +3887,21 @@ def execute_code(
         stderr_text = _clean_execute_text(
             b"".join(stderr_chunks).decode("utf-8", errors="replace")
         )
+        full_stdout_artifact_path = None
+        if stdout_total_bytes[0] > max_stdout_bytes:
+            try:
+                full_stdout_artifact_path = _persist_execute_artifact_file(
+                    stdout_spill_path,
+                    budget=context.artifact_budget,
+                )
+            except (OSError, ValueError) as exc:
+                logger.warning("Could not persist full execute_code stdout: %s", exc)
         stdout_text, stdout_artifact_path, stdout_image_parts = _prepare_execute_output(
             stdout_full,
             max_stdout_bytes,
             budget=context.artifact_budget,
             already_truncated=stdout_total_bytes[0] > max_stdout_bytes,
+            existing_artifact_path=full_stdout_artifact_path,
         )
 
         exit_code = proc.returncode if proc.returncode is not None else -1

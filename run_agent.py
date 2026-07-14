@@ -5757,6 +5757,7 @@ class AIAgent:
                 summary = append_toolguard_guidance(
                     _multimodal_text_summary(function_result), decision,
                 )
+                function_result["text_summary"] = summary
                 function_result["content"] = [
                     {"type": "text", "text": summary},
                     *content,

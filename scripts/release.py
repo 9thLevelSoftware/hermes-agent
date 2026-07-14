@@ -45,7 +45,8 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
-    "dasblueyeddevil@gmail.com": "9thLevelSoftware",  # PR #29 (code-mode tool orchestration)
+    "dasblueyeddevil@gmail.com": "9thLevelSoftware",  # Historical PR #29 commit email
+    "dasblueeyeddevil@gmail.com": "9thLevelSoftware",  # PR #29 (code-mode tool orchestration)
     "neo@neodeMac-mini.local": "neo-claw-bot",  # PR #58465 salvage (moa: drop empty user turns from advisory view)
     "m.guttmann@journaway.com": "mguttmann",  # PR #63738 salvage (Anthropic setup-token pool auth normalization)
     "VrtxOmega@pm.me": "VrtxOmega",  # PR #43809 salvage (desktop: WSL folder-picker path bridge)
