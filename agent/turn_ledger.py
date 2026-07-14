@@ -209,14 +209,16 @@ def build_turn_outcome_record(
         except (TypeError, ValueError):
             return 0.0
 
-    skills_loaded = skills_loaded_from(agent)
-    if not skills_loaded and messages is not None:
-        # Finalizers that have a messages list can attribute exact skill
-        # views; the legacy _skills_loaded set is the fallback.
+    if messages is not None:
+        # Finalizers that have a messages list attribute exact skill
+        # names from ``skill_view`` tool calls; the legacy _skills_loaded
+        # set is the fallback only when no messages list is supplied.
         try:
             skills_loaded = extract_loaded_skills(messages)
         except Exception:
             skills_loaded = ()
+    else:
+        skills_loaded = skills_loaded_from(agent)
 
     return TurnOutcomeRecord(
         session_id=str(getattr(agent, "session_id", "") or ""),
@@ -266,10 +268,52 @@ def _guardrail_halt_json(agent: Any) -> Optional[str]:
         return None
 
 
+def _bump_sidecar_for_skills(record: "TurnOutcomeRecord") -> None:
+    """Best-effort sidecar bump for each skill in ``record.skills_loaded``.
+
+    Finalizers call this after ``record_turn_outcome_safely`` so the curator's
+    utility ranking picks up the outcome. The sidecar is observability —
+    failures (DB outage, missing tools module, raised exceptions in
+    ``bump_outcome``) MUST NEVER escape this function. A broken sidecar
+    cannot be allowed to break a user turn.
+
+    Bumps run whether or not the DB write succeeded, as long as we have a
+    record with a non-empty ``skills_loaded``. If the record has no skills,
+    there is nothing to attribute and we no-op.
+    """
+    skills = getattr(record, "skills_loaded", ()) or ()
+    if not skills:
+        return None
+    try:
+        # ponytail: lazy import keeps the ledger module from pulling
+        # tools.skill_usage (file-locking, fcntl) at import time, and
+        # means a missing tools package is a silent no-op rather than
+        # an ImportError that escapes the finalizer.
+        from tools.skill_usage import bump_outcome as _bump
+    except Exception:
+        return None
+    outcome = str(getattr(record, "outcome", "") or "")
+    try:
+        cost = float(getattr(record, "cost_usd_delta", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    for skill in skills:
+        try:
+            _bump(str(skill), outcome, cost)
+        except Exception:
+            # ponytail: per-skill swallow; one bad skill must not stop
+            # the others. bump_outcome is already best-effort internally
+            # but defensive on the call site protects against callers
+            # that pre-date the internal guard.
+            continue
+    return None
+
+
 __all__ = [
     "TurnOutcomeRecord",
     "build_turn_outcome_record",
     "record_turn_outcome_safely",
     "skills_loaded_from",
     "extract_loaded_skills",
+    "_bump_sidecar_for_skills",
 ]

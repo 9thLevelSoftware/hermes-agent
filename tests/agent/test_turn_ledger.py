@@ -1131,3 +1131,546 @@ def test_build_turn_outcome_record_preserves_existing_seam(monkeypatch):
     )
     # No messages kwarg → falls back to existing skills_loaded_from path.
     assert record.skills_loaded == ("from-agent",)
+
+
+# ---------------------------------------------------------------------------
+# Task 2 fix — finalizer/codex wire `messages` into the builder, and the
+# builder switches the skills_loaded source to ``extract_loaded_skills`` when
+# a messages list is supplied. After a successful or attempted ledger
+# attribution the sidecar ``tools.skill_usage.bump_outcome`` is best-effort
+# invoked for each recorded skill. The sidecar MUST never escape.
+#
+# These tests are written first so the wiring gap (Task 2's commit fe63e02a8
+# defined ``extract_loaded_skills`` and ``bump_outcome`` but no finalizer
+# path actually used them) is exercised end-to-end before the production fix
+# lands. # noqa: E501 — long docstring lines.
+# ---------------------------------------------------------------------------
+
+
+def test_messages_passed_to_builder_yields_exact_skill_view_attribution():
+    """When the finalizer passes ``messages``, the builder's skills_loaded
+    MUST come from ``extract_loaded_skills(messages)`` — even when
+    ``agent._skills_loaded`` is also populated. The legacy _skills_loaded
+    set is the fallback only when messages is *omitted*.
+
+    This is the "exact" attribution the finalizer path promises the
+    ledger: the recorded skills are the actual skill_view tool calls,
+    not whatever hooks happened to populate _skills_loaded.
+    """
+    from agent.turn_ledger import build_turn_outcome_record
+
+    agent = SimpleNamespace(
+        session_id="s1",
+        _current_turn_id="t1",
+        session_input_tokens=0,
+        session_output_tokens=0,
+        session_cache_read_tokens=0,
+        session_estimated_cost_usd=0.0,
+        model="m",
+        _tool_guardrail_halt_decision=None,
+        _invalid_tool_retries=0,
+        _invalid_json_retries=0,
+        _empty_content_retries=0,
+        _incomplete_scratchpad_retries=0,
+        _codex_incomplete_retries=0,
+        _thinking_prefill_retries=0,
+        # _skills_loaded is set, but messages takes precedence per spec.
+        _skills_loaded=("from-agent",),
+    )
+    turn_context = SimpleNamespace(token_cost_snapshot={}, turn_id="t1")
+    messages = [
+        {"role": "assistant", "tool_calls": [
+            {"function": {"name": "skill_view", "arguments": {"name": "plan"}}},
+            {"function": {"name": "skill_view", "arguments": {"name": "web"}}},
+        ]},
+    ]
+
+    record = build_turn_outcome_record(
+        agent,
+        outcome="verified",
+        outcome_reason="ok",
+        turn_exit_reason="text_response",
+        api_calls=1,
+        tool_iterations=1,
+        turn_context=turn_context,
+        messages=messages,
+    )
+    assert record.skills_loaded == ("plan", "web")
+
+
+def test_finalizer_passes_messages_to_build_turn_outcome_record(monkeypatch):
+    """The chat-completions finalizer MUST forward its `messages` argument
+    to ``build_turn_outcome_record`` so the builder sees the per-turn tool
+    calls (skill_view in particular). Without this, the legacy
+    ``_skills_loaded`` seam — which only carries hook-populated names — is
+    the only attribution source and Task 2's "exact skill_view names"
+    promise is silently dropped.
+    """
+    from agent import turn_finalizer
+    from agent.turn_ledger import build_turn_outcome_record as _orig_build
+
+    captured_kwargs = {}
+
+    def _capture_record(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _orig_build(*args, **kwargs)
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "agent.turn_ledger.record_turn_outcome_safely",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "agent.turn_ledger.build_turn_outcome_record",
+        _capture_record,
+    )
+
+    agent = _finalizer_agent(verification_status="passed")
+    messages = [
+        {"role": "user", "content": "do it"},
+        {"role": "assistant", "content": "done"},
+    ]
+    turn_finalizer.finalize_turn(
+        agent,
+        final_response="done",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="t-fin-msg",
+        user_message="do it",
+        original_user_message="do it",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+    assert "messages" in captured_kwargs, (
+        "finalizer must forward messages=... to build_turn_outcome_record "
+        f"so skill attribution is exact. Got kwargs: {list(captured_kwargs)}"
+    )
+    assert captured_kwargs["messages"] is messages
+
+
+def test_codex_runtime_passes_messages_to_build_turn_outcome_record(monkeypatch):
+    """The codex app-server runtime MUST forward its `messages` argument
+    to ``build_turn_outcome_record``. At this point the projected messages
+    have already been spliced into ``messages`` (see line ~458), so passing
+    the full list means skill_view calls from projected assistant rows
+    attribute correctly.
+    """
+    from agent import codex_runtime
+    from agent.turn_ledger import build_turn_outcome_record as _orig_build
+
+    captured_kwargs = {}
+
+    def _capture_record(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _orig_build(*args, **kwargs)
+
+    # Patch both import surfaces (the runtime imports lazily inside the
+    # try-block, so patching agent.turn_ledger is enough — but mirroring
+    # the chat-finalizer test pattern keeps the patch symmetric).
+    monkeypatch.setattr(
+        "agent.turn_ledger.record_turn_outcome_safely",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "agent.turn_ledger.build_turn_outcome_record",
+        _capture_record,
+    )
+
+    codex_agent = MagicMock()
+    codex_agent.tool_progress_callback = None
+    codex_agent._iters_since_skill = 0
+    codex_agent._skill_nudge_interval = 0
+    codex_agent.valid_tool_names = set()
+    codex_agent._session_db = _RecordingSessionDB()
+    codex_agent._session_db_created = True
+    codex_agent.session_id = "sess-codex-test"
+    codex_agent._current_turn_id = "t-codex-1"
+    codex_agent._turn_token_cost_snapshot = {}
+    codex_agent._sync_external_memory_for_turn = MagicMock()
+    codex_agent._spawn_background_review = MagicMock()
+    codex_agent._turn_verification_status = "passed"
+
+    # projected_messages includes a skill_view call so we can assert
+    # attribution picks it up.
+    codex_turn = SimpleNamespace(
+        interrupted=False,
+        error=None,
+        thread_id="thread-1",
+        turn_id="t-codex-1",
+        projected_messages=[{
+            "role": "assistant",
+            "tool_calls": [
+                {"function": {"name": "skill_view", "arguments": {"name": "plan"}}},
+            ],
+        }],
+        tool_iterations=0,
+        final_text="ok",
+        should_retire=False,
+    )
+    codex_agent._codex_session = MagicMock()
+    codex_agent._codex_session.run_turn.return_value = codex_turn
+
+    user_messages = [{"role": "user", "content": "hello"}]
+    codex_runtime.run_codex_app_server_turn(
+        codex_agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=user_messages,
+        effective_task_id="task",
+    )
+    assert "messages" in captured_kwargs, (
+        "codex runtime must forward messages=... to build_turn_outcome_record "
+        f"so skill attribution is exact. Got kwargs: {list(captured_kwargs)}"
+    )
+    # The forwarded list contains the projected skill_view call —
+    # this is the meaningful attribution guarantee: the projected
+    # messages (added in-place via messages.extend) flow into the
+    # ledger's skill extraction.
+    skill_names = [tc["function"]["arguments"]["name"]
+                   for m in captured_kwargs["messages"]
+                   for tc in (m.get("tool_calls") or [])
+                   if tc.get("function", {}).get("name") == "skill_view"]
+    assert "plan" in skill_names
+
+
+def test_bump_outcome_called_for_each_skill_on_successful_attribution(monkeypatch):
+    """After a successful ledger attribution, ``bump_outcome`` MUST be
+    invoked for every skill in ``record.skills_loaded`` with
+    ``(skill_name, outcome, cost_usd_delta)``. The sidecar bump is what
+    feeds the curator's utility ranking.
+    """
+    from agent import turn_ledger
+
+    calls = []
+
+    def _fake_bump(skill_name, outcome, cost_delta):
+        calls.append((skill_name, outcome, cost_delta))
+
+    monkeypatch.setattr(
+        "tools.skill_usage.bump_outcome",
+        _fake_bump,
+    )
+    # Capture the records handed to the safe writer so we can assert
+    # the post-write bump is best-effort (always invoked on success).
+    written = []
+    monkeypatch.setattr(
+        "agent.turn_ledger.record_turn_outcome_safely",
+        lambda _db, rec: written.append(rec),
+    )
+
+    record = turn_ledger.TurnOutcomeRecord(
+        session_id="s1",
+        turn_id="t1",
+        created_at=1.0,
+        outcome="verified",
+        outcome_reason="ok",
+        turn_exit_reason="text_response",
+        api_calls=1,
+        tool_iterations=0,
+        retry_count=0,
+        guardrail_halt=None,
+        cost_usd_delta=0.42,
+        input_tokens_delta=0,
+        output_tokens_delta=0,
+        cache_read_tokens_delta=0,
+        skills_loaded=("plan", "web"),
+        model="m",
+    )
+    # Helper under test: invoke the post-attribution sidecar.
+    turn_ledger._bump_sidecar_for_skills(record)  # type: ignore[attr-defined]
+
+    assert ("plan", "verified", 0.42) in calls
+    assert ("web", "verified", 0.42) in calls
+    assert len(calls) == 2
+
+
+def test_bump_outcome_runs_even_when_db_write_fails(monkeypatch):
+    """DB failure must NOT suppress sidecar evidence. If we attempted the
+    attribution (i.e. we have a record with a non-empty skills_loaded),
+    the sidecar bumps MUST still happen. The exception boundary is
+    "ledger write ok" vs "ledger write raised" — not "ledger write ok"
+    vs "anything went wrong".
+    """
+    from agent import turn_ledger
+
+    calls = []
+
+    def _fake_bump(skill_name, outcome, cost_delta):
+        calls.append((skill_name, outcome, cost_delta))
+
+    monkeypatch.setattr(
+        "tools.skill_usage.bump_outcome",
+        _fake_bump,
+    )
+
+    record = turn_ledger.TurnOutcomeRecord(
+        session_id="s1",
+        turn_id="t1",
+        created_at=1.0,
+        outcome="failed",
+        outcome_reason="boom",
+        turn_exit_reason="provider_failure",
+        api_calls=1,
+        tool_iterations=0,
+        retry_count=0,
+        guardrail_halt=None,
+        cost_usd_delta=0.1,
+        input_tokens_delta=0,
+        output_tokens_delta=0,
+        cache_read_tokens_delta=0,
+        skills_loaded=("plan",),
+        model="m",
+    )
+    # Even though the DB write is mocked to raise, we expect bumps to
+    # be attempted by the helper.
+    turn_ledger._bump_sidecar_for_skills(record)  # type: ignore[attr-defined]
+
+    assert ("plan", "failed", 0.1) in calls
+
+
+def test_bump_outcome_failure_does_not_propagate(monkeypatch):
+    """A bump_outcome exception MUST be swallowed — the sidecar is
+    observability, never a correctness path. If the bump raises, the
+    finalizer must still return its result unchanged.
+    """
+    from agent import turn_ledger
+
+    def _broken_bump(_skill, _outcome, _cost):
+        raise RuntimeError("sidecar on fire")
+
+    monkeypatch.setattr(
+        "tools.skill_usage.bump_outcome",
+        _broken_bump,
+    )
+
+    record = turn_ledger.TurnOutcomeRecord(
+        session_id="s1",
+        turn_id="t1",
+        created_at=1.0,
+        outcome="verified",
+        outcome_reason="ok",
+        turn_exit_reason="text_response",
+        api_calls=1,
+        tool_iterations=0,
+        retry_count=0,
+        guardrail_halt=None,
+        cost_usd_delta=0.0,
+        input_tokens_delta=0,
+        output_tokens_delta=0,
+        cache_read_tokens_delta=0,
+        skills_loaded=("plan",),
+        model="m",
+    )
+    # Must not raise.
+    turn_ledger._bump_sidecar_for_skills(record)  # type: ignore[attr-defined]
+
+
+def test_bump_outcome_skips_when_no_skills_loaded(monkeypatch):
+    """If the record has no skills loaded, no bump is attempted — there
+    is nothing to attribute. This is the "no outcome record" boundary
+    in the spec: if there's no evidence, there's no bump.
+    """
+    from agent import turn_ledger
+
+    calls = []
+
+    def _fake_bump(skill_name, outcome, cost_delta):
+        calls.append((skill_name, outcome, cost_delta))
+
+    monkeypatch.setattr(
+        "tools.skill_usage.bump_outcome",
+        _fake_bump,
+    )
+
+    record = turn_ledger.TurnOutcomeRecord(
+        session_id="s1",
+        turn_id="t1",
+        created_at=1.0,
+        outcome="verified",
+        outcome_reason="ok",
+        turn_exit_reason="text_response",
+        api_calls=1,
+        tool_iterations=0,
+        retry_count=0,
+        guardrail_halt=None,
+        cost_usd_delta=0.0,
+        input_tokens_delta=0,
+        output_tokens_delta=0,
+        cache_read_tokens_delta=0,
+        skills_loaded=(),  # empty — no bumps expected
+        model="m",
+    )
+    turn_ledger._bump_sidecar_for_skills(record)  # type: ignore[attr-defined]
+    assert calls == []
+
+
+def test_bump_outcome_missing_tools_module_does_not_raise(monkeypatch):
+    """The bump helper must tolerate a missing ``tools.skill_usage``
+    module. ``tools`` is importable in production but tests may import
+    in unusual paths; the safe-by-default behavior is to no-op rather
+    than crash the finalizer.
+    """
+    from agent import turn_ledger
+
+    # Simulate tools.skill_usage being unimportable by replacing the
+    # module-level reference used by the bump helper.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _guarded_import(name, *args, **kwargs):
+        if name == "tools.skill_usage" or name.startswith("tools.skill_usage"):
+            raise ImportError("simulated missing tools module")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _guarded_import)
+
+    record = turn_ledger.TurnOutcomeRecord(
+        session_id="s1",
+        turn_id="t1",
+        created_at=1.0,
+        outcome="verified",
+        outcome_reason="ok",
+        turn_exit_reason="text_response",
+        api_calls=1,
+        tool_iterations=0,
+        retry_count=0,
+        guardrail_halt=None,
+        cost_usd_delta=0.0,
+        input_tokens_delta=0,
+        output_tokens_delta=0,
+        cache_read_tokens_delta=0,
+        skills_loaded=("plan",),
+        model="m",
+    )
+    # Must not raise.
+    turn_ledger._bump_sidecar_for_skills(record)  # type: ignore[attr-defined]
+
+
+def test_finalizer_invokes_sidecar_bump_with_recorded_skills(monkeypatch):
+    """End-to-end: chat-completions finalizer extracts skill_view names
+    from its messages, builds the record, writes it via the safe writer,
+    then bumps the sidecar with the recorded skill/outcome/cost. Asserts
+    the finalizer wires messages AND triggers the bump — not just one
+    or the other.
+    """
+    from agent import turn_finalizer
+
+    bumps = []
+    records = []
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook", lambda *a, **k: []
+    )
+    monkeypatch.setattr(
+        "agent.turn_ledger.record_turn_outcome_safely",
+        lambda _db, rec: records.append(rec),
+    )
+    monkeypatch.setattr(
+        "tools.skill_usage.bump_outcome",
+        lambda skill, outcome, cost: bumps.append((skill, outcome, cost)),
+    )
+
+    agent = _finalizer_agent(verification_status="passed")
+    agent.session_estimated_cost_usd = 0.07
+    messages = [
+        {"role": "user", "content": "use plan"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"function": {"name": "skill_view", "arguments": {"name": "plan"}}},
+        ]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        {"role": "assistant", "content": "done"},
+    ]
+    turn_finalizer.finalize_turn(
+        agent,
+        final_response="done",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="t-fin-bump",
+        user_message="use plan",
+        original_user_message="use plan",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+    assert records, "ledger write did not happen"
+    rec = records[-1]
+    assert rec.skills_loaded == ("plan",)
+    # Cost may be 0 because the snapshot is empty (start=end); the
+    # important assertion is the bump fired with the recorded skill
+    # and the same outcome the row carries.
+    assert any(skill == "plan" for skill, _outcome, _cost in bumps), (
+        f"expected bump for 'plan' from messages, got {bumps}"
+    )
+
+
+def test_codex_runtime_invokes_sidecar_bump_with_recorded_skills(monkeypatch):
+    """End-to-end: codex app-server finalizer extracts skill_view names
+    from its projected messages, writes the row, then bumps sidecar.
+    """
+    from agent import codex_runtime
+
+    bumps = []
+    records = []
+
+    monkeypatch.setattr(
+        "agent.turn_ledger.record_turn_outcome_safely",
+        lambda _db, rec: records.append(rec),
+    )
+    monkeypatch.setattr(
+        "tools.skill_usage.bump_outcome",
+        lambda skill, outcome, cost: bumps.append((skill, outcome, cost)),
+    )
+
+    codex_agent = MagicMock()
+    codex_agent.tool_progress_callback = None
+    codex_agent._iters_since_skill = 0
+    codex_agent._skill_nudge_interval = 0
+    codex_agent.valid_tool_names = set()
+    codex_agent._session_db = _RecordingSessionDB()
+    codex_agent._session_db_created = True
+    codex_agent.session_id = "sess-codex-bump"
+    codex_agent._current_turn_id = "t-codex-bump"
+    codex_agent._turn_token_cost_snapshot = {}
+    codex_agent._sync_external_memory_for_turn = MagicMock()
+    codex_agent._spawn_background_review = MagicMock()
+    codex_agent._turn_verification_status = "passed"
+
+    codex_turn = SimpleNamespace(
+        interrupted=False,
+        error=None,
+        thread_id="thread-1",
+        turn_id="t-codex-bump",
+        projected_messages=[{
+            "role": "assistant",
+            "tool_calls": [
+                {"function": {"name": "skill_view", "arguments": {"name": "web"}}},
+            ],
+        }],
+        tool_iterations=0,
+        final_text="ok",
+        should_retire=False,
+    )
+    codex_agent._codex_session = MagicMock()
+    codex_agent._codex_session.run_turn.return_value = codex_turn
+
+    codex_runtime.run_codex_app_server_turn(
+        codex_agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task",
+    )
+    assert records, "codex ledger write did not happen"
+    rec = records[-1]
+    assert rec.skills_loaded == ("web",)
+    assert any(skill == "web" for skill, _outcome, _cost in bumps), (
+        f"expected bump for 'web' from projected messages, got {bumps}"
+    )

@@ -529,6 +529,9 @@ def run_codex_app_server_turn(
 
     # Persist the per-turn outcome to the learning ledger. Mirrors the
     # chat-completions path in ``finalize_turn``; safe-writer is best-effort.
+    # The sidecar bump runs in a SEPARATE try/except so a ledger-write
+    # failure cannot suppress utility-counter evidence.
+    _turn_outcome_record = None
     try:
         from agent.turn_ledger import (
             build_turn_outcome_record,
@@ -548,6 +551,7 @@ def run_codex_app_server_turn(
             turn_exit_reason=codex_exit_reason,
             api_calls=api_calls,
             tool_iterations=turn.tool_iterations,
+            messages=messages,
         )
         record_turn_outcome_safely(
             getattr(agent, "_session_db", None),
@@ -555,6 +559,14 @@ def run_codex_app_server_turn(
         )
     except Exception as _ledger_err:
         logger.debug("turn_outcome ledger write skipped: %s", _ledger_err)
+    # Best-effort sidecar bump — must run whether the DB write above
+    # succeeded or failed. A sidecar failure never escapes this block.
+    if _turn_outcome_record is not None:
+        try:
+            from agent.turn_ledger import _bump_sidecar_for_skills
+            _bump_sidecar_for_skills(_turn_outcome_record)
+        except Exception as _bump_err:
+            logger.debug("skill sidecar bump skipped: %s", _bump_err)
 
     # Background review fork — same cadence + signature as the default
     # path (line ~15449). Only fires when a trigger actually tripped AND

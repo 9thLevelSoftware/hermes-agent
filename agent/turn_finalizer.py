@@ -160,7 +160,11 @@ def finalize_turn(
 
     # Persist the per-turn outcome to the learning ledger. Funneled through
     # the safe writer so a DB outage cannot escape finalization; the
-    # user-visible response is already computed at this point.
+    # user-visible response is already computed at this point. The sidecar
+    # bump runs in a SEPARATE try/except so a ledger-write failure cannot
+    # suppress utility-counter evidence — DB failure must not shadow the
+    # skill-utility signal.
+    _turn_outcome_record = None
     try:
         from agent.turn_ledger import (
             build_turn_outcome_record,
@@ -185,11 +189,21 @@ def finalize_turn(
             turn_exit_reason=_turn_exit_reason,
             api_calls=api_call_count,
             tool_iterations=_turn_tool_count,
+            messages=messages,
         )
         record_turn_outcome_safely(getattr(agent, "_session_db", None),
                                    _turn_outcome_record)
     except Exception as _ledger_err:
         logger.debug("turn_outcome ledger write skipped: %s", _ledger_err)
+    # Best-effort sidecar bump — must run whether the DB write above
+    # succeeded or failed, so the curator's utility ranking still sees
+    # evidence for this turn. A sidecar failure never escapes this block.
+    if _turn_outcome_record is not None:
+        try:
+            from agent.turn_ledger import _bump_sidecar_for_skills
+            _bump_sidecar_for_skills(_turn_outcome_record)
+        except Exception as _bump_err:
+            logger.debug("skill sidecar bump skipped: %s", _bump_err)
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
