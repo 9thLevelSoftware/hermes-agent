@@ -31,6 +31,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
+
+def workspace_key(row: Dict[str, Any]) -> Optional[str]:
+    """Return the repository root, or cwd, used to group a session."""
+    root = (row.get("git_repo_root") or "").strip()
+    if root:
+        return root
+    cwd = (row.get("cwd") or "").strip()
+    return cwd or None
+
 def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
