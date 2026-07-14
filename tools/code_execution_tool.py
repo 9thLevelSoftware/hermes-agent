@@ -1297,7 +1297,11 @@ def _rpc_server_loop(
     the client disconnects or the call limit is reached.
     """
     allowed_tools = frozenset(_scriptable_tool_names(allowed_tools, {})) | SCRIPT_INTERNAL_TOOLS
-    rpc_context = rpc_context or CodeExecutionContext(task_id, None, (), ())
+    if isinstance(rpc_context, list):
+        if not rpc_context:
+            rpc_context.append(CodeExecutionContext(task_id, None, (), ()))
+    else:
+        rpc_context = rpc_context or CodeExecutionContext(task_id, None, (), ())
     conn = None
     try:
         server_sock.settimeout(0.05)
@@ -1345,7 +1349,15 @@ def _rpc_server_loop(
 
                 tool_name = request.get("tool", "")
                 tool_args = request.get("args", {})
-                request_context = _context_from_rpc_request(request, rpc_context)
+                current_context = (
+                    rpc_context[0] if isinstance(rpc_context, list) else rpc_context
+                )
+                request_context = _context_from_rpc_request(request, current_context)
+                call_limit = (
+                    max_tool_calls[0]
+                    if isinstance(max_tool_calls, list)
+                    else max_tool_calls
+                )
 
                 # Enforce the allow-list
                 if tool_name not in allowed_tools:
@@ -1360,10 +1372,10 @@ def _rpc_server_loop(
                     continue
 
                 # Enforce tool call limit
-                if tool_call_counter[0] >= max_tool_calls:
+                if tool_call_counter[0] >= call_limit:
                     resp = json.dumps({
                         "error": (
-                            f"Tool call limit reached ({max_tool_calls}). "
+                            f"Tool call limit reached ({call_limit}). "
                             "No more tool calls allowed in this execution."
                         )
                     })
@@ -1381,6 +1393,19 @@ def _rpc_server_loop(
                 try:
                     _real_stdout, _real_stderr = sys.stdout, sys.stderr
                     devnull = open(os.devnull, "w", encoding="utf-8")
+                    approval_token = None
+                    reset_approval_session = None
+                    try:
+                        from tools.approval import (
+                            reset_current_session_key,
+                            set_current_session_key,
+                        )
+                        approval_token = set_current_session_key(
+                            request_context.session_id or "",
+                        )
+                        reset_approval_session = reset_current_session_key
+                    except Exception:
+                        pass
                     try:
                         sys.stdout = devnull
                         sys.stderr = devnull
@@ -1392,6 +1417,8 @@ def _rpc_server_loop(
                         )
                     finally:
                         sys.stdout, sys.stderr = _real_stdout, _real_stderr
+                        if approval_token is not None and reset_approval_session is not None:
+                            reset_approval_session(approval_token)
                         devnull.close()
                 except Exception as exc:
                     logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
@@ -1942,6 +1969,17 @@ globals_ns = _new_globals()
 for raw in reader:
     try:
         request = json.loads(raw.decode("utf-8"))
+        context = request.get("context")
+        if isinstance(context, dict):
+            hermes_tools = sys.modules.get("hermes_tools")
+            rpc_context = getattr(hermes_tools, "_HERMES_RPC_CONTEXT", None)
+            if isinstance(rpc_context, dict):
+                rpc_context.update({
+                    "task_id": context.get("task_id"),
+                    "session_id": context.get("session_id"),
+                    "enabled_toolsets": list(context.get("enabled_toolsets") or ()),
+                    "disabled_toolsets": list(context.get("disabled_toolsets") or ()),
+                })
         code = request.get("code", "")
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -2033,7 +2071,8 @@ class ExecutionKernel:
         self.sandbox_tools = frozenset(sandbox_tools)
         self.context = context
         self.idle_ttl = float(idle_ttl)
-        self.max_tool_calls = max_tool_calls
+        self.max_tool_calls = int(max_tool_calls)
+        self._max_tool_calls = [self.max_tool_calls]
         self.max_stdout_bytes = max_stdout_bytes
         self.max_stderr_bytes = max_stderr_bytes
         self.clock = clock
@@ -2050,6 +2089,7 @@ class ExecutionKernel:
         self._stop_event = threading.Event()
         self._tool_call_log = []
         self._tool_call_counter = [0]
+        self._rpc_context = [context]
         self._lock = threading.RLock()
         self.closed = False
 
@@ -2078,8 +2118,8 @@ class ExecutionKernel:
                 target=propagate_context_to_thread(_rpc_server_loop),
                 args=(
                     self._rpc_server, self.task_id, self._tool_call_log,
-                    self._tool_call_counter, self.max_tool_calls,
-                    self.sandbox_tools, self._stop_event, rpc_token, self.context,
+                    self._tool_call_counter, self._max_tool_calls,
+                    self.sandbox_tools, self._stop_event, rpc_token, self._rpc_context,
                 ),
                 daemon=True,
             )
@@ -2126,20 +2166,61 @@ class ExecutionKernel:
             self._control_conn.settimeout(None)
             self.last_activity = self.clock()
 
-    def execute(self, code: str, timeout: float) -> dict:
+    def execute(
+        self,
+        code: str,
+        timeout: float,
+        *,
+        max_tool_calls: Optional[int] = None,
+        context: Optional[CodeExecutionContext] = None,
+    ) -> dict:
         with self._lock:
+            if context is not None:
+                self.context = context
+                self._rpc_context[0] = context
+            if max_tool_calls is not None:
+                self.max_tool_calls = int(max_tool_calls)
+                self._max_tool_calls[0] = self.max_tool_calls
+            self._tool_call_counter[0] = 0
+            self._tool_call_log.clear()
+            self.last_activity = self.clock()
             if not self.alive:
                 self.start()
-            request = (json.dumps({"code": code}, ensure_ascii=False) + "\n").encode("utf-8")
-            deadline = time.monotonic() + max(0.01, float(timeout))
+            request = (json.dumps({
+                "code": code,
+                "context": _context_payload(self.context),
+            }, ensure_ascii=False) + "\n").encode("utf-8")
+            exec_start = time.monotonic()
+            deadline = exec_start + max(0.01, float(timeout))
             try:
+                from tools.interrupt import is_interrupted
+
                 self._control_conn.sendall(request)
                 while b"\n" not in self._control_buffer:
+                    if is_interrupted():
+                        _kill_process_group(self.process)
+                        self.close()
+                        duration = round(time.monotonic() - exec_start, 2)
+                        return {
+                            "status": "interrupted",
+                            "output": "\n[execution interrupted — user sent a new message]",
+                            "stdout": "",
+                            "stderr": "",
+                            "interrupted": True,
+                            "kernel_restarted": True,
+                            "tool_calls_made": self._tool_call_counter[0],
+                            "duration_seconds": duration,
+                            "persistent": True,
+                            "kernel_id": self.kernel_id,
+                        }
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise socket.timeout()
                     self._control_conn.settimeout(min(0.2, remaining))
-                    chunk = self._control_conn.recv(65536)
+                    try:
+                        chunk = self._control_conn.recv(65536)
+                    except socket.timeout:
+                        continue
                     if not chunk:
                         raise RuntimeError("Persistent execute_code kernel exited.")
                     self._control_buffer += chunk
@@ -2244,10 +2325,36 @@ class ExecutionKernelRegistry:
         self._kernels = {}
         self._expired_keys = set()
         self._lock = threading.RLock()
+        self._reaper_stop = threading.Event()
+        self._reaper_thread = threading.Thread(
+            target=self._reaper_loop,
+            name="execute-code-kernel-reaper",
+            daemon=True,
+        )
+        self._reaper_thread.start()
+
+    def _reaper_loop(self):
+        while not self._reaper_stop.is_set():
+            with self._lock:
+                ttls = [
+                    kernel.idle_ttl
+                    for kernel in self._kernels.values()
+                    if kernel.idle_ttl >= 0
+                ]
+            ttl = min(ttls, default=self.idle_ttl)
+            interval = min(0.5, max(0.01, ttl / 2 if ttl > 0 else 0.05))
+            if self._reaper_stop.wait(interval):
+                break
+            try:
+                self.cleanup_expired()
+            except Exception:
+                logger.debug("Persistent kernel reaper failed", exc_info=True)
 
     @staticmethod
     def _key(task_id, kernel_id):
-        return (str(task_id or "default"), str(kernel_id or "default"))
+        if task_id is None or not str(task_id).strip():
+            raise ValueError("Persistent kernels require an explicit task_id.")
+        return (str(task_id), str(kernel_id or "default"))
 
     def get(self, task_id, kernel_id):
         self.cleanup_expired()
@@ -2317,7 +2424,9 @@ class ExecutionKernelRegistry:
         return kernel
 
     def cleanup_task(self, task_id):
-        task = str(task_id or "default")
+        if task_id is None or not str(task_id).strip():
+            return 0
+        task = str(task_id)
         with self._lock:
             kernels = [self._kernels.pop(key) for key in list(self._kernels) if key[0] == task]
             self._expired_keys = {key for key in self._expired_keys if key[0] != task}
@@ -2326,7 +2435,9 @@ class ExecutionKernelRegistry:
         return len(kernels)
 
     def for_task(self, task_id):
-        task = str(task_id or "default")
+        if task_id is None or not str(task_id).strip():
+            return {}
+        task = str(task_id)
         with self._lock:
             return {key[1]: kernel for key, kernel in self._kernels.items() if key[0] == task}
 
@@ -2352,12 +2463,16 @@ class ExecutionKernelRegistry:
             return True
 
     def close_all(self):
+        self._reaper_stop.set()
         with self._lock:
             kernels = list(self._kernels.values())
             self._kernels.clear()
             self._expired_keys.clear()
         for kernel in kernels:
             kernel.close()
+        reaper = self._reaper_thread
+        if reaper is not threading.current_thread():
+            reaper.join(timeout=2)
 
 
 _kernel_registry = ExecutionKernelRegistry()
@@ -2384,7 +2499,7 @@ def reap_kernels_for_task(task_id):
 # ---------------------------------------------------------------------------
 
 def execute_code(
-    code: str,
+    code: Optional[str] = None,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     *,
@@ -2428,8 +2543,17 @@ def execute_code(
     _cfg = _load_config()
     if persistent is None:
         persistent = _cfg.get("persistent") is True
-    persistent_requested = bool(persistent or session or kernel_id)
+    persistent_requested = bool(persistent or session or kernel_id or reset)
     selected_kernel_id = str(kernel_id or session or "default")
+    if persistent_requested and (task_id is None or not str(task_id).strip()):
+        return json.dumps({
+            "status": "error",
+            "error": "Persistent execute_code requires an explicit task_id.",
+            "persistent": True,
+            "kernel_id": selected_kernel_id,
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
     if reset:
         reset_done = _kernel_registry.reset(task_id, selected_kernel_id)
         if not code or not code.strip():
@@ -2520,7 +2644,7 @@ def execute_code(
         sandbox_tools = frozenset(_scriptable_tool_names(requested_tools, {}))
         try:
             kernel = _kernel_registry.get_or_create(
-                task_id or "default",
+                task_id,
                 selected_kernel_id,
                 sandbox_tools,
                 context,
@@ -2536,7 +2660,12 @@ def execute_code(
                 max_stderr_bytes=max_stderr_bytes,
             )
             kernel_expired = _kernel_registry.consume_expired(task_id, selected_kernel_id)
-            result = kernel.execute(code, kernel_timeout)
+            result = kernel.execute(
+                code,
+                kernel_timeout,
+                max_tool_calls=max_tool_calls,
+                context=context,
+            )
             if kernel_expired:
                 result["kernel_expired"] = True
             if result.get("status") == "timeout" or not kernel.alive:
@@ -3268,7 +3397,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
                     "description": "Optional idle-expiry TTL in seconds for this persistent kernel.",
                 },
             },
-            "required": ["code"],
+            "required": [],
         },
     }
 

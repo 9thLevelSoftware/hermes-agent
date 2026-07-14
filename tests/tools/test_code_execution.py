@@ -444,7 +444,7 @@ class TestSandboxRequirements(unittest.TestCase):
     def test_schema_is_valid(self):
         self.assertEqual(EXECUTE_CODE_SCHEMA["name"], "execute_code")
         self.assertIn("code", EXECUTE_CODE_SCHEMA["parameters"]["properties"])
-        self.assertIn("code", EXECUTE_CODE_SCHEMA["parameters"]["required"])
+        self.assertNotIn("code", EXECUTE_CODE_SCHEMA["parameters"]["required"])
 
 
 class TestHermesToolsGeneration(unittest.TestCase):
@@ -1196,7 +1196,7 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
         self.assertEqual(schema["name"], "execute_code")
         self.assertIn("parameters", schema)
         self.assertIn("code", schema["parameters"]["properties"])
-        self.assertEqual(schema["parameters"]["required"], ["code"])
+        self.assertEqual(schema["parameters"]["required"], [])
 
     def test_subset_only_lists_enabled_tools(self):
         enabled = {"terminal", "read_file"}

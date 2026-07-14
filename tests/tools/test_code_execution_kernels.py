@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -111,6 +112,151 @@ def test_persistent_kernel_reuses_existing_tool_rpc_channel():
     assert result["tool_calls_made"] == 1
 
 
+def test_persistent_kernel_interrupt_kills_worker_and_returns_interrupted_result():
+    from tools.interrupt import set_interrupt
+
+    result_holder = {}
+    started = threading.Event()
+    pid_holder = {}
+
+    def run_code():
+        started.set()
+        result_holder["result"] = _run("while True: pass", "kernel-test", timeout=10)
+
+    worker = threading.Thread(target=run_code)
+    worker.start()
+    assert started.wait(1)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        kernel = code_execution_tool._kernel_registry.get("kernel-test", "test")
+        if kernel is not None and kernel.process is not None:
+            pid_holder["pid"] = kernel.process.pid
+            set_interrupt(True, thread_id=worker.ident)
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("persistent kernel did not start")
+    worker.join(5)
+    set_interrupt(False, thread_id=worker.ident)
+
+    assert not worker.is_alive()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and psutil.pid_exists(pid_holder["pid"]):
+        time.sleep(0.02)
+    assert not psutil.pid_exists(pid_holder["pid"])
+    result = result_holder["result"]
+    assert result["status"] == "interrupted"
+    assert result.get("timed_out") is not True
+    assert "execution interrupted" in result["output"]
+    assert result["kernel_restarted"] is True
+
+
+def test_persistent_kernel_resets_tool_call_limit_per_execution():
+    execution_manager = SimpleNamespace(_middleware={"tool_execution": [object()]})
+
+    def dispatch(function_name, function_args, **kwargs):
+        return json.dumps({"output": function_args.get("command", "rpc-ok"), "exit_code": 0})
+
+    with (
+        patch("tools.code_execution_tool._load_config", return_value={"max_tool_calls": 1}),
+        patch("hermes_cli.plugins.get_plugin_manager", return_value=execution_manager),
+        patch("model_tools.handle_function_call", side_effect=dispatch),
+    ):
+        first = _run(
+            "from hermes_tools import terminal\n"
+            "one = terminal('first')\n"
+            "two = terminal('second')\n"
+            "print(one.get('output'), two.get('error'))",
+            "kernel-test",
+        )
+        second = _run(
+            "from hermes_tools import terminal\n"
+            "print(terminal('again').get('output'))",
+            "kernel-test",
+        )
+
+    assert first["status"] == "success"
+    assert first["tool_calls_made"] == 1
+    assert "Tool call limit reached" in first["output"]
+    assert second["status"] == "success"
+    assert second["tool_calls_made"] == 1
+    assert "again" in second["output"]
+
+
+def test_persistent_kernel_updates_dispatch_context_on_reuse():
+    execution_manager = SimpleNamespace(_middleware={"tool_execution": [object()]})
+    seen = []
+
+    def dispatch(function_name, function_args, **kwargs):
+        from tools.approval import get_current_session_key
+
+        seen.append({**kwargs, "approval_scope": get_current_session_key()})
+        return json.dumps({"output": "rpc-ok", "exit_code": 0})
+
+    with (
+        patch("hermes_cli.plugins.get_plugin_manager", return_value=execution_manager),
+        patch("model_tools.handle_function_call", side_effect=dispatch),
+    ):
+        first = _run(
+            "from hermes_tools import terminal\nprint(terminal('first').get('output'))",
+            "kernel-test",
+            session_id="session-a",
+        )
+        second = _run(
+            "from hermes_tools import terminal\nprint(terminal('second').get('output'))",
+            "kernel-test",
+            session_id="session-b",
+        )
+
+    assert first["status"] == "success"
+    assert second["status"] == "success"
+    assert [item["session_id"] for item in seen] == ["session-a", "session-b"]
+    assert [item["approval_scope"] for item in seen] == ["session-a", "session-b"]
+
+
+def test_reset_only_execute_code_call_accepts_omitted_code():
+    first = _run("secret = 'stale'", "kernel-test")
+    reset = json.loads(execute_code(
+        task_id="kernel-test",
+        enabled_tools=[],
+        persistent=True,
+        kernel_id="test",
+        reset=True,
+    ))
+
+    assert first["status"] == "success"
+    assert reset["status"] == "success"
+    assert reset["kernel_reset"] is True
+
+
+def test_persistent_execute_without_task_id_returns_structured_error():
+    result = json.loads(execute_code(
+        "print('must not run')",
+        enabled_tools=[],
+        persistent=True,
+        kernel_id="test",
+    ))
+
+    assert result["status"] == "error"
+    assert "explicit task_id" in result["error"]
+    assert result["tool_calls_made"] == 0
+
+
+def test_distinct_explicit_task_ids_do_not_share_persistent_kernel():
+    first = _run("value = 'task-a'", "kernel-a", kernel_id="shared")
+    second = _run("value = 'task-b'", "kernel-b", kernel_id="shared")
+    registry = code_execution_tool._kernel_registry
+
+    assert first["status"] == "success"
+    assert second["status"] == "success"
+    kernel_a = registry.get("kernel-a", "shared")
+    kernel_b = registry.get("kernel-b", "shared")
+    assert kernel_a is not None and kernel_b is not None
+    assert kernel_a.process.pid != kernel_b.process.pid
+    assert _run("print(value)", "kernel-a", kernel_id="shared")["output"].strip() == "task-a"
+    assert _run("print(value)", "kernel-b", kernel_id="shared")["output"].strip() == "task-b"
+
+
 def test_reset_clears_state_and_timeout_restarts_clean_kernel():
     assert _run("secret = 'stale'", "kernel-test")["status"] == "success"
     reset = _run("", "kernel-test", reset=True)
@@ -156,6 +302,26 @@ def test_idle_expiry_terminates_and_removes_kernel():
         while time.monotonic() < deadline and psutil.pid_exists(pid):
             time.sleep(0.02)
         assert not psutil.pid_exists(pid)
+    finally:
+        registry.close_all()
+        code_execution_tool._kernel_registry = old_registry
+
+
+def test_idle_reaper_expires_kernel_without_registry_access_after_wait():
+    registry = ExecutionKernelRegistry(idle_ttl=0.1)
+    old_registry = code_execution_tool._kernel_registry
+    code_execution_tool._kernel_registry = registry
+    try:
+        result = _run("value = 1", "kernel-test", kernel_id="reaper")
+        assert result["status"] == "success"
+        kernel = registry.get("kernel-test", "reaper")
+        assert kernel is not None
+        pid = kernel.process.pid
+        tmpdir = kernel._tmpdir
+
+        time.sleep(0.5)
+        assert not psutil.pid_exists(pid)
+        assert not os.path.exists(tmpdir)
     finally:
         registry.close_all()
         code_execution_tool._kernel_registry = old_registry
