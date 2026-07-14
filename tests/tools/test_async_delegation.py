@@ -492,6 +492,7 @@ def test_interrupts_are_scoped_to_active_profile(tmp_path, monkeypatch):
     assert interrupted == {"a": 0, "b": 2}
 
 
+
 def test_interrupt_all_signals_running_children():
     ev = threading.Event()
     interrupted = {"count": 0}
