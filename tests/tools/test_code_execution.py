@@ -17,6 +17,8 @@ import pytest
 
 import json
 import os
+import base64
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import shutil
@@ -56,6 +58,7 @@ from tools.code_execution_tool import (
     _TOOL_DOC_LINES,
     _execute_remote,
     CodeExecutionContext,
+    ArtifactBudget,
     _context_from_rpc_request,
     _dispatch_script_call,
     is_structured_image_artifact,
@@ -127,6 +130,13 @@ def _dispatch_script(code, context, definitions):
     """Run generated code against the production local RPC server."""
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     tmpdir = tempfile.mkdtemp(prefix="hermes_code_mode_test_")
+    artifact_dir = os.path.join(tmpdir, "artifacts")
+    os.makedirs(artifact_dir, mode=0o700, exist_ok=True)
+    context = replace(
+        context,
+        artifact_roots=(tmpdir, artifact_dir),
+        artifact_budget=ArtifactBudget(),
+    )
     sock_path = os.path.join("/tmp", f"hermes_code_mode_{uuid.uuid4().hex}.sock")
     server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server_sock.bind(sock_path)
@@ -156,6 +166,7 @@ def _dispatch_script(code, context, definitions):
         env.update({
             "HERMES_RPC_SOCKET": sock_path,
             "HERMES_RPC_TOKEN": token,
+            "HERMES_ARTIFACTS_DIR": artifact_dir,
             "PYTHONPATH": os.pathsep.join((tmpdir, repo_root)),
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONIOENCODING": "utf-8",
@@ -743,6 +754,49 @@ class TestExecuteCodeRemoteTempDir(unittest.TestCase):
         self.assertIn("HERMES_RPC_DIR=/data/data/com.termux/files/usr/tmp/hermes_exec_", run_cmd)
         self.assertIn("rm -rf /data/data/com.termux/files/usr/tmp/hermes_exec_", cleanup_cmd)
         self.assertNotIn("mkdir -p /tmp/hermes_exec_", mkdir_cmd)
+
+    def test_remote_artifacts_are_collected_before_cleanup(self):
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+                self.artifact_path = "/tmp/hermes_exec_test/artifacts/chart.png"
+                self.artifact_bytes = b"PNG-REMOTE"
+
+            def get_temp_dir(self):
+                return "/tmp"
+
+            def execute(self, command, cwd=None, timeout=None):
+                self.commands.append((command, cwd, timeout))
+                if "command -v python3" in command:
+                    return {"output": "OK\n"}
+                if "python3 script.py" in command:
+                    return {"output": "hello\n", "returncode": 0}
+                if command.startswith("find "):
+                    root = command.split("find ", 1)[1].split(" -maxdepth", 1)[0].strip("'")
+                    self.artifact_path = root + "/chart.png"
+                    return {"output": f"{self.artifact_path}\n"}
+                if command.startswith("wc -c"):
+                    return {"output": f"{len(self.artifact_bytes)}\n"}
+                if command.startswith("head -c"):
+                    return {"output": base64.b64encode(self.artifact_bytes).decode() + "\n"}
+                return {"output": ""}
+
+        env = FakeEnv()
+        fake_thread = MagicMock()
+        with patch("tools.code_execution_tool._load_config", return_value={"timeout": 30, "max_tool_calls": 5}), \
+             patch("tools.code_execution_tool._get_or_create_env", return_value=(env, "ssh")), \
+             patch("tools.code_execution_tool._ship_file_to_remote"), \
+             patch("tools.code_execution_tool.threading.Thread", return_value=fake_thread):
+            result = json.loads(_execute_remote("print('hello')", "task-remote-image", ["terminal"]))
+
+        assert result["status"] == "success"
+        assert result["_multimodal"] is True
+        image_url = result["content"][0]["image_url"]["url"]
+        assert image_url.startswith("file://")
+        assert Path(image_url[7:]).is_file()
+        find_index = next(i for i, (cmd, _, _) in enumerate(env.commands) if cmd.startswith("find "))
+        cleanup_index = next(i for i, (cmd, _, _) in enumerate(env.commands) if cmd.startswith("rm -rf "))
+        assert find_index < cleanup_index
 
     def test_timezone_shell_quoted_in_remote_execution(self):
         """HERMES_TIMEZONE must be shell-quoted in remote env_prefix to prevent injection."""
@@ -1877,15 +1931,17 @@ def test_execute_code_spills_oversized_text_even_with_image_content(monkeypatch)
     assert len(result["output"]) < 2000
 
 
-def test_generated_save_artifact_persists_a_real_file(tmp_path):
-    source = tmp_path / "report.txt"
-    source.write_text("artifact output", encoding="utf-8")
+def test_generated_save_artifact_persists_a_real_file():
     result = _dispatch_script(
         """
 import json
+import os
+from pathlib import Path
 from hermes_tools import save_artifact
-print(json.dumps(save_artifact(%r)))
-""" % str(source),
+source = Path(os.environ['HERMES_ARTIFACTS_DIR']) / 'report.txt'
+source.write_text('artifact output', encoding='utf-8')
+print(json.dumps(save_artifact(str(source))))
+""",
         CodeExecutionContext("save-artifact-task", None, (), ()),
         [_fixture_definition("fixture")],
     )
@@ -1894,6 +1950,68 @@ print(json.dumps(save_artifact(%r)))
     assert saved["status"] == "ok"
     assert os.path.isfile(saved["artifact_path"])
     assert open(saved["artifact_path"], encoding="utf-8").read() == "artifact output"
+
+
+def test_generated_save_artifact_accepts_bytes_and_rejects_external_paths():
+    result = _dispatch_script(
+        """
+import json
+from hermes_tools import save_artifact
+print(json.dumps(save_artifact(b'artifact bytes', name='bytes.txt')))
+""",
+        CodeExecutionContext("save-artifact-bytes", None, (), ()),
+        [_fixture_definition("fixture")],
+    )
+    assert result["status"] == "ok"
+    assert open(result["artifact_path"], encoding="utf-8").read() == "artifact bytes"
+
+    external = _dispatch_script(
+        """
+import json
+from hermes_tools import save_artifact
+print(json.dumps(save_artifact('/etc/hosts')))
+""",
+        CodeExecutionContext("save-artifact-external", None, (), ()),
+        [_fixture_definition("fixture")],
+    )
+    assert "inside the execution artifact roots" in external["error"]
+
+    escaped = _dispatch_script(
+        """
+import json
+import os
+from pathlib import Path
+from hermes_tools import save_artifact
+link = Path(os.environ['HERMES_ARTIFACTS_DIR']) / 'escape.txt'
+link.symlink_to('/etc/hosts')
+print(json.dumps(save_artifact(str(link))))
+""",
+        CodeExecutionContext("save-artifact-symlink", None, (), ()),
+        [_fixture_definition("fixture")],
+    )
+    assert "inside the execution artifact roots" in escaped["error"]
+
+
+def test_registry_dispatch_exposes_only_multimodal_execute_code_results(monkeypatch):
+    from tools.registry import registry
+
+    monkeypatch.setattr(
+        code_execution_tool,
+        "execute_code",
+        lambda **_kwargs: json.dumps({
+            "status": "success",
+            "_multimodal": True,
+            "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}],
+        }),
+    )
+    multimodal = registry.dispatch("execute_code", {"code": "print('x')"}, task_id="registry-image")
+    assert isinstance(multimodal, dict)
+    assert multimodal["_multimodal"] is True
+
+    monkeypatch.setattr(code_execution_tool, "execute_code", lambda **_kwargs: '{"status":"success"}')
+    ordinary = registry.dispatch("execute_code", {"code": "print('x')"}, task_id="registry-text")
+    assert isinstance(ordinary, str)
+    assert ordinary == '{"status":"success"}'
 
 
 def test_execute_code_keeps_ordinary_string_output_shape():

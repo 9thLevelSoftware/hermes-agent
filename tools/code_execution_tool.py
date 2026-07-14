@@ -46,7 +46,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -62,6 +62,32 @@ from tools.thread_context import propagate_context_to_thread
 logger = logging.getLogger(__name__)
 
 SANDBOX_AVAILABLE = True
+
+# Durable artifacts are deliberately bounded so a generated helper cannot use
+# save_artifact as an unbounded file-read or disk-filling primitive.  These are
+# execution-level defaults; a single execution has a separate aggregate cap.
+MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
+MAX_TOTAL_ARTIFACT_BYTES = 50 * 1024 * 1024
+
+
+@dataclass
+class ArtifactBudget:
+    """Thread-safe per-execution artifact byte budget."""
+
+    max_bytes: int = MAX_ARTIFACT_BYTES
+    max_total_bytes: int = MAX_TOTAL_ARTIFACT_BYTES
+    used_bytes: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def reserve(self, size: int) -> bool:
+        if size < 0 or size > self.max_bytes:
+            return False
+        with self._lock:
+            if self.used_bytes + size > self.max_total_bytes:
+                return False
+            self.used_bytes += size
+            return True
+
 
 # The 7 tools allowed inside the sandbox. The intersection of this list
 # and the session's enabled tools determines which stubs are generated.
@@ -84,6 +110,10 @@ class CodeExecutionContext:
     session_id: Optional[str]
     enabled_toolsets: tuple[str, ...]
     disabled_toolsets: tuple[str, ...]
+    # Parent-authorized roots for generated save_artifact calls.  These are
+    # never taken from an untrusted RPC request; they are bound per execution.
+    artifact_roots: tuple[str, ...] = ()
+    artifact_budget: Optional["ArtifactBudget"] = None
 
 
 # Keep policy names centralized so every RPC transport applies the same
@@ -160,11 +190,14 @@ def _script_operation_decision(
 
 def _context_payload(context: Optional[CodeExecutionContext]) -> Dict[str, object]:
     context = context or CodeExecutionContext(None, None, (), ())
+    budget = context.artifact_budget
     return {
         "task_id": context.task_id,
         "session_id": context.session_id,
         "enabled_toolsets": list(context.enabled_toolsets),
         "disabled_toolsets": list(context.disabled_toolsets),
+        "artifact_roots": list(context.artifact_roots),
+        "artifact_max_bytes": int(budget.max_bytes if budget else MAX_ARTIFACT_BYTES),
     }
 
 
@@ -206,15 +239,31 @@ def _dispatch_catalog_action(
         save_args = arguments.get("arguments", {})
         if not isinstance(save_args, dict):
             return {"error": "save_artifact arguments must be an object."}
+        source: str | bytes | None = None
         path = save_args.get("path")
-        if not isinstance(path, str) or not path.strip():
-            return {"error": "save_artifact requires a local file path."}
+        path_or_bytes = save_args.get("path_or_bytes")
+        encoded = save_args.get("bytes_b64")
+        if isinstance(encoded, str):
+            try:
+                source = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError):
+                return {"error": "save_artifact bytes_b64 is invalid."}
+        elif isinstance(path_or_bytes, (bytes, bytearray, memoryview)):
+            source = bytes(path_or_bytes)
+        elif isinstance(path_or_bytes, str) and path_or_bytes.strip():
+            source = path_or_bytes
+        elif isinstance(path, str) and path.strip():
+            source = path
+        else:
+            return {"error": "save_artifact requires path_or_bytes."}
         name = save_args.get("name")
         mime_type = save_args.get("mime_type")
         return _persist_file_artifact(
-            path,
+            source,
             name=name if isinstance(name, str) else None,
             mime_type=mime_type if isinstance(mime_type, str) else None,
+            allowed_roots=context.artifact_roots,
+            budget=context.artifact_budget,
         )
     if bridge_name is None:
         return {"error": f"Unknown code-mode catalog action: {action}"}
@@ -442,14 +491,25 @@ def _artifact_storage_dir() -> str:
     return directory
 
 
-def _persist_execute_artifact(content: str, suffix: str = ".txt") -> str:
-    """Persist already-redacted text and return its durable path."""
+def _persist_execute_artifact(
+    content: str,
+    suffix: str = ".txt",
+    *,
+    budget: Optional[ArtifactBudget] = None,
+) -> str:
+    """Persist already-redacted text under the durable artifact directory."""
+    data = str(content or "").encode("utf-8")
+    if len(data) > MAX_ARTIFACT_BYTES:
+        data = data[:MAX_ARTIFACT_BYTES].decode("utf-8", errors="ignore").encode("utf-8")
+    budget = budget or ArtifactBudget()
+    if not budget.reserve(len(data)):
+        raise ValueError("Artifact byte budget exceeded.")
     fd, path = tempfile.mkstemp(
-        prefix="execute_code_", suffix=suffix, dir=_artifact_storage_dir(), text=True,
+        prefix="execute_code_", suffix=suffix, dir=_artifact_storage_dir(), text=False,
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
     except BaseException:
@@ -461,51 +521,134 @@ def _persist_execute_artifact(content: str, suffix: str = ".txt") -> str:
     return path
 
 
-def _persist_file_artifact(path: str, name: Optional[str] = None, mime_type: Optional[str] = None) -> dict:
-    """Copy a child-created artifact out of its disposable execution directory."""
-    source = os.path.abspath(os.path.expanduser(path))
-    if not os.path.isfile(source):
-        return {"error": f"Artifact does not exist: {path}"}
-    filename = os.path.basename(name or source) or "artifact"
-    suffix = os.path.splitext(filename)[1]
-    image_part = normalize_image_artifact(source)
-    if image_part:
+def _path_is_under_roots(path: str, roots: Iterable[str]) -> bool:
+    """Return whether a resolved path is inside one authorized root."""
+    try:
+        candidate = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+        for root in roots:
+            if not isinstance(root, str) or not root.strip():
+                continue
+            resolved_root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
+            if os.path.commonpath((candidate, resolved_root)) == resolved_root:
+                return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _safe_artifact_name(name: Optional[str], fallback: str = "artifact") -> str:
+    """Return a bounded, basename-only, redacted artifact metadata name."""
+    raw = os.path.basename(str(name or fallback)).strip() or fallback
+    cleaned = os.path.basename(_clean_execute_text(raw)).strip() or fallback
+    return cleaned[:128]
+
+
+def _safe_mime_type(mime_type: Optional[str]) -> Optional[str]:
+    if not isinstance(mime_type, str):
+        return None
+    cleaned = _clean_execute_text(mime_type).strip()
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*", cleaned):
+        return cleaned
+    return None
+
+
+def _persist_file_artifact(
+    source: str | bytes,
+    name: Optional[str] = None,
+    mime_type: Optional[str] = None,
+    *,
+    allowed_roots: Iterable[str] = (),
+    budget: Optional[ArtifactBudget] = None,
+) -> dict:
+    """Persist bounded bytes or a file beneath an authorized execution root."""
+    budget = budget or ArtifactBudget()
+    source_path = None
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        data = bytes(source)
+        fallback_name = "artifact"
+    elif isinstance(source, str) and source.strip():
+        source_path = os.path.realpath(os.path.abspath(os.path.expanduser(source)))
+        if not _path_is_under_roots(source_path, allowed_roots):
+            return {"error": "Artifact path must be inside the execution artifact roots."}
+        if not os.path.isfile(source_path):
+            return {"error": f"Artifact does not exist: {source}"}
+        try:
+            size = os.path.getsize(source_path)
+            if size > MAX_ARTIFACT_BYTES:
+                return {"error": f"Artifact exceeds the {MAX_ARTIFACT_BYTES}-byte limit."}
+            with open(source_path, "rb") as handle:
+                data = handle.read(MAX_ARTIFACT_BYTES + 1)
+            if len(data) > MAX_ARTIFACT_BYTES:
+                return {"error": f"Artifact exceeds the {MAX_ARTIFACT_BYTES}-byte limit."}
+        except OSError as exc:
+            return {"error": f"Artifact could not be read: {exc}"}
+        fallback_name = os.path.basename(source_path)
+    else:
+        return {"error": "Artifact requires path_or_bytes."}
+
+    if len(data) > MAX_ARTIFACT_BYTES:
+        return {"error": f"Artifact exceeds the {MAX_ARTIFACT_BYTES}-byte limit."}
+
+    safe_mime = _safe_mime_type(mime_type)
+    filename = _safe_artifact_name(name, fallback_name)
+    suffix = os.path.splitext(filename)[1].lower()
+    if safe_mime and safe_mime.startswith("image/") and suffix not in _IMAGE_SUFFIXES:
+        import mimetypes
+        suffix = mimetypes.guess_extension(safe_mime) or ".bin"
+    is_image = suffix in _IMAGE_SUFFIXES or bool(safe_mime and safe_mime.startswith("image/"))
+
+    if is_image:
+        if not budget.reserve(len(data)):
+            return {"error": "Artifact byte budget exceeded."}
         fd, destination = tempfile.mkstemp(
             prefix="execute_code_", suffix=suffix or ".bin", dir=_artifact_storage_dir(),
         )
-        os.close(fd)
         try:
-            import shutil
-            shutil.copyfile(source, destination)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
         except BaseException:
             try:
                 os.unlink(destination)
             except OSError:
                 pass
             raise
+        image_part = normalize_image_artifact(destination)
     else:
-        with open(source, encoding="utf-8", errors="replace") as handle:
-            content = _clean_execute_text(handle.read())
-        destination = _persist_execute_artifact(content, suffix=suffix or ".txt")
+        content = _clean_execute_text(data.decode("utf-8", errors="replace"))
+        destination = _persist_execute_artifact(
+            content,
+            suffix=suffix or ".txt",
+            budget=budget,
+        )
+        image_part = None
+
     response = {
         "status": "ok",
         "artifact_path": destination,
         "name": filename,
     }
-    if mime_type:
-        response["mime_type"] = mime_type
+    if safe_mime:
+        response["mime_type"] = safe_mime
     if image_part:
         response.update({
             "_multimodal": True,
-            "content": [normalize_image_artifact(destination)],
+            "content": [image_part],
         })
     return response
 
 
-def _collect_local_artifacts(artifact_dir: Optional[str], limit: int) -> tuple[list[dict], Optional[str]]:
+def _collect_local_artifacts(
+    artifact_dir: Optional[str],
+    limit: int,
+    *,
+    budget: Optional[ArtifactBudget] = None,
+) -> tuple[list[dict], Optional[str]]:
     """Copy generated images or spill generated text files before cleanup."""
     if not artifact_dir or not os.path.isdir(artifact_dir):
         return [], None
+    budget = budget or ArtifactBudget()
     image_parts = []
     text_path = None
     for name in sorted(os.listdir(artifact_dir)):
@@ -514,18 +657,31 @@ def _collect_local_artifacts(artifact_dir: Optional[str], limit: int) -> tuple[l
             continue
         image_part = normalize_image_artifact(source)
         if image_part:
-            copied = _persist_file_artifact(source, name=name)
+            copied = _persist_file_artifact(
+                source,
+                name=name,
+                allowed_roots=(artifact_dir,),
+                budget=budget,
+            )
             part = copied.get("content", [None])[0]
             if part and part not in image_parts:
                 image_parts.append(part)
             continue
         try:
-            with open(source, encoding="utf-8", errors="replace") as handle:
-                content = _clean_execute_text(handle.read())
+            size = os.path.getsize(source)
+            if size <= limit:
+                continue
+            if size > MAX_ARTIFACT_BYTES:
+                size = MAX_ARTIFACT_BYTES
+            with open(source, "rb") as handle:
+                content = _clean_execute_text(handle.read(size + 1).decode("utf-8", errors="replace"))
         except OSError:
             continue
         if len(content) > limit and text_path is None:
-            text_path = _persist_execute_artifact(content)
+            try:
+                text_path = _persist_execute_artifact(content, budget=budget)
+            except ValueError:
+                pass
     return image_parts, text_path
 
 
@@ -548,13 +704,18 @@ def _truncate_execute_output(text: str, limit: int) -> str:
     )
 
 
-def _prepare_execute_output(text: Any, limit: int) -> tuple[str, Optional[str], list[dict]]:
+def _prepare_execute_output(
+    text: Any,
+    limit: int,
+    *,
+    budget: Optional[ArtifactBudget] = None,
+) -> tuple[str, Optional[str], list[dict]]:
     """Clean output, preserve images, and spill oversized text before truncating."""
     cleaned = _clean_execute_text(text)
     image_parts = _image_parts_from_output(cleaned)
     artifact_path = None
     if len(cleaned) > limit:
-        artifact_path = _persist_execute_artifact(cleaned)
+        artifact_path = _persist_execute_artifact(cleaned, budget=budget)
         cleaned = _truncate_execute_output(cleaned, limit)
     return cleaned, artifact_path, image_parts
 
@@ -802,11 +963,49 @@ def call_tool(name: str, arguments: dict = None):
     })
 
 
-def save_artifact(path: str, name: str = None, mime_type: str = None):
-    """Request artifact persistence; collection is implemented by the parent."""
+def save_artifact(path_or_bytes, name: str = None, mime_type: str = None):
+    """Persist bounded bytes or a file under the execution artifact roots."""
+    if isinstance(path_or_bytes, (bytes, bytearray, memoryview)):
+        data = bytes(path_or_bytes)
+        source_name = None
+    elif isinstance(path_or_bytes, str) and path_or_bytes.strip():
+        candidate = os.path.realpath(os.path.expanduser(path_or_bytes))
+        roots = [
+            os.path.realpath(str(root))
+            for root in (_HERMES_RPC_CONTEXT.get('artifact_roots') or [])
+            if isinstance(root, str) and root.strip()
+        ]
+        try:
+            allowed = any(os.path.commonpath((candidate, root)) == root for root in roots)
+        except (OSError, ValueError):
+            allowed = False
+        if not allowed:
+            return {'error': 'save_artifact path must be inside the execution artifact roots.'}
+        try:
+            size = os.path.getsize(candidate)
+            max_bytes = int(_HERMES_RPC_CONTEXT.get('artifact_max_bytes') or 0)
+            if max_bytes > 0 and size > max_bytes:
+                return {'error': f'save_artifact file exceeds the {max_bytes}-byte limit.'}
+            with open(candidate, 'rb') as handle:
+                data = handle.read(max_bytes + 1 if max_bytes > 0 else -1)
+            if max_bytes > 0 and len(data) > max_bytes:
+                return {'error': f'save_artifact file exceeds the {max_bytes}-byte limit.'}
+        except OSError as exc:
+            return {'error': f'save_artifact could not read the file: {exc}'}
+        source_name = os.path.basename(candidate)
+    else:
+        return {'error': 'save_artifact requires path_or_bytes.'}
+
+    max_bytes = int(_HERMES_RPC_CONTEXT.get('artifact_max_bytes') or 0)
+    if max_bytes > 0 and len(data) > max_bytes:
+        return {'error': f'save_artifact bytes exceed the {max_bytes}-byte limit.'}
     return _call('__code_mode_catalog__', {
         'action': 'save_artifact',
-        'arguments': {'path': path, 'name': name, 'mime_type': mime_type},
+        'arguments': {
+            'bytes_b64': base64.b64encode(data).decode('ascii'),
+            'name': name or source_name,
+            'mime_type': mime_type,
+        },
     })
 '''
 
@@ -1132,6 +1331,7 @@ def retry(fn, max_attempts=3, delay=2):
 
 _UDS_TRANSPORT_HEADER = '''\
 """Auto-generated Hermes tools RPC stubs."""
+import base64
 import json, os, socket, shlex, threading, time
 
 _sock = None
@@ -1204,6 +1404,7 @@ def _call(tool_name, args):
 
 _FILE_TRANSPORT_HEADER = '''\
 """Auto-generated Hermes tools RPC stubs (file-based transport)."""
+import base64
 import json, os, shlex, tempfile, threading, time
 
 _RPC_DIR = os.environ.get("HERMES_RPC_DIR") or os.path.join(tempfile.gettempdir(), "hermes_rpc")
@@ -1571,6 +1772,85 @@ def _ship_file_to_remote(env, remote_path: str, content: str) -> None:
     )
 
 
+def _collect_remote_artifacts(
+    env: Any,
+    artifact_dir: str,
+    limit: int,
+    *,
+    budget: Optional[ArtifactBudget] = None,
+) -> tuple[list[dict], Optional[str]]:
+    """Fetch bounded remote artifacts before the remote sandbox is removed."""
+    budget = budget or ArtifactBudget()
+    quoted_dir = shlex.quote(artifact_dir)
+    try:
+        listing = env.execute(
+            f"find {quoted_dir} -maxdepth 1 -type f -print 2>/dev/null || true",
+            cwd="/",
+            timeout=15,
+        )
+        paths = [
+            line.strip()
+            for line in str(listing.get("output", "")).splitlines()
+            if line.strip()
+        ]
+    except Exception:
+        logger.debug("Could not list remote execute_code artifacts", exc_info=True)
+        return [], None
+
+    image_parts: list[dict] = []
+    text_path = None
+    root_prefix = artifact_dir.rstrip("/") + "/"
+    for remote_path in paths:
+        if not remote_path.startswith(root_prefix):
+            continue
+        name = os.path.basename(remote_path)
+        suffix = os.path.splitext(name)[1].lower()
+        try:
+            quoted_path = shlex.quote(remote_path)
+            size_result = env.execute(
+                f"wc -c < {quoted_path}", cwd="/", timeout=15,
+            )
+            size_match = re.search(r"\d+", str(size_result.get("output", "")))
+            size = int(size_match.group(0)) if size_match else 0
+        except Exception:
+            logger.debug("Could not stat remote artifact %s", remote_path, exc_info=True)
+            continue
+
+        is_image = suffix in _IMAGE_SUFFIXES
+        if size <= 0:
+            continue
+        if not is_image and size <= limit:
+            continue
+        if size > MAX_ARTIFACT_BYTES and is_image:
+            logger.warning("Skipping oversized remote image artifact %s", name)
+            continue
+        fetch_size = min(max(size, 0), MAX_ARTIFACT_BYTES)
+        try:
+            command = f"head -c {fetch_size} {shlex.quote(remote_path)} | base64"
+            encoded_result = env.execute(command, cwd="/", timeout=60)
+            encoded = "".join(str(encoded_result.get("output", "")).split())
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError, OSError):
+            logger.debug("Could not fetch remote artifact %s", remote_path, exc_info=True)
+            continue
+        except Exception:
+            logger.debug("Could not fetch remote artifact %s", remote_path, exc_info=True)
+            continue
+
+        copied = _persist_file_artifact(
+            data,
+            name=name,
+            allowed_roots=(),
+            budget=budget,
+        )
+        part = copied.get("content", [None])[0]
+        if part and part not in image_parts:
+            image_parts.append(part)
+        if not is_image and copied.get("artifact_path") and text_path is None:
+            text_path = copied["artifact_path"]
+    return image_parts, text_path
+
+
 def _env_temp_dir(env: Any) -> str:
     """Return a writable temp dir for env-backed execute_code sandboxes."""
     get_temp_dir = getattr(env, "get_temp_dir", None)
@@ -1774,6 +2054,11 @@ def _execute_remote(
     temp_dir = _env_temp_dir(env)
     sandbox_dir = f"{temp_dir}/hermes_exec_{sandbox_id}"
     artifact_dir = f"{sandbox_dir}/artifacts"
+    context = replace(
+        context,
+        artifact_roots=(sandbox_dir, artifact_dir),
+        artifact_budget=context.artifact_budget or ArtifactBudget(),
+    )
     quoted_sandbox_dir = shlex.quote(sandbox_dir)
     quoted_rpc_dir = shlex.quote(f"{sandbox_dir}/rpc")
 
@@ -1782,6 +2067,8 @@ def _execute_remote(
     exec_start = time.monotonic()
     stop_event = threading.Event()
     rpc_thread = None
+    remote_artifact_images: list[dict] = []
+    remote_artifact_file: Optional[str] = None
 
     try:
         # Verify Python is available on the remote
@@ -1858,6 +2145,15 @@ def _execute_remote(
         elif exit_code == 130:
             status = "interrupted"
 
+        # Collect remote artifacts while the sandbox still exists.  The durable
+        # parent-side paths are then safe to return after cleanup.
+        remote_artifact_images, remote_artifact_file = _collect_remote_artifacts(
+            env,
+            artifact_dir,
+            max_stdout_bytes,
+            budget=context.artifact_budget,
+        )
+
     except Exception as exc:
         duration = round(time.monotonic() - exec_start, 2)
         logger.error(
@@ -1890,7 +2186,7 @@ def _execute_remote(
 
     # --- Post-process output (same as local path) ---
     stdout_text, stdout_artifact_path, stdout_image_parts = _prepare_execute_output(
-        stdout_text, max_stdout_bytes,
+        stdout_text, max_stdout_bytes, budget=context.artifact_budget,
     )
 
     # Build response
@@ -1922,7 +2218,11 @@ def _execute_remote(
         result["status"] = "error"
         result["error"] = f"Script exited with code {exit_code}"
 
-    _attach_execute_artifacts(result, stdout_image_parts, stdout_artifact_path)
+    _attach_execute_artifacts(
+        result,
+        [*stdout_image_parts, *remote_artifact_images],
+        stdout_artifact_path or remote_artifact_file,
+    )
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -2100,6 +2400,14 @@ class ExecutionKernel:
             if self.alive:
                 return
             self._tmpdir = tempfile.mkdtemp(prefix="hermes_kernel_")
+            artifact_dir = os.path.join(self._tmpdir, "artifacts")
+            os.makedirs(artifact_dir, mode=0o700, exist_ok=True)
+            self.context = replace(
+                self.context,
+                artifact_roots=(self._tmpdir, artifact_dir),
+                artifact_budget=self.context.artifact_budget or ArtifactBudget(),
+            )
+            self._rpc_context[0] = self.context
             tools_src = generate_hermes_tools_module(
                 list(self.sandbox_tools), context=self.context,
             )
@@ -2174,8 +2482,12 @@ class ExecutionKernel:
     ) -> dict:
         with self._lock:
             if context is not None:
-                self.context = context
-                self._rpc_context[0] = context
+                self.context = replace(
+                    context,
+                    artifact_roots=self.context.artifact_roots,
+                    artifact_budget=ArtifactBudget(),
+                )
+                self._rpc_context[0] = self.context
             if max_tool_calls is not None:
                 self.max_tool_calls = int(max_tool_calls)
                 self._max_tool_calls[0] = self.max_tool_calls
@@ -2574,6 +2886,7 @@ def execute_code(
         session_id=session_id,
         enabled_toolsets=tuple(str(name) for name in (enabled_toolsets or ())),
         disabled_toolsets=tuple(str(name) for name in (disabled_toolsets or ())),
+        artifact_budget=ArtifactBudget(),
     )
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
@@ -2711,6 +3024,7 @@ def execute_code(
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
     artifact_dir = os.path.join(tmpdir, "artifacts")
     os.makedirs(artifact_dir, mode=0o700, exist_ok=True)
+    context = replace(context, artifact_roots=(tmpdir, artifact_dir))
     # Use /tmp on macOS to avoid the long /var/folders/... path that pushes
     # Unix domain socket paths past the 104-byte macOS AF_UNIX limit.
     # On Linux, tempfile.gettempdir() already returns /tmp.
@@ -2953,7 +3267,7 @@ def execute_code(
             b"".join(stderr_chunks).decode("utf-8", errors="replace")
         )
         stdout_text, stdout_artifact_path, stdout_image_parts = _prepare_execute_output(
-            stdout_full, max_stdout_bytes,
+            stdout_full, max_stdout_bytes, budget=context.artifact_budget,
         )
 
         exit_code = proc.returncode if proc.returncode is not None else -1
@@ -2998,7 +3312,11 @@ def execute_code(
             if stderr_text:
                 result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
 
-        artifact_images, artifact_file = _collect_local_artifacts(artifact_dir, max_stdout_bytes)
+        artifact_images, artifact_file = _collect_local_artifacts(
+            artifact_dir,
+            max_stdout_bytes,
+            budget=context.artifact_budget,
+        )
         ephemeral_prefix = Path(artifact_dir).resolve().as_uri().rstrip("/") + "/"
         stdout_image_parts = [
             part for part in stdout_image_parts
@@ -3408,11 +3726,10 @@ EXECUTE_CODE_SCHEMA = build_execute_code_schema()
 # --- Registry ---
 from tools.registry import registry, tool_error
 
-registry.register(
-    name="execute_code",
-    toolset="code_execution",
-    schema=EXECUTE_CODE_SCHEMA,
-    handler=lambda args, **kw: execute_code(
+
+def _execute_code_registry_handler(args: dict, **kw):
+    """Keep ordinary results as strings and expose validated image envelopes."""
+    raw = execute_code(
         code=args.get("code", ""),
         task_id=kw.get("task_id"),
         enabled_tools=kw.get("enabled_tools"),
@@ -3424,7 +3741,27 @@ registry.register(
         session=args.get("session"),
         reset=args.get("reset", False),
         timeout=args.get("timeout"),
-        idle_ttl=args.get("idle_ttl")),
+        idle_ttl=args.get("idle_ttl"),
+    )
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return raw
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("_multimodal") is True
+            and isinstance(parsed.get("content"), list)
+        ):
+            return parsed
+    return raw
+
+
+registry.register(
+    name="execute_code",
+    toolset="code_execution",
+    schema=EXECUTE_CODE_SCHEMA,
+    handler=_execute_code_registry_handler,
     check_fn=check_sandbox_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,
