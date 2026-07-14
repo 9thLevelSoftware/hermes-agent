@@ -2888,6 +2888,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+    _adapter_state_lock = threading.Lock()
+    _fatal_adapter_claims: _weakref.WeakSet[BasePlatformAdapter] = _weakref.WeakSet()
 
     async def _workflow_dispatcher_watcher(
         self,

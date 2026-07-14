@@ -4051,11 +4051,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
-        # Stage async-delegation operation_ids awaiting acknowledgement. Popped
-        # when the agent commits to running the queued synth — see
-        # `_ack_pending_async_delegations`. Bounds if the agent loop crashes
-        # before consuming every staged ack; the durable journal still owns the
-        # source of truth, so this is just a "don't double-ack" hint list.
         self._pending_delegation_acks: "deque[str]" = deque()
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
@@ -8742,7 +8737,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif canonical == "compress":
             self._manual_compress(cmd_original)
         elif canonical == "usage":
-            self._show_usage()
+            self._handle_usage_command(cmd_original)
         elif canonical == "credits":
             self._show_credits()
         elif canonical == "billing":
@@ -9642,6 +9637,53 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 print(f"  ❌ Compression failed: {e}")
 
 
+
+    def _handle_usage_command(self, cmd_original: str):
+        """Dispatch `/usage [reset [--force]]`.
+
+        Bare `/usage` keeps the classic display. `/usage reset` redeems one
+        banked Codex rate-limit reset credit (guarded: refuses when limits
+        aren't exhausted unless --force).
+        """
+        parts = cmd_original.split()
+        args = [p.lower() for p in parts[1:]]
+        if args and args[0] == "reset":
+            self._usage_reset(force="--force" in args[1:])
+            return
+        if args:
+            print(f"  Unknown /usage subcommand: {' '.join(parts[1:])}. Try /usage or /usage reset [--force].")
+            return
+        self._show_usage()
+
+    def _usage_reset(self, force: bool = False):
+        """`/usage reset [--force]` — redeem one banked Codex reset credit."""
+        provider = (
+            (getattr(self.agent, "provider", None) if self.agent else None)
+            or getattr(self, "provider", None)
+        )
+        normalized = str(provider or "").strip().lower()
+        if normalized != "openai-codex":
+            print("  Banked usage resets are only available on the openai-codex provider.")
+            print("  Switch with `/model` or `hermes auth` first.")
+            return
+        base_url = (getattr(self.agent, "base_url", None) if self.agent else None) or getattr(self, "base_url", None)
+        api_key = (getattr(self.agent, "api_key", None) if self.agent else None) or getattr(self, "api_key", None)
+
+        from agent.account_usage import redeem_codex_reset_credit
+
+        print("  ⏳ Checking banked reset credits...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+            try:
+                result = _pool.submit(
+                    redeem_codex_reset_credit,
+                    base_url=base_url,
+                    api_key=api_key,
+                    force=force,
+                ).result(timeout=45.0)
+            except concurrent.futures.TimeoutError:
+                print("  ❌ Timed out talking to the Codex backend — try again shortly.")
+                return
+        print(f"  {result.message}")
 
     def _show_usage(self):
         """Rate limits + session token usage (when a live agent exists) + Nous credits.
@@ -11703,13 +11745,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         return ""
 
     def _approval_callback(self, command: str, description: str,
-                           *, allow_permanent: bool = True) -> str:
+                           *, allow_permanent: bool = True,
+                           smart_denied: bool = False) -> str:
         """
         Prompt for dangerous command approval through the prompt_toolkit UI.
 
         Called from the agent thread. Shows a selection UI similar to clarify
-        with choices: once / session / always / deny. When allow_permanent
-        is False (tirith warnings present), the 'always' option is hidden.
+        with choices: once / session / always / deny. Smart DENY owner
+        overrides show only once / deny. When allow_permanent is False for
+        another reason (for example tirith), only 'always' is hidden.
         Long commands also get a 'view' option so the full command can be
         expanded before deciding.
 
@@ -11726,7 +11770,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._approval_state = {
                 "command": command,
                 "description": description,
-                "choices": self._approval_choices(command, allow_permanent=allow_permanent),
+                "choices": self._approval_choices(
+                    command,
+                    allow_permanent=allow_permanent,
+                    smart_denied=smart_denied,
+                ),
                 "selected": 0,
                 "response_queue": response_queue,
             }
@@ -11772,9 +11820,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
             return "deny"
 
-    def _approval_choices(self, command: str, *, allow_permanent: bool = True) -> list[str]:
+    def _approval_choices(self, command: str, *, allow_permanent: bool = True,
+                          smart_denied: bool = False) -> list[str]:
         """Return approval choices for a dangerous command prompt."""
-        choices = ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+        if smart_denied:
+            choices = ["once", "deny"]
+        else:
+            choices = ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
         if len(command) > 70:
             choices.append("view")
         return choices
@@ -12139,7 +12191,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             request_overrides=turn_route.get("request_overrides"),
         ):
             return None
-        
+        agent = self.agent
+        if agent is None:
+            return None
+
         # Route image attachments based on the active model's vision capability.
         # "native" → pass pixels as OpenAI-style content parts (adapters
         #            translate for Anthropic/Gemini/Bedrock).
@@ -12227,8 +12282,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             from run_agent import _sanitize_surrogates
             message = _sanitize_surrogates(message)
 
-        # Add user message to history
-        self.conversation_history.append({"role": "user", "content": message})
+        # Keep the exact CLI input dict available until turn-start persistence.
+        # Copy the completed agent transcript before appending: otherwise this
+        # UI-only staging step mutates ``agent._session_messages`` and exposes a
+        # duplicate-prone intermediate snapshot to terminal-close persistence.
+        if self.conversation_history is getattr(agent, "_session_messages", None):
+            self.conversation_history = list(self.conversation_history)
+        # The prior turn's override applies only to its own user dict. Clear it
+        # before exposing the next staged input to close persistence; otherwise
+        # a shutdown before the worker prologue can write old API-local text as
+        # this new user message (#63766).
+        persist_lock = getattr(agent, "_session_persist_lock", None)
+
+        def _stage_user_message() -> None:
+            agent._persist_user_message_idx = None
+            agent._persist_user_message_override = None
+            agent._persist_user_message_timestamp = None
+            staged_user_message = {"role": "user", "content": message}
+            agent._pending_cli_user_message = staged_user_message
+            self.conversation_history.append(staged_user_message)
+
+        if persist_lock is None:
+            _stage_user_message()
+        else:
+            with persist_lock:
+                _stage_user_message()
 
         ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
         print(flush=True)
@@ -12365,13 +12443,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 self._pending_moa_config = None
                 if _moa_cfg is None:
                     _moa_cfg = None
+                # Model/skill notes and voice instructions are API-local. Keep
+                # the original staged input as the durable transcript value so a
+                # close-path marker follows the same dict into turn setup rather
+                # than producing a second noted user row (#63766).
+                _persist_clean_user_message = (
+                    message if (_voice_prefix or agent_message != message) else None
+                )
                 try:
                     result = self.agent.run_conversation(
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
                         stream_callback=stream_callback,
                         task_id=self.session_id,
-                        persist_user_message=message if _voice_prefix else None,
+                        persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
@@ -12834,20 +12919,75 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if not agent or not hasattr(agent, "_persist_session"):
             return
 
-        messages = getattr(agent, "_session_messages", None)
-        if not isinstance(messages, list):
-            messages = getattr(self, "conversation_history", None)
-        if not isinstance(messages, list) or not messages:
-            return
+        persist_lock = getattr(agent, "_session_persist_lock", None)
 
-        conversation_history = getattr(self, "conversation_history", None)
-        if not isinstance(conversation_history, list):
-            conversation_history = messages
+        def _snapshot_and_persist() -> None:
+            # This snapshot must share the staging lock with ``chat()``. Without
+            # it, close can retain a mutable history baseline just before chat
+            # appends its pending dict; the later flush then mistakes that dict
+            # for durable history and stamps it without writing a row (#63766).
+            messages = getattr(agent, "_session_messages", None)
+            pending_cli_message = getattr(agent, "_pending_cli_user_message", None)
+            if not isinstance(messages, list):
+                messages = getattr(self, "conversation_history", None)
+            if not isinstance(messages, list):
+                return
+            if isinstance(pending_cli_message, dict) and not any(
+                message is pending_cli_message for message in messages
+            ):
+                # The UI has accepted a new input but the worker still exposes its
+                # prior snapshot. Include only that staged dict; the baseline below
+                # keeps any durable resumed prefix from being re-appended.
+                messages = [*messages, pending_cli_message]
+            if not messages:
+                return
 
-        try:
+            # A normal turn builds a new list that reuses the resumed-history dicts.
+            # Keep that CLI history as the baseline so a signal between assigning
+            # ``_session_messages`` and the turn's DB flush cannot append its durable
+            # prefix a second time. Once the CLI takes the turn result, however, both
+            # names can point at the same live list; passing that alias would mark an
+            # unflushed tail durable without writing it. Marker-only persistence is
+            # correct only in that alias case.
+            conversation_history = getattr(self, "conversation_history", None)
+            pending_cli_message = getattr(agent, "_pending_cli_user_message", None)
+            if (
+                isinstance(conversation_history, list)
+                and conversation_history
+                and conversation_history[-1] is pending_cli_message
+            ):
+                # The UI accepted this user message before the agent finished its
+                # early persistence. Its dict can already be in ``messages`` but is
+                # not durable yet, so exclude it from the resumed-history baseline.
+                conversation_history = conversation_history[:-1]
+            elif not isinstance(conversation_history, list) or conversation_history is messages:
+                conversation_history = None
+
+            # A first-turn close can arrive before the worker builds its cached
+            # prompt. Build or restore it before the DB row is created so the
+            # durable transcript never leaves a NULL system_prompt cache entry.
+            if getattr(agent, "_cached_system_prompt", None) is None:
+                try:
+                    from agent.conversation_loop import _restore_or_build_system_prompt
+
+                    _restore_or_build_system_prompt(agent, None, conversation_history)
+                except Exception:
+                    logger.debug("Could not build system prompt during CLI close", exc_info=True)
+                    return
+            if getattr(agent, "_cached_system_prompt", None) is None:
+                return
+
+            agent._ensure_db_session()
             agent._persist_session(messages, conversation_history)
             if getattr(agent, "session_id", None):
                 self.session_id = agent.session_id
+
+        try:
+            if persist_lock is None:
+                _snapshot_and_persist()
+            else:
+                with persist_lock:
+                    _snapshot_and_persist()
         except (Exception, KeyboardInterrupt) as e:
             logger.debug("Could not persist active CLI session before close: %s", e)
 
@@ -13149,34 +13289,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         ]
 
     def _drain_idle_async_delegations(self) -> int:
-        """Pull pending async-delegation (and watch-pattern) notifications
-        from ``process_registry`` and queue them for the agent loop.
-
-        Acknowledgement of the *durable* row is INTENTIONALLY deferred —
-        it lives in ``self._pending_delegation_acks`` until the agent
-        loop actually commits to running the queued item
-        (``_ack_pending_async_delegations``). This way a process death
-        between put() and consumption leaves the row unacked so a
-        restart replays the completion instead of silently dropping it.
-
-        Returns the number of events staged (test hook surface).
-        """
+        """Queue notifications while deferring durable acknowledgement to consumption."""
         from tools.process_registry import process_registry
         from tools.approval import get_current_session_key
 
-        _drain_sk = get_current_session_key(default="")
+        session_key = get_current_session_key(default="")
         staged = 0
-        for _evt, _synth in process_registry.drain_notifications(session_key=_drain_sk):
-            _did = _evt.get("delegation_id", "") if _evt.get("type") == "async_delegation" else ""
-            self._pending_input.put(
-                _AsyncSynth(_synth, _did) if _did else _synth
-            )
-            # Stage the durable-row ack — do NOT call acknowledge yet.
-            # Background process completions have no operation row, so
-            # the later ack would be a no-op for them; we only stage
-            # the rows the journal actually owns.
-            if _did:
-                self._pending_delegation_acks.append(_did)
+        for event, synth in process_registry.drain_notifications(session_key=session_key):
+            delegation_id = event.get("delegation_id", "") if event.get("type") == "async_delegation" else ""
+            self._pending_input.put(_AsyncSynth(synth, delegation_id) if delegation_id else synth)
+            if delegation_id:
+                self._pending_delegation_acks.append(delegation_id)
             staged += 1
         return staged
 
@@ -13189,11 +13312,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         except ValueError:
             return
         from tools.async_delegation import acknowledge_async_delegation
+
         try:
             acknowledge_async_delegation(delegation_id)
         except Exception:
-            # ack must never crash the loop — see the helper's docstring.
-            pass
+            logger.debug("Unable to acknowledge async delegation %s", delegation_id, exc_info=True)
 
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
@@ -13350,7 +13473,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()     # For normal input (commands + new queries)
         self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
-        # Mirrors the constructor above — see `_ack_pending_async_delegations`.
         self._pending_delegation_acks: "deque[str]" = deque()
         # See constructor note. Mirrored here for the run() path that skips
         # the earlier __init__ branch.
@@ -15229,17 +15351,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         spinner_thread = threading.Thread(target=spinner_loop, daemon=True)
         spinner_thread.start()
-
-        # Re-cover orphan async delegations from a prior process (Task 8).
-        # The journal reconciles any in-flight rows to 'unknown', then we
-        # restore every terminal unacknowledged row onto the same completion
-        # queue the process_loop already drains — so consumers don't need a
-        # second path.
+        
         try:
             from agent.operation_journal import OperationJournal
-            from tools.async_delegation import (
-                restore_unacknowledged_delegations,
-            )
+            from tools.async_delegation import restore_unacknowledged_delegations
             from tools.process_registry import process_registry as _pr_cli
 
             _session_db = getattr(self, "_session_db", None)
@@ -15251,17 +15366,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 _pr_cli.completion_queue, _pr_cli.completion_queue.put,
             )
             if _moved or _restored:
-                import logging as _logging_cli
-                _logging_cli.getLogger(__name__).info(
-                    "Async delegation durable journal: reconciled %d in-flight, "
-                    "restored %d unacknowledged terminal rows onto completion queue",
+                logger.info(
+                    "Async delegation durable journal: reconciled %d in-flight, restored %d unacknowledged terminal rows",
                     _moved, _restored,
                 )
-        except Exception as _e:  # noqa: BLE001 — startup must never crash the CLI
-            import logging as _logging_cli2
-            _logging_cli2.getLogger(__name__).debug(
-                "Async delegation durable journal startup skipped: %s", _e,
-            )
+        except Exception:
+            logger.debug("Async delegation durable journal startup skipped", exc_info=True)
 
         # Background thread to process inputs and run agent
         def process_loop():
@@ -15276,19 +15386,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             self._check_config_mcp_changes()
                             # Check for background process notifications (completions
                             # and watch pattern matches) while agent is idle.
-                            # The drain puts the synthetic prompt onto _pending_input
-                            # but STAGES the durable-row ack (Task 8 — durable
-                            # delegation completion). The actual acknowledgement
-                            # runs on the *consumer* path just before the agent
-                            # commits to processing the queued item, so a process
-                            # death between put() and consumption leaves the row
-                            # unacked and a restart replays the completion.
                             try:
                                 self._drain_idle_async_delegations()
                             except Exception:
                                 pass
                         continue
-
+                    
                     if not user_input:
                         continue
 
@@ -15299,7 +15402,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     )
                     self._ack_pending_async_delegations(_async_delegation_id)
 
-                    # The user has typed and submitted something. Any
+                    # The user has typed and submitted something, so any
                     # post-resize transient suppression should end here.
                     self._status_bar_suppressed_after_resize = False
 
@@ -15451,9 +15554,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         # Drain process notifications (completions + watch matches)
                         # that arrived while the agent was running.
                         try:
-                            from tools.process_registry import process_registry
-                            for _evt, _synth in process_registry.drain_notifications():
-                                self._pending_input.put(_synth)
+                            self._drain_idle_async_delegations()
                         except Exception:
                             pass  # Non-fatal — don't break the main loop
 
