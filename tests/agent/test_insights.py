@@ -1,5 +1,7 @@
 """Tests for agent/insights.py — InsightsEngine analytics and reporting."""
 
+import json
+import os
 import time
 import pytest
 
@@ -601,6 +603,142 @@ class TestGatewayFormatting:
 
         assert "Models" in text
         assert "sessions" in text
+
+
+# =========================================================================
+# Task 2 — optional learning sections on the existing Insights report.
+#
+# Default report shape (no learning=True) is preserved for every existing
+# caller (CLI /insights, dashboard, gateway format). When learning=True,
+# the report gains ``turn_outcomes``, ``reflection_triggers``, and
+# ``skill_utility`` sections read from SessionDB + the existing sidecar.
+# =========================================================================
+
+
+class TestLearningSections:
+    def test_generate_default_omits_learning_sections(self, populated_db):
+        """Backwards compat: callers that don't ask for learning get the same shape."""
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30, learning=False)
+
+        assert "turn_outcomes" not in report
+        assert "reflection_triggers" not in report
+        assert "skill_utility" not in report
+
+    def test_generate_with_learning_adds_turn_outcomes_section(self, populated_db):
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30, learning=True)
+        assert "turn_outcomes" in report
+        # The section is a list/trend dump — emptiness is fine when the
+        # underlying SessionDB has no turn_outcomes rows yet.
+        assert isinstance(report["turn_outcomes"], list)
+
+    def test_generate_with_learning_adds_reflection_triggers_section(self, populated_db):
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30, learning=True)
+        assert "reflection_triggers" in report
+
+    def test_generate_with_learning_adds_skill_utility_section(self, populated_db):
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30, learning=True)
+        assert "skill_utility" in report
+        assert isinstance(report["skill_utility"], list)
+
+    def test_generate_with_learning_includes_attributed_skills(self, populated_db, tmp_path):
+        """End-to-end: bump outcome signals, verify the learning section reflects them."""
+        import importlib
+        from tools import skill_usage as su
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "skills").mkdir()
+        os.environ["HERMES_HOME"] = str(home)
+        importlib.reload(su)
+
+        # 5 helped + 1 hurt — eligible: utility = (5+1)/(5+1+2) = 6/8.
+        for _ in range(5):
+            su.bump_outcome("plan", "verified", 0.10)
+        su.bump_outcome("plan", "failed", 0.20)
+
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30, learning=True)
+
+        by_skill = {r["skill"]: r for r in report["skill_utility"]}
+        assert "plan" in by_skill
+        plan = by_skill["plan"]
+        assert plan["eligible"] is True
+        assert plan["helped"] == 5
+        assert plan["hurt"] == 1
+        assert plan["utility"] == pytest.approx(6 / 8)
+
+    def test_generate_with_learning_turn_outcomes_reads_session_db_rows(self, db):
+        """turn_outcomes section reads from SessionDB, no extra table."""
+        from agent.turn_ledger import TurnOutcomeRecord
+        import time
+
+        db.create_session(session_id="sX", source="cli", model="m")
+        db.record_turn_outcome(TurnOutcomeRecord(
+            session_id="sX",
+            turn_id="t1",
+            created_at=time.time(),
+            outcome="verified",
+            outcome_reason="ok",
+            turn_exit_reason="text_response",
+            api_calls=1,
+            tool_iterations=0,
+            retry_count=0,
+            guardrail_halt=None,
+            cost_usd_delta=0.0,
+            input_tokens_delta=0,
+            output_tokens_delta=0,
+            cache_read_tokens_delta=0,
+            skills_loaded=("plan",),
+            model="m",
+        ))
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30, learning=True)
+        serialized = json.dumps(report["turn_outcomes"], default=str)
+        assert "verified" in serialized
+
+    def test_generate_with_learning_safe_when_sidecar_missing(self, db, tmp_path, monkeypatch):
+        """With no sidecar file, learning=True still succeeds."""
+        empty_home = tmp_path / "fresh_home"
+        empty_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(empty_home))
+        import tools.skill_usage as su
+        import importlib
+        importlib.reload(su)
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30, learning=True)
+        assert report["skill_utility"] == []
+
+    def test_generate_with_learning_unknown_fields_preserved_on_record(self, populated_db, tmp_path):
+        """Reading records must not drop unknown fields added to a sidecar by another process."""
+        import importlib
+        from tools import skill_usage as su
+
+        home = tmp_path / ".hermes2"
+        home.mkdir()
+        (home / "skills").mkdir()
+        os.environ["HERMES_HOME"] = str(home)
+        importlib.reload(su)
+        su.save_usage({
+            "plan": {
+                "use_count": 0,
+                "outcome_counts": {"verified": 6},
+                "helped": 6,
+                "hurt": 1,
+                "neutral": 0,
+                "outcome_cost_usd": 0.06,
+                "last_outcome_at": "2026-01-01T00:00:00+00:00",
+                "future_evidence_field": "kept",
+            }
+        })
+
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30, learning=True)
+        rows = {r["skill"]: r for r in report["skill_utility"]}
+        assert rows["plan"]["future_evidence_field"] == "kept"
 
 
 # =========================================================================

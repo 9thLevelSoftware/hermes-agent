@@ -16,6 +16,14 @@ def _bump_view_many(hermes_home: str, skill_name: str, iterations: int) -> None:
         bump_view(skill_name)
 
 
+def _bump_outcome_many(hermes_home: str, skill_name: str, iterations: int) -> None:
+    os.environ["HERMES_HOME"] = hermes_home
+    from tools.skill_usage import bump_outcome
+
+    for _ in range(iterations):
+        bump_outcome(skill_name, "verified", 0.001)
+
+
 @pytest.fixture
 def skills_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with a clean skills/ dir for each test.
@@ -813,3 +821,250 @@ def test_usage_report_covers_all_provenance(skills_home):
     for n in rows:
         assert rows[n]["use_count"] == 1
         assert rows[n]["_persisted"] is True
+
+
+# ---------------------------------------------------------------------------
+# Task 2 — outcome attribution sidecar + smoothed utility evidence.
+#
+# ``bump_outcome`` lives in tools.skill_usage.py and extends the sidecar with
+# per-skill outcome counters. ``get_skill_utility`` reads them back and
+# returns a shape the Insights + Curator layers can render. Both are
+# best-effort like the existing bumps.
+# ---------------------------------------------------------------------------
+
+_HELPED_OUTCOMES = {"verified", "completed_unverified"}
+_HURT_OUTCOMES = {"failed", "blocked", "unresolved"}
+
+
+def test_bump_outcome_helped_increments_helped_and_counts(skills_home):
+    from tools.skill_usage import bump_outcome, get_record
+
+    bump_outcome("plan", "verified", 0.01)
+    bump_outcome("plan", "verified", 0.02)
+    bump_outcome("plan", "completed_unverified", 0.005)
+
+    rec = get_record("plan")
+    assert rec["outcome_counts"]["verified"] == 2
+    assert rec["outcome_counts"]["completed_unverified"] == 1
+    assert rec["helped"] == 3
+    assert rec["hurt"] == 0
+    assert rec["neutral"] == 0
+    assert rec["outcome_cost_usd"] == pytest.approx(0.035)
+    assert rec["last_outcome_at"] is not None
+
+
+def test_bump_outcome_hurt_increments_hurt(skills_home):
+    from tools.skill_usage import bump_outcome, get_record
+
+    bump_outcome("plan", "failed", 0.10)
+    bump_outcome("plan", "blocked", 0.20)
+    bump_outcome("plan", "unresolved", 0.05)
+
+    rec = get_record("plan")
+    assert rec["outcome_counts"]["failed"] == 1
+    assert rec["outcome_counts"]["blocked"] == 1
+    assert rec["outcome_counts"]["unresolved"] == 1
+    assert rec["helped"] == 0
+    assert rec["hurt"] == 3
+    assert rec["outcome_cost_usd"] == pytest.approx(0.35)
+
+
+def test_bump_outcome_neutral_increments_neutral_not_helped_or_hurt(skills_home):
+    from tools.skill_usage import bump_outcome, get_record
+
+    bump_outcome("plan", "partial", 0.01)
+    bump_outcome("plan", "interrupted", 0.02)
+    bump_outcome("plan", "cancelled", 0.0)
+
+    rec = get_record("plan")
+    assert rec["neutral"] == 3
+    assert rec["helped"] == 0
+    assert rec["hurt"] == 0
+    assert rec["outcome_cost_usd"] == pytest.approx(0.03)
+    # Neutral outcomes still record specific counts under outcome_counts.
+    assert rec["outcome_counts"]["partial"] == 1
+
+
+def test_bump_outcome_mixed_keeps_helped_hurt_neutral_independent(skills_home):
+    from tools.skill_usage import bump_outcome, get_record
+
+    bump_outcome("plan", "verified", 0.10)
+    bump_outcome("plan", "failed", 0.10)
+    bump_outcome("plan", "verified", 0.10)
+    bump_outcome("plan", "partial", 0.10)
+
+    rec = get_record("plan")
+    assert rec["helped"] == 2
+    assert rec["hurt"] == 1
+    assert rec["neutral"] == 1
+    assert rec["outcome_cost_usd"] == pytest.approx(0.40)
+
+
+def test_bump_outcome_unknown_outcome_is_treated_as_neutral(skills_home):
+    """Outcomes not in either list count as neutral — record but don't bias utility."""
+    from tools.skill_usage import bump_outcome, get_record
+
+    bump_outcome("plan", "weird_outcome", 0.05)
+    rec = get_record("plan")
+    assert rec["outcome_counts"]["weird_outcome"] == 1
+    assert rec["neutral"] == 1
+    assert rec["helped"] == 0
+    assert rec["hurt"] == 0
+    assert rec["outcome_cost_usd"] == pytest.approx(0.05)
+
+
+def test_bump_outcome_lazy_seeds_old_records(skills_home):
+    """A sidecar record that pre-dates Task 2 (only legacy keys) gets the new
+    outcome keys backfilled on first bump, without dropping legacy fields."""
+    from tools.skill_usage import bump_outcome, get_record, save_usage
+
+    save_usage({"legacy": {"use_count": 5, "view_count": 2, "state": "active"}})
+    bump_outcome("legacy", "verified", 0.01)
+
+    rec = get_record("legacy")
+    # Legacy keys survive.
+    assert rec["use_count"] == 5
+    assert rec["view_count"] == 2
+    assert rec["state"] == "active"
+    # New fields seeded.
+    assert rec["helped"] == 1
+    assert rec["outcome_counts"]["verified"] == 1
+    assert rec["outcome_cost_usd"] == pytest.approx(0.01)
+    assert rec["last_outcome_at"] is not None
+
+
+def test_bump_outcome_preserves_unknown_fields(skills_home):
+    """Bumping must NOT clobber keys we did not write (e.g. future schema)."""
+    from tools.skill_usage import bump_outcome, save_usage, load_usage
+
+    save_usage({"plan": {"use_count": 3, "future_field": "kept"}})
+    bump_outcome("plan", "verified", 0.01)
+
+    raw = load_usage()["plan"]
+    assert raw["future_field"] == "kept"
+    assert raw["use_count"] == 3
+    assert raw["outcome_counts"]["verified"] == 1
+
+
+def test_bump_outcome_is_best_effort_and_does_not_raise(skills_home, monkeypatch):
+    """If the sidecar write fails (e.g. disk full), the call returns None silently."""
+    from tools import skill_usage as mod
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mod, "save_usage", _boom)
+    # Must not raise.
+    mod.bump_outcome("plan", "verified", 0.01)
+
+
+def test_bump_outcome_empty_name_is_noop(skills_home):
+    from tools.skill_usage import bump_outcome, load_usage
+
+    bump_outcome("", "verified", 0.0)
+    assert load_usage() == {}
+
+
+def test_bump_outcome_holds_lock_for_concurrent_processes(skills_home):
+    """Concurrent processes bumping the same skill must not lose increments.
+
+    Ponytail: global lock is fine here — outcome attribution is single-digit
+    per-second, not a throughput-bottleneck path.
+    """
+    process_count = 4
+    iterations = 50
+    ctx = mp.get_context("spawn")
+    processes = [
+        ctx.Process(
+            target=_bump_outcome_many,
+            args=(str(skills_home), "shared", iterations),
+        )
+        for _ in range(process_count)
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=20)
+
+    for process in processes:
+        assert process.exitcode == 0
+
+    from tools.skill_usage import get_record
+    rec = get_record("shared")
+    assert rec["outcome_counts"]["verified"] == process_count * iterations
+    assert rec["helped"] == process_count * iterations
+
+
+def test_get_skill_utility_ineligible_below_minimum_sample(skills_home):
+    """Below 5 attributed samples, eligible is False and utility is None — no ranking."""
+    from tools.skill_usage import bump_outcome, get_skill_utility
+
+    for _ in range(4):
+        bump_outcome("plan", "verified", 0.001)
+    result = get_skill_utility("plan")
+    assert result["count"] == 4
+    assert result["helped"] == 4
+    assert result["hurt"] == 0
+    assert result["eligible"] is False
+    assert result["utility"] is None
+
+
+def test_get_skill_utility_smoothed_laplace_formula(skills_home):
+    """utility = (helped + 1) / (helped + hurt + 2) with 5+ samples makes it eligible."""
+    from tools.skill_usage import bump_outcome, get_skill_utility
+
+    for _ in range(7):
+        bump_outcome("plan", "verified", 0.001)
+    for _ in range(3):
+        bump_outcome("plan", "failed", 0.001)
+    result = get_skill_utility("plan")
+    assert result["count"] == 10
+    assert result["helped"] == 7
+    assert result["hurt"] == 3
+    assert result["eligible"] is True
+    # (7 + 1) / (7 + 3 + 2) = 8/12 = 2/3
+    assert result["utility"] == pytest.approx(8 / 12)
+
+
+def test_get_skill_utility_zero_neutral_only_outcomes_eligible(skills_home):
+    """A skill with 5 helped and 0 hurt has utility = (5+1)/(5+0+2) = 6/7."""
+    from tools.skill_usage import bump_outcome, get_skill_utility
+
+    for _ in range(5):
+        bump_outcome("plan", "verified", 0.001)
+    result = get_skill_utility("plan")
+    assert result["eligible"] is True
+    assert result["utility"] == pytest.approx(6 / 7)
+
+
+def test_get_skill_utility_returns_default_when_unseen(skills_home):
+    """Never-seen skill: count 0, utility None, eligible False — never errors."""
+    from tools.skill_usage import get_skill_utility
+
+    result = get_skill_utility("never-seen")
+    assert result["count"] == 0
+    assert result["helped"] == 0
+    assert result["hurt"] == 0
+    assert result["neutral"] == 0
+    assert result["cost_usd"] == 0.0
+    assert result["eligible"] is False
+    assert result["utility"] is None
+
+
+def test_get_skill_utility_does_not_archive_or_delete(skills_home):
+    """Utility must be observability; a low score must never drive archival."""
+    from tools import skill_usage as mod
+    from tools.skill_usage import bump_outcome, get_skill_utility
+
+    # All failed: lowest possible utility, far past the eligibility threshold.
+    for _ in range(10):
+        bump_outcome("low-score", "failed", 0.1)
+    result = get_skill_utility("low-score")
+    assert result["eligible"] is True
+    assert result["utility"] == pytest.approx(1 / 12)
+
+    rec = mod.get_record("low-score")
+    # No archive state was applied as a side effect of poor utility.
+    assert rec["state"] == "active"
+    assert rec.get("archived_at") is None

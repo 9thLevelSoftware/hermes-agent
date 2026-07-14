@@ -494,7 +494,27 @@ def _empty_record() -> Dict[str, Any]:
         "state": STATE_ACTIVE,
         "pinned": False,
         "archived_at": None,
+        # Task 2 — outcome attribution sidecar fields. Older readers ignore
+        # unknown keys; new readers must preserve anything we did not write
+        # (so future tasks can extend without rewriting this one).
+        "outcome_counts": {},
+        "helped": 0,
+        "hurt": 0,
+        "neutral": 0,
+        "outcome_cost_usd": 0.0,
+        "last_outcome_at": None,
     }
+
+
+# Outcome attribution buckets — verified outcomes are evidence a skill helped,
+# failed/blocked/unresolved are evidence a skill hurt; everything else is
+# neutral. Ponytail: keep this list tight, mirror canonical outcome vocabulary.
+_HELPED_OUTCOMES = frozenset({"verified", "completed_unverified"})
+_HURT_OUTCOMES = frozenset({"failed", "blocked", "unresolved"})
+# Minimum attributed samples (helped + hurt) before a skill is eligible
+# for utility ranking. Below the floor we have too little signal — parity is
+# a coin flip and ranking on it is noise.
+MIN_UTILITY_SAMPLES = 5
 
 
 def load_usage() -> Dict[str, Dict[str, Any]]:
@@ -640,6 +660,57 @@ def bump_patch(skill_name: str) -> None:
     def _apply(rec: Dict[str, Any]) -> None:
         rec["patch_count"] = int(rec.get("patch_count") or 0) + 1
         rec["last_patched_at"] = _now_iso()
+    _mutate(skill_name, _apply)
+
+
+def bump_outcome(skill_name: str, outcome: str, cost_delta: float) -> None:
+    """Bump outcome attribution counters and cost for *skill_name*.
+
+    Verified-style outcomes increment ``helped``; failed/blocked/unresolved
+    increment ``hurt``; anything else is neutral. ``outcome_counts`` always
+    tracks the per-outcome breakdown (used for diagnostics), and the running
+    ``outcome_cost_usd`` accumulates ``cost_delta`` regardless of bucket so
+    curriculum / cost-aware curators can read total spend downstream.
+
+    Best-effort, like ``bump_view`` / ``bump_use``. Empty skill_name is a no-op.
+    Unknown fields on existing records are preserved across the bump (the
+    mutator only touches the fields this module owns).
+    """
+    if not skill_name:
+        return
+    try:
+        cost = float(cost_delta or 0.0)
+    except (TypeError, ValueError):
+        cost = 0.0
+
+    def _apply(rec: Dict[str, Any]) -> None:
+        # Seed missing keys without clobbering any future schema additions.
+        rec.setdefault("outcome_counts", {})
+        rec.setdefault("helped", 0)
+        rec.setdefault("hurt", 0)
+        rec.setdefault("neutral", 0)
+        rec.setdefault("outcome_cost_usd", 0.0)
+        rec.setdefault("last_outcome_at", None)
+
+        outcome_counts = rec["outcome_counts"]
+        if not isinstance(outcome_counts, dict):
+            outcome_counts = {}
+            rec["outcome_counts"] = outcome_counts
+        outcome_counts[outcome] = int(outcome_counts.get(outcome, 0) or 0) + 1
+
+        if outcome in _HELPED_OUTCOMES:
+            rec["helped"] = int(rec.get("helped") or 0) + 1
+        elif outcome in _HURT_OUTCOMES:
+            rec["hurt"] = int(rec.get("hurt") or 0) + 1
+        else:
+            rec["neutral"] = int(rec.get("neutral") or 0) + 1
+
+        try:
+            rec["outcome_cost_usd"] = float(rec.get("outcome_cost_usd") or 0.0) + cost
+        except (TypeError, ValueError):
+            rec["outcome_cost_usd"] = cost
+        rec["last_outcome_at"] = _now_iso()
+
     _mutate(skill_name, _apply)
 
 
@@ -945,3 +1016,54 @@ def usage_report() -> List[Dict[str, Any]]:
         row["activity_count"] = activity_count(row)
         rows.append(row)
     return sorted(rows, key=lambda r: r["name"])
+
+
+# ---------------------------------------------------------------------------
+# Outcome utility — observability for the learning pipeline.
+# ---------------------------------------------------------------------------
+
+def get_skill_utility(skill_name: str) -> Dict[str, Any]:
+    """Return outcome-attribution evidence for *skill_name*.
+
+    Shape::
+
+        {
+          "skill": str,
+          "count": int,         # helped + hurt
+          "helped": int,
+          "hurt": int,
+          "neutral": int,
+          "cost_usd": float,
+          "eligible": bool,     # count >= MIN_UTILITY_SAMPLES
+          "utility": float | None,  # (helped+1) / (helped+hurt+2), or None
+        }
+
+    A skill below ``MIN_UTILITY_SAMPLES`` attributed samples is ``eligible=
+    False`` and ``utility=None``; ranking on insufficient data is noise. This
+    is pure observability — a low utility must NOT drive archival or
+    ``forget()``; the curator has its own state-transition rules and we
+    don't introduce a new one from this module.
+    """
+    rec = get_record(skill_name)
+    helped = int(rec.get("helped") or 0)
+    hurt = int(rec.get("hurt") or 0)
+    neutral = int(rec.get("neutral") or 0)
+    count = helped + hurt
+    try:
+        cost = float(rec.get("outcome_cost_usd") or 0.0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    eligible = count >= MIN_UTILITY_SAMPLES
+    utility: Optional[float] = None
+    if eligible:
+        utility = (helped + 1.0) / (helped + hurt + 2.0)
+    return {
+        "skill": skill_name,
+        "count": count,
+        "helped": helped,
+        "hurt": hurt,
+        "neutral": neutral,
+        "cost_usd": cost,
+        "eligible": eligible,
+        "utility": utility,
+    }

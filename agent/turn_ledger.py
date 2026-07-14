@@ -19,6 +19,7 @@ finalizer's lazy-logger pattern (no import cycle with conversation_loop).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
@@ -110,6 +111,55 @@ def skills_loaded_from(agent: Any) -> tuple[str, ...]:
     return tuple(seen)
 
 
+def extract_loaded_skills(messages: Any) -> tuple[str, ...]:
+    """Extract unique skill names from ``skill_view`` tool calls in messages.
+
+    Reads the assistant message ``tool_calls`` entries whose ``function.name``
+    is ``skill_view`` and returns the ``name`` argument value. Tolerates the
+    repository's two message shapes — ``function.arguments`` may be a dict
+    (after parsing) or a JSON-encoded string — and never raises on malformed
+    messages, missing fields, bad JSON, or unknown tool names.
+
+    Ordering is first-seen across the turn; duplicates collapse. Empty/whitespace
+    names are dropped. Returning ``()`` for turns with no skill views lets
+    callers treat missing-skills as a non-event without a None check.
+    """
+    seen: list[str] = []
+    if not messages:
+        return tuple(seen)
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        calls = msg.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            func = call.get("function")
+            if not isinstance(func, dict):
+                continue
+            if func.get("name") != "skill_view":
+                continue
+            args = func.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (TypeError, ValueError):
+                    continue
+            if not isinstance(args, dict):
+                continue
+            name = args.get("name")
+            if not isinstance(name, str):
+                continue
+            text = name.strip()
+            if text and text not in seen:
+                seen.append(text)
+    return tuple(seen)
+
+
 def build_turn_outcome_record(
     agent: Any,
     *,
@@ -120,6 +170,7 @@ def build_turn_outcome_record(
     tool_iterations: int,
     turn_context: Optional[Any] = None,
     created_at: Optional[float] = None,
+    messages: Optional[Any] = None,
 ) -> TurnOutcomeRecord:
     """Build a ``TurnOutcomeRecord`` from an agent + turn-context snapshot.
 
@@ -130,6 +181,11 @@ def build_turn_outcome_record(
     agent instead of threading ``turn_context`` everywhere. Missing
     counters yield zero deltas rather than ``None`` arithmetic, so the
     writer can always serialise the row.
+
+    ``messages`` is an optional pass-through used by the finalizer paths
+    to extract exact skill names from ``skill_view`` tool calls when
+    ``agent._skills_loaded`` is empty. Falls back to the legacy seam
+    (skills from the agent) when no messages are provided.
     """
     import time as _time
 
@@ -152,6 +208,15 @@ def build_turn_outcome_record(
             return float(end) - float(start)
         except (TypeError, ValueError):
             return 0.0
+
+    skills_loaded = skills_loaded_from(agent)
+    if not skills_loaded and messages is not None:
+        # Finalizers that have a messages list can attribute exact skill
+        # views; the legacy _skills_loaded set is the fallback.
+        try:
+            skills_loaded = extract_loaded_skills(messages)
+        except Exception:
+            skills_loaded = ()
 
     return TurnOutcomeRecord(
         session_id=str(getattr(agent, "session_id", "") or ""),
@@ -179,7 +244,7 @@ def build_turn_outcome_record(
         input_tokens_delta=_delta("session_input_tokens"),
         output_tokens_delta=_delta("session_output_tokens"),
         cache_read_tokens_delta=_delta("session_cache_read_tokens"),
-        skills_loaded=skills_loaded_from(agent),
+        skills_loaded=skills_loaded,
         model=getattr(agent, "model", None),
     )
 
@@ -206,4 +271,5 @@ __all__ = [
     "build_turn_outcome_record",
     "record_turn_outcome_safely",
     "skills_loaded_from",
+    "extract_loaded_skills",
 ]

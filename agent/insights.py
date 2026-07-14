@@ -100,13 +100,25 @@ class InsightsEngine:
         self.db = db
         self._conn = db._conn
 
-    def generate(self, days: int = 30, source: str = None) -> Dict[str, Any]:
+    def generate(
+        self,
+        days: int = 30,
+        source: str = None,
+        learning: bool = False,
+    ) -> Dict[str, Any]:
         """
         Generate a complete insights report.
 
         Args:
             days: Number of days to look back (default: 30)
             source: Optional filter by source platform
+            learning: When True, the report gains ``turn_outcomes``,
+                ``reflection_triggers``, and ``skill_utility`` sections
+                sourced from SessionDB and the existing skill-usage
+                sidecar. Default False preserves the original report
+                shape for every existing caller (CLI /insights,
+                dashboard, gateway format) — adding this flag is the
+                Task 2 extension seam.
 
         Returns:
             Dict with all computed insights
@@ -120,7 +132,7 @@ class InsightsEngine:
         message_stats = self._get_message_stats(cutoff, source)
 
         if not sessions:
-            return {
+            report: Dict[str, Any] = {
                 "days": days,
                 "source_filter": source,
                 "empty": True,
@@ -140,6 +152,9 @@ class InsightsEngine:
                 "activity": {},
                 "top_sessions": [],
             }
+            if learning:
+                self._inject_learning_sections(report, cutoff, source)
+            return report
 
         # Compute insights
         models = self._compute_model_breakdown(sessions, cutoff, source)
@@ -150,7 +165,7 @@ class InsightsEngine:
         activity = self._compute_activity_patterns(sessions)
         top_sessions = self._compute_top_sessions(sessions)
 
-        return {
+        report = {
             "days": days,
             "source_filter": source,
             "empty": False,
@@ -163,6 +178,86 @@ class InsightsEngine:
             "activity": activity,
             "top_sessions": top_sessions,
         }
+        if learning:
+            self._inject_learning_sections(report, cutoff, source)
+        return report
+
+    # =========================================================================
+    # Learning sections (Task 2) — opt-in via learning=True on generate().
+    # Both branches share this helper so the empty / populated report paths
+    # stay aligned. Each call is best-effort: a failure (DB locked, sidecar
+    # unreadable) yields an empty list, never a propagated exception that
+    # would corrupt the rest of the report.
+    # =========================================================================
+
+    def _inject_learning_sections(
+        self,
+        report: Dict[str, Any],
+        cutoff: float,
+        source: Optional[str],
+    ) -> None:
+        report["turn_outcomes"] = self._get_turn_outcomes(cutoff, source)
+        report["reflection_triggers"] = self._get_reflection_triggers(cutoff, source)
+        report["skill_utility"] = self._get_skill_utility()
+
+    def _get_turn_outcomes(
+        self,
+        cutoff: float,
+        source: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Per-outcome trend rows using the existing SessionDB query."""
+        try:
+            if hasattr(self.db, "get_outcome_trends"):
+                rows = self.db.get_outcome_trends(days=int((time.time() - cutoff) // 86400) or 30)
+                return list(rows or [])
+        except Exception:
+            pass
+        return []
+
+    def _get_reflection_triggers(self, cutoff: float, source: Optional[str]) -> List[Dict[str, Any]]:
+        """Reflection-trigger counters by kind. Stays hook-shaped for Task 3."""
+        try:
+            cursor = self._conn.execute(
+                """
+                SELECT
+                    CASE
+                        WHEN outcome IN ('failed', 'blocked', 'unresolved') THEN 'failure'
+                        ELSE outcome
+                    END AS kind,
+                    COUNT(*) AS count
+                FROM turn_outcomes
+                WHERE created_at >= ?
+                GROUP BY kind
+                ORDER BY count DESC
+                """,
+                (cutoff,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+        except Exception:
+            return []
+
+    def _get_skill_utility(self) -> List[Dict[str, Any]]:
+        """Per-skill utility rows from the sidecar. Returns [] on any failure."""
+        try:
+            from tools import skill_usage as _skill_usage
+
+            data = _skill_usage.load_usage()
+        except Exception:
+            return []
+        rows: List[Dict[str, Any]] = []
+        for name, raw in data.items():
+            if not isinstance(raw, dict):
+                continue
+            try:
+                util = _skill_usage.get_skill_utility(str(name))
+            except Exception:
+                continue
+            # Preserve unknown sidecar fields so a future schema addition
+            # survives the round trip.
+            row = {**raw, **util}
+            rows.append(row)
+        rows.sort(key=lambda r: (r.get("utility") is None, -(r.get("utility") or 0.0), r.get("skill", "")))
+        return rows
 
     # =========================================================================
     # Data gathering (SQL queries)

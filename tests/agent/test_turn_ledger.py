@@ -948,3 +948,186 @@ def test_finalizer_paths_call_safe_writer_with_canonical_vocabulary(monkeypatch)
             "api_calls", "tool_iterations", "skills_loaded", "model",
         ):
             assert hasattr(record, field), f"Record missing field: {field}"
+
+
+# ---------------------------------------------------------------------------
+# Task 2 — attribution: extract exact skill names from stored messages.
+#
+# The repository stores messages with assistant tool_calls whose
+# ``function.arguments`` may be a dict (after parsing) or a JSON string.
+# ``extract_loaded_skills`` is the seam used by the finalizer to populate
+# ``TurnOutcomeRecord.skills_loaded``; it must scan all assistant messages,
+# pick out ``skill_view`` calls, read the ``name`` argument defensively,
+# dedupe, and preserve order — never crash on a malformed entry.
+# ---------------------------------------------------------------------------
+
+
+def test_attribution_extract_loaded_skills_returns_unique_in_call_order():
+    """Repeated skill views collapse; first-seen order is preserved (deterministic)."""
+    from agent.turn_ledger import extract_loaded_skills
+
+    messages = [
+        {"role": "assistant", "tool_calls": [
+            {"function": {"name": "skill_view", "arguments": {"name": "plan"}}},
+            {"function": {"name": "skill_view", "arguments": {"name": "web"}}},
+            {"function": {"name": "terminal", "arguments": {"command": "ls"}}},
+        ]},
+        {"role": "assistant", "tool_calls": [
+            {"function": {"name": "skill_view", "arguments": {"name": "plan"}}},  # dup
+            {"function": {"name": "skill_view", "arguments": {"name": "github"}}},
+        ]},
+    ]
+    assert extract_loaded_skills(messages) == ("plan", "web", "github")
+
+
+def test_attribution_extract_loaded_skills_accepts_arguments_as_json_string():
+    """tool_calls sometimes ship arguments as a JSON string — parse them."""
+    from agent.turn_ledger import extract_loaded_skills
+
+    messages = [
+        {"role": "assistant", "tool_calls": [
+            {"function": {"name": "skill_view", "arguments": '{"name": "plan"}'}},
+            {"function": {"name": "skill_view", "arguments": '{"name":"web"}'}},
+        ]},
+    ]
+    assert extract_loaded_skills(messages) == ("plan", "web")
+
+
+def test_attribution_extract_loaded_skills_tolerates_malformed_entries():
+    """Bad messages, missing fields, non-skill calls, bad JSON — never crash."""
+    from agent.turn_ledger import extract_loaded_skills
+
+    messages = [
+        {"role": "user", "content": "hi"},                                      # ignored
+        {"role": "assistant"},                                                    # no tool_calls
+        {"role": "assistant", "tool_calls": "not-a-list"},                        # malformed
+        {"role": "assistant", "tool_calls": [
+            "garbage",                                                            # not a dict
+            {"no_function": True},                                                # missing function
+            {"function": None},                                                    # None function
+            {"function": {"name": "skill_view", "arguments": None}},               # no args
+            {"function": {"name": "skill_view", "arguments": "{not json"}},        # bad json
+            {"function": {"name": "skill_view", "arguments": "[]"}},              # not a dict
+            {"function": {"name": "skill_view", "arguments": {"name": ""}}},      # empty name
+            {"function": {"name": "skill_view", "arguments": {"name": "  "}}},     # whitespace
+            {"function": {"name": "skill_view", "arguments": {"name": "real"}}},
+            {"function": {"name": "terminal", "arguments": {}}},                   # wrong tool
+        ]},
+    ]
+    assert extract_loaded_skills(messages) == ("real",)
+
+
+def test_attribution_extract_loaded_skills_strips_whitespace_and_skips_empty():
+    """Names with leading/trailing whitespace are trimmed; empties are dropped."""
+    from agent.turn_ledger import extract_loaded_skills
+
+    messages = [
+        {"role": "assistant", "tool_calls": [
+            {"function": {"name": "skill_view", "arguments": {"name": "  plan  "}}},
+            {"function": {"name": "skill_view", "arguments": {"name": "plan"}}},  # dup after strip
+        ]},
+    ]
+    assert extract_loaded_skills(messages) == ("plan",)
+
+
+def test_attribution_extract_loaded_skills_empty_for_no_skill_view_calls():
+    """Turns without any skill_view calls yield an empty tuple, not None."""
+    from agent.turn_ledger import extract_loaded_skills
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "tool_calls": [
+            {"function": {"name": "terminal", "arguments": {"command": "ls"}}},
+        ]},
+    ]
+    result = extract_loaded_skills(messages)
+    assert isinstance(result, tuple)
+    assert result == ()
+
+
+def test_attribution_uses_extract_when_agent_skills_empty():
+    """If agent._skills_loaded is empty, the builder falls back to extract_loaded_skills.
+
+    The finalizer is allowed to pass a populated messages list instead of relying
+    on the agent's _skills_loaded set. Without the fallback, attribution is
+    limited to whatever hooks ran first — a regression we don't want.
+    """
+    from agent.turn_ledger import build_turn_outcome_record
+
+    agent = SimpleNamespace(
+        session_id="s1",
+        _current_turn_id="t1",
+        session_input_tokens=0,
+        session_output_tokens=0,
+        session_cache_read_tokens=0,
+        session_estimated_cost_usd=0.0,
+        model="m",
+        _tool_guardrail_halt_decision=None,
+        _invalid_tool_retries=0,
+        _invalid_json_retries=0,
+        _empty_content_retries=0,
+        _incomplete_scratchpad_retries=0,
+        _codex_incomplete_retries=0,
+        _thinking_prefill_retries=0,
+        _skills_loaded=(),
+    )
+    turn_context = SimpleNamespace(token_cost_snapshot={}, turn_id="t1")
+    messages = [
+        {"role": "assistant", "tool_calls": [
+            {"function": {"name": "skill_view", "arguments": {"name": "plan"}}},
+            {"function": {"name": "skill_view", "arguments": {"name": "web"}}},
+        ]},
+    ]
+
+    record = build_turn_outcome_record(
+        agent,
+        outcome="verified",
+        outcome_reason="ok",
+        turn_exit_reason="text_response",
+        api_calls=1,
+        tool_iterations=1,
+        turn_context=turn_context,
+        messages=messages,
+    )
+    assert record.skills_loaded == ("plan", "web")
+
+
+def test_build_turn_outcome_record_preserves_existing_seam(monkeypatch):
+    """If no messages are passed and _skills_loaded is set, the old path still works.
+
+    The seam is additive: callers that don't populate messages get the same
+    behavior as Task 1 (skills from agent._skills_loaded). Adding messages
+    must not replace an explicit agent._skills_loaded entry.
+    """
+    from agent.turn_ledger import build_turn_outcome_record
+
+    agent = SimpleNamespace(
+        session_id="s1",
+        _current_turn_id="t1",
+        session_input_tokens=0,
+        session_output_tokens=0,
+        session_cache_read_tokens=0,
+        session_estimated_cost_usd=0.0,
+        model="m",
+        _tool_guardrail_halt_decision=None,
+        _invalid_tool_retries=0,
+        _invalid_json_retries=0,
+        _empty_content_retries=0,
+        _incomplete_scratchpad_retries=0,
+        _codex_incomplete_retries=0,
+        _thinking_prefill_retries=0,
+        _skills_loaded=("from-agent",),
+    )
+    turn_context = SimpleNamespace(token_cost_snapshot={}, turn_id="t1")
+
+    record = build_turn_outcome_record(
+        agent,
+        outcome="verified",
+        outcome_reason="ok",
+        turn_exit_reason="text_response",
+        api_calls=0,
+        tool_iterations=0,
+        turn_context=turn_context,
+    )
+    # No messages kwarg → falls back to existing skills_loaded_from path.
+    assert record.skills_loaded == ("from-agent",)
