@@ -158,6 +158,27 @@ def finalize_turn(
     )
     completed = _turn_outcome["outcome"] in {"verified", "completed_unverified"}
 
+    # Persist the per-turn outcome to the learning ledger. Funneled through
+    # the safe writer so a DB outage cannot escape finalization; the
+    # user-visible response is already computed at this point.
+    try:
+        from agent.turn_ledger import (
+            build_turn_outcome_record,
+            record_turn_outcome_safely,
+        )
+        _turn_outcome_record = build_turn_outcome_record(
+            agent,
+            outcome=_turn_outcome["outcome"],
+            outcome_reason=_turn_outcome["reason"],
+            turn_exit_reason=_turn_exit_reason,
+            api_calls=api_call_count,
+            tool_iterations=getattr(agent, "_iters_since_skill", 0) or 0,
+        )
+        record_turn_outcome_safely(getattr(agent, "_session_db", None),
+                                   _turn_outcome_record)
+    except Exception as _ledger_err:
+        logger.debug("turn_outcome ledger write skipped: %s", _ledger_err)
+
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
     # surfaces — file I/O / JSON serialization (_save_trajectory), remote

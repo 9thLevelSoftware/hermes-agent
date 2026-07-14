@@ -1,0 +1,209 @@
+"""Per-turn outcome ledger — dataclass + safe writer.
+
+The data contract lives here (NOT in ``hermes_state``) so the persistence
+layer stays a thin SQL projection and callers don't accidentally
+instantiate half-built records. The dataclass is frozen + hashable; the
+safe writer is the only seam finalizers reach through — it must never
+propagate database errors into the post-loop cleanup path.
+
+Layering::
+
+    turn_finalizer / codex_runtime  ->  record_turn_outcome_safely(...)
+    record_turn_outcome_safely       ->  agent._session_db.record_turn_outcome(...)
+    SessionDB                        ->  turn_outcomes SQL table
+
+This module owns no schema and no logging configuration — it imports the
+shared ``agent.conversation_loop.logger`` lazily, mirroring the
+finalizer's lazy-logger pattern (no import cycle with conversation_loop).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Iterable, Optional
+
+
+@dataclass(frozen=True)
+class TurnOutcomeRecord:
+    """One row of the per-turn outcome ledger.
+
+    Fields mirror the schema in ``hermes_state.SCHEMA_SQL``'s
+    ``turn_outcomes`` table. ``skills_loaded`` is a tuple (not a list) so
+    the dataclass stays hashable; the writer serialises it to JSON.
+    """
+
+    session_id: str
+    turn_id: str
+    created_at: float
+    outcome: str
+    outcome_reason: Optional[str]
+    turn_exit_reason: Optional[str]
+    api_calls: int
+    tool_iterations: int
+    retry_count: int
+    guardrail_halt: Optional[str]
+    cost_usd_delta: float
+    input_tokens_delta: int
+    output_tokens_delta: int
+    cache_read_tokens_delta: int
+    skills_loaded: tuple[str, ...]
+    model: Optional[str]
+
+
+def record_turn_outcome_safely(
+    session_db: Any,
+    record: TurnOutcomeRecord,
+) -> None:
+    """Persist a turn outcome, swallowing DB errors.
+
+    Finalizers call this after ``classify_turn_outcome()``. A database
+    outage must NEVER escape the post-loop path — the agent has already
+    decided the outcome, the cleanup is best-effort, and the user-visible
+    response is already computed. We log a warning with session/turn
+    identifiers so the failure is observable without raising.
+    """
+    if session_db is None:
+        return None
+    try:
+        session_db.record_turn_outcome(record)
+    except Exception as exc:  # noqa: BLE001 - intentional blanket catch
+        # Lazy import mirrors agent/turn_finalizer.py — no module-level
+        # import of conversation_loop, which would create a cycle.
+        try:
+            from agent.conversation_loop import logger
+        except Exception:  # pragma: no cover - fallback when logger unavailable
+            import logging
+            logger = logging.getLogger(__name__)
+        try:
+            logger.warning(
+                "record_turn_outcome_safely failed for session=%s turn=%s: %s",
+                getattr(record, "session_id", "<unknown>"),
+                getattr(record, "turn_id", "<unknown>"),
+                exc,
+            )
+        except Exception:
+            pass
+        return None
+    return None
+
+
+def skills_loaded_from(agent: Any) -> tuple[str, ...]:
+    """Best-effort extraction of the loaded-skill names from an agent.
+
+    The agent tracks loaded skills on ``_skills_loaded`` (a list of
+    name strings) or — depending on version — on the skill_manager.
+    Anything missing → empty tuple. Missing here is fine: callers treat
+    an empty tuple as "no skills recorded this turn".
+    """
+    candidates: Iterable[Any] = (
+        getattr(agent, "_skills_loaded", None),
+        getattr(getattr(agent, "_skill_manager", None), "loaded", None),
+    )
+    seen: list[str] = []
+    for source in candidates:
+        if not source:
+            continue
+        for name in source:
+            text = str(name or "").strip()
+            if text and text not in seen:
+                seen.append(text)
+    return tuple(seen)
+
+
+def build_turn_outcome_record(
+    agent: Any,
+    *,
+    outcome: str,
+    outcome_reason: Optional[str],
+    turn_exit_reason: Optional[str],
+    api_calls: int,
+    tool_iterations: int,
+    turn_context: Optional[Any] = None,
+    created_at: Optional[float] = None,
+) -> TurnOutcomeRecord:
+    """Build a ``TurnOutcomeRecord`` from an agent + turn-context snapshot.
+
+    The ``turn_context`` snapshot is the per-turn token/cost baseline
+    captured at prologue (turn_context.py); the agent's
+    ``_turn_token_cost_snapshot`` (or any equivalent) is used as a
+    fallback so codex-runtime and tests can pass a snapshot through the
+    agent instead of threading ``turn_context`` everywhere. Missing
+    counters yield zero deltas rather than ``None`` arithmetic, so the
+    writer can always serialise the row.
+    """
+    import time as _time
+
+    snapshot = getattr(turn_context, "token_cost_snapshot", None) or {}
+    if not snapshot:
+        snapshot = getattr(agent, "_turn_token_cost_snapshot", None) or {}
+
+    def _delta(field: str) -> int:
+        start = snapshot.get(field, 0) or 0
+        end = getattr(agent, field, 0) or 0
+        try:
+            return int(end) - int(start)
+        except (TypeError, ValueError):
+            return 0
+
+    def _cost_delta() -> float:
+        start = snapshot.get("session_estimated_cost_usd", 0.0) or 0.0
+        end = getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0
+        try:
+            return float(end) - float(start)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return TurnOutcomeRecord(
+        session_id=str(getattr(agent, "session_id", "") or ""),
+        turn_id=str(
+            getattr(turn_context, "turn_id", None)
+            or getattr(agent, "_current_turn_id", "")
+            or ""
+        ),
+        created_at=float(created_at if created_at is not None else _time.time()),
+        outcome=str(outcome),
+        outcome_reason=outcome_reason,
+        turn_exit_reason=turn_exit_reason,
+        api_calls=int(api_calls),
+        tool_iterations=int(tool_iterations),
+        retry_count=int(
+            getattr(agent, "_invalid_tool_retries", 0)
+            + getattr(agent, "_invalid_json_retries", 0)
+            + getattr(agent, "_empty_content_retries", 0)
+            + getattr(agent, "_incomplete_scratchpad_retries", 0)
+            + getattr(agent, "_codex_incomplete_retries", 0)
+            + getattr(agent, "_thinking_prefill_retries", 0)
+        ),
+        guardrail_halt=_guardrail_halt_json(agent),
+        cost_usd_delta=_cost_delta(),
+        input_tokens_delta=_delta("session_input_tokens"),
+        output_tokens_delta=_delta("session_output_tokens"),
+        cache_read_tokens_delta=_delta("session_cache_read_tokens"),
+        skills_loaded=skills_loaded_from(agent),
+        model=getattr(agent, "model", None),
+    )
+
+
+def _guardrail_halt_json(agent: Any) -> Optional[str]:
+    """Render the guardrail halt decision as JSON text for the ledger row."""
+    import json as _json
+
+    decision = getattr(agent, "_tool_guardrail_halt_decision", None)
+    if decision is None:
+        return None
+    try:
+        metadata = decision.to_metadata()
+    except Exception:
+        metadata = {"reason": str(decision)}
+    try:
+        return _json.dumps(metadata)
+    except (TypeError, ValueError):
+        return None
+
+
+__all__ = [
+    "TurnOutcomeRecord",
+    "build_turn_outcome_record",
+    "record_turn_outcome_safely",
+    "skills_loaded_from",
+]

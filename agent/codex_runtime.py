@@ -527,6 +527,28 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("external memory sync raised", exc_info=True)
 
+    # Persist the per-turn outcome to the learning ledger. Mirrors the
+    # chat-completions path in ``finalize_turn``; safe-writer is best-effort.
+    try:
+        from agent.turn_ledger import (
+            build_turn_outcome_record,
+            record_turn_outcome_safely,
+        )
+        _turn_outcome_record = build_turn_outcome_record(
+            agent,
+            outcome=turn_outcome["outcome"],
+            outcome_reason=turn_outcome["reason"],
+            turn_exit_reason=turn.turn_id or "",
+            api_calls=api_calls,
+            tool_iterations=turn.tool_iterations,
+        )
+        record_turn_outcome_safely(
+            getattr(agent, "_session_db", None),
+            _turn_outcome_record,
+        )
+    except Exception as _ledger_err:
+        logger.debug("turn_outcome ledger write skipped: %s", _ledger_err)
+
     # Background review fork — same cadence + signature as the default
     # path (line ~15449). Only fires when a trigger actually tripped AND
     # we have a verified final response.
