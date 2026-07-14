@@ -3,6 +3,13 @@ import { formatApiError as importedFormatApiError, createApi as buildApi } from 
 import { semanticWorkflowDiff, isDraftDirty, buildApiHelpers } from "./build.js";
 import { feedActions, shouldPollFeed, fieldErrors } from "./run.js";
 import {
+  renderBottomPanel as renderBottomPanelModule,
+  renderRunStartPanel as renderRunStartPanelModule,
+  renderHistoryMode as renderHistoryModeModule,
+  renderInputFeedPanel as renderInputFeedPanelModule,
+  renderDiagnosticsPanel as renderDiagnosticsPanelModule,
+} from "./panels.js";
+import {
   serializeFilters as historySerializeFilters,
   historyListPath,
   detailUrl as historyDetailUrl,
@@ -12,9 +19,12 @@ import {
 } from "./history.js";
 import {
   WORKSPACE_MODES,
+  libraryGroups,
   locationForMode,
   modeForLocation,
+  snapFlowPosition,
 } from "./workspace.js";
+import { renderTopBar as renderExtractedTopBar } from "./topbar.js";
 import {
   SCALAR_INPUT_KINDS,
   workflowIdFromText,
@@ -23,7 +33,16 @@ import {
   triggerIntakeFromForm,
   readyPathFromTrigger,
   changeNodeType,
+  defaultTriggerForType,
 } from "./editor-model.js";
+import { makeWorkflowNode } from "./canvas-nodes.js";
+import {
+  NODE_CATEGORIES,
+  NodePaletteOverlay,
+  renderWorkflowOnboarding,
+  WorkflowRail,
+} from "./palette.js";
+import { renderInspector } from "./inspector.js";
 
 (function () {
   "use strict";
@@ -38,18 +57,15 @@ import {
   const FlowSDK = SDK.ReactFlow || SDK.reactFlow || {};
   const ReactFlow = FlowSDK.ReactFlow;
   const ReactFlowProvider = FlowSDK.ReactFlowProvider;
-  const Background = FlowSDK.Background;
   const Controls = FlowSDK.Controls;
   const MiniMap = FlowSDK.MiniMap;
-  const Handle = FlowSDK.Handle;
-  const Position = FlowSDK.Position || { Left: "left", Right: "right" };
   const MarkerType = FlowSDK.MarkerType || { ArrowClosed: "arrowclosed" };
   const addEdge = FlowSDK.addEdge;
   const applyNodeChanges = FlowSDK.applyNodeChanges;
   const applyEdgeChanges = FlowSDK.applyEdgeChanges;
   const API = "/api/plugins/workflows";
   const DEFINITIONS_API = "/api/plugins/workflows/definitions";
-  const NODE_KIND_LIST = ["trigger", "pass", "switch", "agent_task", "wait", "parallel", "join", "fail"];
+  const NODE_KIND_LIST = ["trigger", "pass", "switch", "agent_task", "wait", "parallel", "join", "fail", "send_message", "subworkflow"];
   const FALLBACK_IMPLEMENTED_TRIGGER_TYPES = ["manual", "schedule"];
   const FALLBACK_IMPLEMENTED_NODE_TYPES = ["pass", "switch", "agent_task", "wait", "parallel", "join", "fail"];
   const EXAMPLE_DEFINITION = [
@@ -604,46 +620,17 @@ import {
     return statuses;
   }
 
-  function makeWorkflowNode(kind) {
-    return function WorkflowNode(props) {
-      const data = (props && props.data) || {};
-      const status = data.status || "idle";
-      const node = data.node || {};
-      return h("div", {
-        className: "hermes-workflows-rf-node is-" + classSafe(kind) + " is-status-" + classSafe(status),
-        role: "button",
-        tabIndex: 0,
-        "aria-label": "Edit workflow cell " + safeString(data.id || node.id || "cell"),
-        onClick: function (event) {
-          event.stopPropagation();
-          if (data.onSelect) data.onSelect(node);
-        },
-        onKeyDown: function (event) {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            event.stopPropagation();
-            if (data.onSelect) data.onSelect(node);
-          }
-        },
-      },
-        Handle ? h(Handle, { type: "target", position: Position.Left }) : null,
-        h("div", { className: "hermes-workflows-rf-node-title" }, safeString(node.id || data.id)),
-        h("div", { className: "hermes-workflows-rf-node-type" }, kind),
-        status && status !== "idle" ? h("div", { className: "hermes-workflows-rf-node-status" }, safeString(status)) : null,
-        Handle ? h(Handle, { type: "source", position: Position.Right }) : null
-      );
-    };
-  }
-
   const NODE_TYPES = {
-    trigger: makeWorkflowNode("trigger"),
-    pass: makeWorkflowNode("pass"),
-    switch: makeWorkflowNode("switch"),
-    agent_task: makeWorkflowNode("agent_task"),
-    wait: makeWorkflowNode("wait"),
-    parallel: makeWorkflowNode("parallel"),
-    join: makeWorkflowNode("join"),
-    fail: makeWorkflowNode("fail"),
+    trigger: makeWorkflowNode("trigger", SDK),
+    pass: makeWorkflowNode("pass", SDK),
+    switch: makeWorkflowNode("switch", SDK),
+    agent_task: makeWorkflowNode("agent_task", SDK),
+    wait: makeWorkflowNode("wait", SDK),
+    parallel: makeWorkflowNode("parallel", SDK),
+    join: makeWorkflowNode("join", SDK),
+    fail: makeWorkflowNode("fail", SDK),
+    send_message: makeWorkflowNode("send_message", SDK),
+    subworkflow: makeWorkflowNode("subworkflow", SDK),
   };
 
   function buildFlowNodes(spec, statuses, selectedNode, onSelect, nodePositions) {
@@ -862,10 +849,10 @@ import {
 
   function addSpecTrigger(spec, triggerId, triggerType, scheduleText) {
     const next = cloneSpec(spec || newWorkflowSpec("Workflow Draft"));
-    const type = triggerType === "schedule" ? "schedule" : "manual";
+    const type = triggerType === "schedule" || triggerType === "webhook" ? triggerType : "manual";
     const id = uniqueWorkflowId(next, triggerId || type || "trigger");
-    const trigger = { id: id, type: type };
-    if (type === "schedule") trigger.schedule = String(scheduleText || "0 9 * * *").trim() || "0 9 * * *";
+    const trigger = defaultTriggerForType(type, id);
+    if (type === "schedule") trigger.schedule = String(scheduleText || trigger.schedule || "0 9 * * *").trim() || "0 9 * * *";
     next.triggers = asArray(next.triggers).filter(function (existing) {
       return String((existing && (existing.id || existing.name)) || "") !== id;
     });
@@ -954,7 +941,14 @@ import {
     // re-renders the flow without mutating membership, so nodePositions and
     // the viewport must stay put.
     const flowInstanceRef = useRef(null);
+    const canvasRef = useRef(null);
     const membershipKeyRef = useRef("");
+    const stateNodePaletteOpen = useState(false);
+    const nodePaletteOpen = stateNodePaletteOpen[0];
+    const setNodePaletteOpen = stateNodePaletteOpen[1];
+    const stateNodePaletteGroup = useState("");
+    const nodePaletteGroup = stateNodePaletteGroup[0];
+    const setNodePaletteGroup = stateNodePaletteGroup[1];
     const stateDefinitions = useState([]);
     const definitions = stateDefinitions[0];
     const setDefinitions = stateDefinitions[1];
@@ -1042,6 +1036,21 @@ import {
     const stateCellOutputText = useState("");
     const cellOutputText = stateCellOutputText[0];
     const setCellOutputText = stateCellOutputText[1];
+    const stateSendMessagePlatform = useState("auto");
+    const sendMessagePlatform = stateSendMessagePlatform[0];
+    const setSendMessagePlatform = stateSendMessagePlatform[1];
+    const stateSendMessageTarget = useState("");
+    const sendMessageTarget = stateSendMessageTarget[0];
+    const setSendMessageTarget = stateSendMessageTarget[1];
+    const stateSendMessageText = useState("");
+    const sendMessageText = stateSendMessageText[0];
+    const setSendMessageText = stateSendMessageText[1];
+    const stateSubworkflowRef = useState("");
+    const subworkflowRef = stateSubworkflowRef[0];
+    const setSubworkflowRef = stateSubworkflowRef[1];
+    const stateSubworkflowInputMappingText = useState("{}");
+    const subworkflowInputMappingText = stateSubworkflowInputMappingText[0];
+    const setSubworkflowInputMappingText = stateSubworkflowInputMappingText[1];
     const stateCellSeconds = useState("60");
     const cellSeconds = stateCellSeconds[0];
     const setCellSeconds = stateCellSeconds[1];
@@ -1230,6 +1239,15 @@ import {
     const setTicking = stateTicking[1];
     const initialExecutionId = initialExecutionIdFromLocation();
 
+    useEffect(function () {
+      if (!nodePaletteOpen || typeof document === "undefined") return undefined;
+      function closeOnEscape(event) {
+        if (event.key === "Escape") closeNodePalette();
+      }
+      document.addEventListener("keydown", closeOnEscape);
+      return function () { document.removeEventListener("keydown", closeOnEscape); };
+    }, [nodePaletteOpen]);
+
     function fail(err) {
       setError(errorMessage(err));
     }
@@ -1246,6 +1264,16 @@ import {
 
     function activeSpec() {
       return parseJsonObject(editorText) || draftSpec || null;
+    }
+
+    function openNodePalette(groupName = "") {
+      setNodePaletteGroup(groupName);
+      setNodePaletteOpen(true);
+    }
+
+    function closeNodePalette() {
+      setNodePaletteOpen(false);
+      setNodePaletteGroup("");
     }
 
     function checklistSpec() {
@@ -1477,6 +1505,11 @@ import {
       setTriggerReadyPath(node && node.specKind === "trigger" ? readyPathFromTrigger(node) : "");
       setTriggerSchedule(node && (node.schedule || node.cron || node.expr) ? String(node.schedule || node.cron || node.expr) : "");
       setCellOutputText(node && node.output !== undefined && node.output !== null ? (typeof node.output === "string" ? node.output : jsonBlock(node.output)) : "");
+      setSendMessagePlatform(node && node.platform ? String(node.platform) : "auto");
+      setSendMessageTarget(node && node.target ? String(node.target) : "");
+      setSendMessageText(node && node.message_text !== undefined && node.message_text !== null ? String(node.message_text) : "");
+      setSubworkflowRef(node && node.workflow_ref ? String(node.workflow_ref) : "");
+      setSubworkflowInputMappingText(jsonBlock((node && node.input_mapping) || {}));
       setCellSeconds(node && node.seconds !== undefined && node.seconds !== null ? String(node.seconds) : "60");
       setSwitchDefault(node && node.default ? String(node.default) : "");
       setSwitchCases(asArray(node && node.cases));
@@ -1701,17 +1734,21 @@ import {
     }, [draftSpec, editorText, events, selectedNode, nodePositions]);
 
     useEffect(function () {
-      // ponytail: re-fit the React Flow viewport only when the ordered
-      // membership key changes — status polling is a status-only change.
-      const spec = activeSpec();
-      const key = buildGraphItems(spec || {}).map(function (item) {
-        return item.specKind + ":" + item.id;
+      // Fit only after React Flow has rendered the current membership.  The
+      // previous draft-driven effect ran before setFlowNodes committed, so it
+      // could fit stale nodes and then incorrectly suppress its own retry.
+      const key = flowNodes.map(function (item) {
+        return item.data.specKind + ":" + item.id;
       }).join("|");
-      if (key && key !== membershipKeyRef.current && flowInstanceRef.current && typeof flowInstanceRef.current.fitView === "function") {
-        flowInstanceRef.current.fitView();
-      }
-      membershipKeyRef.current = key;
-    }, [draftSpec, editorText, flowNodes]);
+      if (!key || key === membershipKeyRef.current) return undefined;
+      const frame = requestAnimationFrame(function () {
+        const instance = flowInstanceRef.current;
+        if (!instance || typeof instance.fitView !== "function") return;
+        instance.fitView();
+        membershipKeyRef.current = key;
+      });
+      return function () { cancelAnimationFrame(frame); };
+    }, [flowNodes]);
 
     useEffect(function () {
       if (!error && !status) return undefined;
@@ -2240,6 +2277,36 @@ import {
           delete nextNode.cases;
           delete nextNode.default;
         }
+        if (nextType === "send_message") {
+          const platform = ["auto", "discord", "telegram", "slack"].indexOf(sendMessagePlatform) !== -1 ? sendMessagePlatform : "auto";
+          if (sendMessageTarget.trim()) nextNode.target = sendMessageTarget.trim();
+          else delete nextNode.target;
+          if (sendMessageText.trim()) nextNode.message_text = sendMessageText;
+          else delete nextNode.message_text;
+          nextNode.platform = platform;
+        } else {
+          delete nextNode.target;
+          delete nextNode.message_text;
+          delete nextNode.platform;
+        }
+        if (nextType === "subworkflow") {
+          let inputMapping;
+          try {
+            inputMapping = parseJsonObject(subworkflowInputMappingText || "{}");
+          } catch (_) {
+            inputMapping = null;
+          }
+          if (!inputMapping) {
+            setNodeMessage("Input mapping JSON must be a JSON object.");
+            return;
+          }
+          if (subworkflowRef.trim()) nextNode.workflow_ref = subworkflowRef.trim();
+          else delete nextNode.workflow_ref;
+          nextNode.input_mapping = inputMapping;
+        } else {
+          delete nextNode.workflow_ref;
+          delete nextNode.input_mapping;
+        }
       }
 
       delete nextNode.provider_override;
@@ -2313,23 +2380,22 @@ import {
     }
 
     function addWorkflowCellOfType(type) {
-      const safeType = type || "pass";
-      const baseSpec = activeSpec() || newWorkflowSpec(newWorkflowName || goalText || "Workflow Draft");
-      const after = selectedNode && selectedNode.specKind !== "trigger" ? selectedNode.id : "";
-      const nextSpec = addSpecNodeAfter(baseSpec, safeType, safeType, after);
-      setActiveDraftSpec(nextSpec, "Added " + safeString(safeType) + " cell. Select it on the canvas to configure Properties.");
-      const id = Object.keys(nextSpec.nodes || {}).slice(-1)[0];
-      const node = findSpecNode(nextSpec, id);
-      if (node) selectNodeForInspector(node);
+      addWorkflowCellAtPosition(type, null);
     }
 
-    function addTriggerOfType(type) {
-      const safeType = type === "schedule" ? "schedule" : "manual";
+    function addTriggerOfType(type, position) {
+      const safeType = type === "schedule" || type === "webhook" ? type : "manual";
       const baseSpec = activeSpec() || newWorkflowSpec(newWorkflowName || goalText || "Workflow Draft");
       const nextSpec = addSpecTrigger(baseSpec, safeType, safeType, newTriggerSchedule);
-      setActiveDraftSpec(nextSpec, "Added " + safeString(safeType) + " trigger.");
       const trigger = asArray(nextSpec.triggers).slice(-1)[0];
-      if (trigger) selectNodeForInspector(Object.assign({}, trigger, { id: trigger.id || trigger.name, specKind: "trigger", trigger_type: trigger.type }));
+      const triggerId = trigger && (trigger.id || trigger.name);
+      if (triggerId && position) {
+        setNodePositions(function (previous) {
+          return Object.assign({}, previous, { [triggerId]: position });
+        });
+      }
+      setActiveDraftSpec(nextSpec, "Added " + safeString(safeType) + " trigger.");
+      if (trigger) selectNodeForInspector(Object.assign({}, trigger, { id: triggerId, specKind: "trigger", trigger_type: trigger.type }));
     }
 
     function addSwitchCaseFromUi() {
@@ -2348,15 +2414,49 @@ import {
       setSwitchCaseEquals("");
     }
 
-    function addWorkflowCellAtPosition(type) {
+    function addWorkflowCellAtPosition(type, position) {
       const safeType = type || "pass";
       const baseSpec = activeSpec() || newWorkflowSpec(newWorkflowName || goalText || "Workflow Draft");
       const after = selectedNode && selectedNode.specKind !== "trigger" ? selectedNode.id : "";
       const nextSpec = addSpecNodeAfter(baseSpec, safeType, safeType, after);
-      setActiveDraftSpec(nextSpec, "Added " + safeString(safeType) + " cell. Configure it in the inspector.");
       const id = Object.keys(nextSpec.nodes || {}).slice(-1)[0];
+      if (id && position) {
+        setNodePositions(function (previous) {
+          return Object.assign({}, previous, { [id]: position });
+        });
+      }
+      setActiveDraftSpec(nextSpec, "Added " + safeString(safeType) + " cell. Configure it in the inspector.");
       const node = findSpecNode(nextSpec, id);
       if (node) selectNodeForInspector(node);
+    }
+
+    function flowPositionFromDropEvent(event) {
+      const clientPosition = { x: event.clientX, y: event.clientY };
+      const instance = flowInstanceRef.current;
+      if (instance && typeof instance.screenToFlowPosition === "function") {
+        return instance.screenToFlowPosition(clientPosition);
+      }
+      return clientPosition;
+    }
+
+    function paletteNodePosition() {
+      const instance = flowInstanceRef.current;
+      const canvas = canvasRef.current;
+      const rect = canvas && typeof canvas.getBoundingClientRect === "function" ? canvas.getBoundingClientRect() : null;
+      if (instance && rect && typeof instance.screenToFlowPosition === "function") {
+        return snapFlowPosition(instance.screenToFlowPosition({
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2,
+        }));
+      }
+      return snapFlowPosition({ x: 280, y: 180 });
+    }
+
+    function addNodeFromPalette(type) {
+      const position = paletteNodePosition();
+      if (type === "manual" || type === "schedule" || type === "webhook") addTriggerOfType(type, position);
+      else addWorkflowCellAtPosition(type, position);
+      closeNodePalette();
     }
 
     function deleteSelectedCell() {
@@ -2908,7 +3008,7 @@ import {
       );
     }
 
-    function renderInspector(spec) {
+    function renderInspectorLegacy(spec) {
       return h("aside", { className: "hermes-workflows-inspector" },
         h("h3", null, "Node inspector"),
         selectedNode ? renderInspectorForType(spec) : h("p", { className: "hermes-workflows-muted" }, "Choose a node from the palette, select it on the canvas, then configure it in Properties.")
@@ -2916,9 +3016,40 @@ import {
     }
 
     function renderReactFlowGraph(spec) {
-      if (!ReactFlow || !ReactFlowProvider) return renderSimpleGraph(spec);
+      function renderCanvasOnboarding(className) {
+        return h("div", { className: className },
+          h("div", { className: "hermes-workflows-canvas-onboarding-card" },
+            renderWorkflowOnboarding({
+              createElement: h,
+              activeSpec: null,
+              goalText: goalText,
+              setGoalText: setGoalText,
+              newWorkflowName: newWorkflowName,
+              setNewWorkflowName: setNewWorkflowName,
+              draftFromGoal: draftFromGoal,
+              drafting: drafting,
+              startBlankWorkflow: startBlankWorkflow,
+              refineWorkflow: refineWorkflow,
+              refining: refining,
+              refineText: refineText,
+              setRefineText: setRefineText,
+              draftResult: draftResult,
+              candidateSource: candidateSource,
+              acceptDraftCandidate: acceptDraftCandidate,
+              rejectDraftCandidate: rejectDraftCandidate,
+            })
+          )
+        );
+      }
+
+      if (!ReactFlow || !ReactFlowProvider) {
+        return spec ? renderSimpleGraph(spec) : renderCanvasOnboarding("hermes-workflows-canvas-onboarding hermes-workflows-simple-canvas-onboarding");
+      }
+      const nodes = spec ? flowNodes : [];
+      const edges = spec ? flowEdges : [];
       return h("div", { className: "hermes-workflows-flow-surface" },
         h("div", {
+          ref: canvasRef,
           className: "hermes-workflows-canvas" + (isDragOver ? " hermes-workflows-canvas-drop-target" : ""),
           onDragOver: function (event) {
             event.preventDefault();
@@ -2929,18 +3060,19 @@ import {
             event.preventDefault();
             setIsDragOver(false);
             const type = (event.dataTransfer && event.dataTransfer.getData("text/plain")) || window.__HERMES_DRAG_NODE_TYPE || "";
-            if (type === "manual" || type === "schedule") {
-              addTriggerOfType(type);
+            const dropPosition = snapFlowPosition(flowPositionFromDropEvent(event));
+            if (type === "manual" || type === "schedule" || type === "webhook") {
+              addTriggerOfType(type, dropPosition);
             } else if (type) {
-              addWorkflowCellAtPosition(type);
+              addWorkflowCellAtPosition(type, dropPosition);
             }
             delete window.__HERMES_DRAG_NODE_TYPE;
           },
         },
           h(ReactFlowProvider, null,
             h(ReactFlow, {
-              nodes: flowNodes,
-              edges: flowEdges,
+              nodes: nodes,
+              edges: edges,
               nodeTypes: NODE_TYPES,
               fitView: false,
               nodesDraggable: true,
@@ -2979,6 +3111,29 @@ import {
                   setStatus("Draft connection added visually; validate/select a workflow to persist it.");
                 }
               } : undefined,
+              onEdgeDoubleClick: function (event, edge) {
+                if (!edge) return;
+                event.preventDefault();
+                event.stopPropagation();
+                const spec = activeSpec();
+                const current = (edge && edge.label) || "";
+                const nextLabel = typeof window === "undefined" ? current : window.prompt("Edit edge label (used for switch case names):", current);
+                if (nextLabel === null || nextLabel === current) return;
+                if (!spec) return;
+                const edges = asArray(spec.edges).map(function (entry) {
+                  if (entry === edge) return Object.assign({}, entry, { label: nextLabel });
+                  const sameFlow = entry && edge && entry.id === edge.id;
+                  return sameFlow ? Object.assign({}, entry, { label: nextLabel }) : entry;
+                });
+                const updated = edges.find(function (entry) { return entry && entry.id === edge.id; });
+                const nextSpec = Object.assign({}, spec, { edges: edges });
+                updateEditorText(specToEditorText(nextSpec));
+                setDraftSpec(nextSpec);
+                setFlowEdges(flowEdges.map(function (e) {
+                  return e && e.id === edge.id ? Object.assign({}, e, { label: nextLabel }) : e;
+                }));
+                setStatus(updated && updated.label !== current ? "Edge label updated." : "Edge label cleared.");
+              },
               onNodeContextMenu: function (event, node) {
                 event.preventDefault();
                 if (node && node.data && node.data.node) {
@@ -2990,6 +3145,16 @@ import {
               Controls ? h(Controls, null) : null
             )
           ),
+          !spec ? renderCanvasOnboarding("hermes-workflows-canvas-onboarding") : null,
+          h(NodePaletteOverlay, {
+            createElement: h,
+            React: React,
+            isOpen: nodePaletteOpen,
+            nodePaletteGroup: nodePaletteGroup,
+            categories: NODE_CATEGORIES,
+            closeNodePalette: closeNodePalette,
+            onSelectNode: addNodeFromPalette,
+          }),
           contextMenu.visible ? h(React.Fragment, null,
             h("div", {
               className: "hermes-workflows-context-menu-overlay",
@@ -3452,12 +3617,10 @@ import {
         className: "hermes-workflows-build-mode",
       },
         h("div", { className: "hermes-workflows-canvas-area" },
-          renderBuilderToolbar(activeSpec()),
           h("div", { className: "hermes-workflows-canvas-main" },
             h("div", { className: "hermes-workflows-canvas-wrap" },
-              activeSpec() ? renderReactFlowGraph(activeSpec()) : h("div", { className: "hermes-workflows-muted", style: {padding: "2rem", textAlign: "center"} }, "No workflow loaded. Use the sidebar to draft a new workflow or select an existing one.")
-            ),
-            activeSpec() ? h("div", { className: "hermes-workflows-inspector-panel" }, renderInspector(activeSpec())) : null
+              renderReactFlowGraph(activeSpec())
+            )
           )
         )
       );
@@ -3470,46 +3633,58 @@ import {
         "aria-label": "Run workflow",
         className: "hermes-workflows-run-mode",
       },
-        renderInputFeedPanel(),
-        renderDiagnosticsPanel()
+        renderInputFeedPanelModule({
+          createElement: h,
+          React: React,
+          selectedDefinition: selectedDefinition,
+          workflowIdForDefinition: workflowIdForDefinition,
+          selectedInputTrigger: selectedInputTrigger,
+          inputFieldsForSpec: inputFieldsForSpec,
+          inputFeeds: inputFeeds,
+          selectedFeedId: selectedFeedId,
+          setSelectedFeedId: setSelectedFeedId,
+          openContinuousFeed: openContinuousFeed,
+          setSelectedFeedStatus: setSelectedFeedStatus,
+          feedBusy: feedBusy,
+          loadInputFeedItems: loadInputFeedItems,
+          inputFeedItems: inputFeedItems,
+          updateInputFeedItem: updateInputFeedItem,
+          addItemToFeed: addItemToFeed,
+          feedInputValues: feedInputValues,
+          setFeedInputValues: setFeedInputValues,
+          showAdvancedFeedInputJson: showAdvancedFeedInputJson,
+          setShowAdvancedFeedInputJson: setShowAdvancedFeedInputJson,
+          feedInputText: feedInputText,
+          setFeedInputText: setFeedInputText,
+          feedActions: feedActions,
+        }),
+        renderDiagnosticsPanelModule({
+          createElement: h,
+          React: React,
+          diagnosticsOpen: diagnosticsOpen,
+          setDiagnosticsOpen: setDiagnosticsOpen,
+          renderExecutionStallWarning: renderExecutionStallWarning,
+          ticking: ticking,
+          manualTick: manualTick,
+          loading: loading,
+          refresh: refresh,
+        })
       );
     }
 
     function renderHistoryMode() {
-      return h("section", {
-        id: "hermes-workflows-mode-history",
-        role: "tabpanel",
-        "aria-label": "Workflow execution history",
-        className: "hermes-workflows-history-mode",
-      },
-        h("div", { className: "hermes-workflows-history-toolbar" },
-          h("button", { type: "button", disabled: loading, onClick: function () { refresh(); } }, loading ? "Refreshing…" : "Refresh executions")
-        ),
-        h("div", { className: "hermes-workflows-history-list" },
-          executions.length ? executions.slice(0, 50).map(function (execution) {
-            var eid = safeString(execution.execution_id || execution.id);
-            var execStatus = safeString(execution.status);
-            var statusClass = execStatus === "succeeded" ? " is-succeeded" : execStatus === "failed" ? " is-failed" : "";
-            var isActive = selectedExecution && String(selectedExecution.execution_id || selectedExecution.id || "") === eid;
-            return h("button", {
-              key: eid,
-              type: "button",
-              "data-execution-id": eid,
-              className: "hermes-workflows-history-row" + (isActive ? " is-selected" : ""),
-              onClick: function () {
-                loadExecution(eid).catch(fail);
-                pushMode("history", { execution: eid });
-              },
-            },
-              h("span", { className: "hermes-workflows-history-row-id" }, eid.slice(0, 16)),
-              h("span", { className: "hermes-workflows-history-row-status" + statusClass }, execStatus)
-            );
-          }) : h("p", { className: "hermes-workflows-muted" }, "No executions yet.")
-        ),
-        h("div", { className: "hermes-workflows-history-detail" },
-          renderTimeline()
-        )
-      );
+      return renderHistoryModeModule({
+        createElement: h,
+        React: React,
+        executions: executions,
+        selectedExecution: selectedExecution,
+        loadExecution: loadExecution,
+        refresh: refresh,
+        loading: loading,
+        pushMode: pushMode,
+        renderTimeline: renderTimeline,
+        fail: fail,
+      });
     }
 
     function renderActiveMode() {
@@ -3519,9 +3694,131 @@ import {
     }
 
     var spec = activeSpec();
+    var topBarProps = {
+      createElement: h,
+      React: React,
+      activeSpec: spec,
+      selectedDefinition: selectedDefinition,
+      workflowIdForDefinition: workflowIdForDefinition,
+      versionForDefinition: versionForDefinition,
+      renderWorkspaceTabs: renderWorkspaceTabsBar,
+      validateDefinition: validateDefinition,
+      validating: validating,
+      deployDefinition: deployDefinition,
+      deploying: deploying,
+      deleteWorkflow: deleteWorkflow,
+      deleting: deleting,
+      openRunPanel: function () {
+        setRunWorkflowId(workflowIdForDefinition(selectedDefinition));
+        setRunPanelOpen(true);
+      },
+      openNodePalette: openNodePalette,
+      running: running,
+      refresh: function () { refresh(); },
+      loading: loading,
+      showAdvancedYaml: showAdvancedYaml,
+      setShowAdvancedYaml: setShowAdvancedYaml,
+      persistedRunCapable: persistedRunCapable,
+    };
+    var inspectorProps = {
+      createElement: h,
+      React: React,
+      selectedNode: selectedNode,
+      cellId: cellId,
+      setCellId: setCellId,
+      cellType: cellType,
+      setCellType: setCellType,
+      activeSpec: activeSpec,
+      agentProfile: agentProfile,
+      setAgentProfile: setAgentProfile,
+      agentProvider: agentProvider,
+      setAgentProvider: setAgentProvider,
+      agentModel: agentModel,
+      setAgentModel: setAgentModel,
+      agentTitle: agentTitle,
+      setAgentTitle: setAgentTitle,
+      promptText: promptText,
+      setPromptText: setPromptText,
+      resultContractText: resultContractText,
+      setResultContractText: setResultContractText,
+      agentRoutingOptions: agentRoutingOptions,
+      promptAssistantOpen: promptAssistantOpen,
+      setPromptAssistantOpen: setPromptAssistantOpen,
+      promptAssistantGoal: promptAssistantGoal,
+      setPromptAssistantGoal: setPromptAssistantGoal,
+      promptAssistantObjective: promptAssistantObjective,
+      setPromptAssistantObjective: setPromptAssistantObjective,
+      promptAssistantContext: promptAssistantContext,
+      setPromptAssistantContext: setPromptAssistantContext,
+      promptAssistantOutput: promptAssistantOutput,
+      setPromptAssistantOutput: setPromptAssistantOutput,
+      promptAssistantConstraints: promptAssistantConstraints,
+      setPromptAssistantConstraints: setPromptAssistantConstraints,
+      promptAssistantAdvanced: promptAssistantAdvanced,
+      setPromptAssistantAdvanced: setPromptAssistantAdvanced,
+      draftPromptWithAssistant: draftPromptWithAssistant,
+      triggerInputRows: triggerInputRows,
+      setTriggerInputRows: setTriggerInputRows,
+      triggerInputName: triggerInputName,
+      setTriggerInputName: setTriggerInputName,
+      triggerInputKind: triggerInputKind,
+      setTriggerInputKind: setTriggerInputKind,
+      triggerInputRequired: triggerInputRequired,
+      setTriggerInputRequired: setTriggerInputRequired,
+      triggerInputDefault: triggerInputDefault,
+      setTriggerInputDefault: setTriggerInputDefault,
+      triggerInputMinLength: triggerInputMinLength,
+      setTriggerInputMinLength: setTriggerInputMinLength,
+      triggerInputMaxLength: triggerInputMaxLength,
+      setTriggerInputMaxLength: setTriggerInputMaxLength,
+      triggerIntakeMode: triggerIntakeMode,
+      setTriggerIntakeMode: setTriggerIntakeMode,
+      triggerDedupeKey: triggerDedupeKey,
+      setTriggerDedupeKey: setTriggerDedupeKey,
+      triggerReadyPath: triggerReadyPath,
+      setTriggerReadyPath: setTriggerReadyPath,
+      triggerSchedule: triggerSchedule,
+      setTriggerSchedule: setTriggerSchedule,
+      addTriggerInputFieldFromUi: addTriggerInputFieldFromUi,
+      removeTriggerInputField: removeTriggerInputField,
+      switchDefault: switchDefault,
+      setSwitchDefault: setSwitchDefault,
+      switchCases: switchCases,
+      setSwitchCases: setSwitchCases,
+      switchCaseName: switchCaseName,
+      setSwitchCaseName: setSwitchCaseName,
+      switchCasePath: switchCasePath,
+      setSwitchCasePath: setSwitchCasePath,
+      switchCaseEquals: switchCaseEquals,
+      setSwitchCaseEquals: setSwitchCaseEquals,
+      addSwitchCaseFromUi: addSwitchCaseFromUi,
+      cellSeconds: cellSeconds,
+      setCellSeconds: setCellSeconds,
+      cellOutputText: cellOutputText,
+      setCellOutputText: setCellOutputText,
+      sendMessagePlatform: sendMessagePlatform,
+      setSendMessagePlatform: setSendMessagePlatform,
+      sendMessageText: sendMessageText,
+      setSendMessageText: setSendMessageText,
+      applyAgentCellForm: applyAgentCellForm,
+      applyBasicCellForm: applyBasicCellForm,
+      deleteSelectedCell: deleteSelectedCell,
+      advancedJsonOpen: advancedJsonOpen,
+      setAdvancedJsonOpen: setAdvancedJsonOpen,
+      nodeJson: nodeJson,
+      setNodeJson: setNodeJson,
+      applyNodeJson: applyNodeJson,
+      useJsonDraft: useJsonDraft,
+      nodeMessage: nodeMessage,
+      setNodeMessage: setNodeMessage,
+      setDraftSpec: setDraftSpec,
+      setSelectedDefinition: setSelectedDefinition,
+      draftSpec: draftSpec,
+      selectedDefinition: selectedDefinition,
+    };
     return h("div", { className: "hermes-workflows" },
       h("div", { className: "hermes-workflows-app" },
-        renderTopBar(),
+        renderExtractedTopBar(topBarProps),
         (error || status) ? h("div", { className: "hermes-workflows-status-row" },
           error ? h("div", { className: "hermes-workflows-banner is-error", role: "alert" },
             h("span", null, error),
@@ -3532,12 +3829,79 @@ import {
             h("button", { type: "button", className: "hermes-workflows-banner-close", "aria-label": "Dismiss alert", onClick: clearBanners }, "×")
           ) : null
         ) : null,
-        h("div", { className: "hermes-workflows-body" },
-          renderSidebar(),
-          renderActiveMode(),
-          workspaceMode === "build" ? renderBottomPanel() : null
+        h("div", { className: "hermes-workflows-body" + (workspaceMode === "build" && selectedNode ? " has-inspector" : "") },
+          h("div", { className: "hermes-workflows-palette-zone" },
+            h(WorkflowRail, {
+              variant: "rail",
+              createElement: h,
+              React: React,
+              activeSpec: spec,
+              hideWorkflowForm: !spec,
+              goalText: goalText,
+              setGoalText: setGoalText,
+              newWorkflowName: newWorkflowName,
+              setNewWorkflowName: setNewWorkflowName,
+              draftFromGoal: draftFromGoal,
+              drafting: drafting,
+              startBlankWorkflow: startBlankWorkflow,
+              refineWorkflow: refineWorkflow,
+              refining: refining,
+              refineText: refineText,
+              setRefineText: setRefineText,
+              draftResult: draftResult,
+              candidateSource: candidateSource,
+              acceptDraftCandidate: acceptDraftCandidate,
+              rejectDraftCandidate: rejectDraftCandidate,
+              definitions: definitions,
+              selectedDefinition: selectedDefinition,
+              loadDefinition: loadDefinition,
+              executions: executions,
+              loadExecution: loadExecution,
+              libraryGroups: libraryGroups(NODE_CATEGORIES),
+              openNodePalette: openNodePalette,
+            })
+          ),
+          h("div", { className: "hermes-workflows-canvas-zone" },
+            renderActiveMode()
+          ),
+          workspaceMode === "build" && selectedNode ? h("div", { className: "hermes-workflows-inspector-zone" },
+            renderInspector(inspectorProps)
+          ) : null,
+          h("div", { className: "hermes-workflows-bottom-zone" },
+            workspaceMode === "build" ? renderBottomPanelModule({
+            createElement: h,
+            React: React,
+            bottomCollapsed: bottomCollapsed,
+            setBottomCollapsed: setBottomCollapsed,
+            activeSpec: spec,
+            workflowCapabilities: workflowCapabilities,
+            renderValidationChecklist: renderValidationChecklist,
+          }) : null
+          )
         ),
-        renderRunStartPanel(),
+        renderRunStartPanelModule({
+          createElement: h,
+          React: React,
+          runPanelOpen: runPanelOpen,
+          setRunPanelOpen: setRunPanelOpen,
+          runPanelRef: runPanelRef,
+          runWorkflowId: runWorkflowId,
+          definitions: definitions,
+          inputFieldsForSpec: inputFieldsForSpec,
+          runInputSpec: runInputSpec,
+          inputFieldValues: inputFieldValues,
+          setInputFieldValues: setInputFieldValues,
+          showAdvancedInputJson: showAdvancedInputJson,
+          setShowAdvancedInputJson: setShowAdvancedInputJson,
+          runInputText: runInputText,
+          setRunInputText: setRunInputText,
+          running: running,
+          runFieldErrors: runFieldErrors,
+          runWorkflow: runWorkflow,
+          selectedRunVersion: selectedRunVersion,
+          loadDefinition: loadDefinition,
+          fail: fail,
+        }),
         showAdvancedYaml ? renderAdvancedYaml() : null
       )
     );

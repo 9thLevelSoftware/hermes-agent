@@ -522,4 +522,85 @@ async def test_payload_hash_uses_sha256(tmp_path, monkeypatch):
 
     record = journal.get("delivery-hash")
     assert record.payload_hash == expected
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_is_retryable(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    journal, db = _journal_for(tmp_path)
+    journal.create(
+        operation_id="delivery-retry",
+        kind="outbound_delivery",
+        destination="telegram:123",
+        payload_hash=_hash("hello"),
+    )
+    journal.transition(
+        "delivery-retry",
+        from_states={"pending"},
+        to_state="running",
+        effect_disposition="none",
+    )
+    journal.transition(
+        "delivery-retry",
+        from_states={"running"},
+        to_state="dispatched",
+        effect_disposition="unknown",
+    )
+    journal.transition(
+        "delivery-retry",
+        from_states={"dispatched"},
+        to_state="failed",
+        effect_disposition="none",
+        error="temporary failure",
+    )
+
+    adapter = RecordingAdapter()
+    router = DeliveryRouter(
+        GatewayConfig(), adapters={Platform.TELEGRAM: adapter}, journal=journal
+    )
+    result = await router._deliver_to_platform(
+        DeliveryTarget.parse("telegram:123"),
+        "hello",
+        metadata={"delivery_id": "delivery-retry"},
+    )
+
+    assert len(adapter.calls) == 1
+    assert getattr(result, "success", None) is True
+    assert journal.get("delivery-retry").state == "confirmed"
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_transition_failure_still_records_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    journal, db = _journal_for(tmp_path)
+    original_transition = journal.transition
+
+    def fail_dispatched(operation_id, **kwargs):
+        if kwargs.get("to_state") == "dispatched":
+            raise RuntimeError("journal unavailable")
+        return original_transition(operation_id, **kwargs)
+
+    journal.transition = fail_dispatched
+    adapter = RecordingAdapter()
+
+    async def fail_send(*_args, **_kwargs):
+        raise RuntimeError("adapter failed")
+
+    adapter.send = fail_send
+    router = DeliveryRouter(
+        GatewayConfig(), adapters={Platform.TELEGRAM: adapter}, journal=journal
+    )
+
+    with pytest.raises(RuntimeError, match="adapter failed"):
+        await router._deliver_to_platform(
+            DeliveryTarget.parse("telegram:123"),
+            "hello",
+            metadata={"delivery_id": "delivery-dispatch-transition"},
+        )
+
+    record = journal.get("delivery-dispatch-transition")
+    assert record.state == "unknown"
+    assert record.effect_disposition == "unknown"
+    db.close()
     db.close()

@@ -464,6 +464,7 @@ class DeliveryRouter:
             )
             payload_hash = self._payload_hash(content)
             existing = self.journal.get(delivery_id)
+            journal = self.journal
             if existing is not None:
                 if (
                     existing.kind != "outbound_delivery"
@@ -479,7 +480,7 @@ class DeliveryRouter:
                     )
                 # Same identity — if already terminal, short-circuit so a
                 # restart-reattempt does not duplicate the wire send.
-                if existing.state in ("confirmed", "failed", "unknown", "cancelled"):
+                if existing.state in ("confirmed", "unknown", "cancelled"):
                     logger.info(
                         "Skipping outbound delivery %s — already %s",
                         delivery_id, existing.state,
@@ -501,39 +502,56 @@ class DeliveryRouter:
                         except Exception:  # noqa: BLE001
                             pass
                     return dedup_result
-                # In-flight on disk from before this process started: the
-                # boot-time reconcile_after_restart() should have flipped
-                # it to unknown. If a caller forgot to reconcile, treat it
-                # as unknown here too — never auto-resume mid-flight.
+                if existing.state == "failed":
+                    self.journal.transition(
+                        delivery_id,
+                        from_states={"failed"},
+                        to_state="running",
+                        effect_disposition="none",
+                    )
+                    journal = self.journal
+                else:
+                    # In-flight on disk from before this process started: the
+                    # boot-time reconcile_after_restart() should have flipped
+                    # it to unknown. If a caller forgot to reconcile, treat it
+                    # as unknown here too — never auto-resume mid-flight.
+                    try:
+                        self.journal.transition(
+                            delivery_id,
+                            from_states={"running", "dispatched"},
+                            to_state="unknown",
+                            effect_disposition="unknown",
+                            error="resume attempted without reconcile_after_restart",
+                        )
+                    except Exception as journal_exc:  # noqa: BLE001 — never crash the caller
+                        logger.warning(
+                            "resume-time journal transition to unknown failed for %s: %s",
+                            delivery_id,
+                            journal_exc,
+                        )
+                    return {
+                        "success": True,
+                        "deduped": True,
+                        "delivery_id": delivery_id,
+                        "state": "unknown",
+                    }
+            if existing is None:
+                # Brand-new delivery — create the row in pending state, then
+                # advance to running (an in-memory-only state useful for crash
+                # forensics; the on-wire dispatch happens next).
+                self.journal.create(
+                    operation_id=delivery_id,
+                    kind="outbound_delivery",
+                    destination=destination,
+                    payload_hash=payload_hash,
+                )
                 self.journal.transition(
                     delivery_id,
-                    from_states={"running", "dispatched"},
-                    to_state="unknown",
-                    effect_disposition="unknown",
-                    error="resume attempted without reconcile_after_restart",
+                    from_states={"pending"},
+                    to_state="running",
+                    effect_disposition="none",
                 )
-                return {
-                    "success": True,
-                    "deduped": True,
-                    "delivery_id": delivery_id,
-                    "state": "unknown",
-                }
-            # Brand-new delivery — create the row in pending state, then
-            # advance to running (an in-memory-only state useful for crash
-            # forensics; the on-wire dispatch happens next).
-            self.journal.create(
-                operation_id=delivery_id,
-                kind="outbound_delivery",
-                destination=destination,
-                payload_hash=payload_hash,
-            )
-            self.journal.transition(
-                delivery_id,
-                from_states={"pending"},
-                to_state="running",
-                effect_disposition="none",
-            )
-            journal = self.journal
+                journal = self.journal
         else:
             journal = None
 
@@ -746,7 +764,7 @@ class DeliveryRouter:
                         err_text = f"{err_text}: {dispatch_exc}"
                     journal.transition(
                         delivery_id,
-                        from_states={"dispatched"},
+                        from_states={"running", "dispatched"},
                         to_state="unknown",
                         effect_disposition="unknown",
                         error=err_text,
@@ -788,7 +806,7 @@ class DeliveryRouter:
                     try:
                         journal.transition(
                             delivery_id,
-                            from_states={"dispatched"},
+                            from_states={"running", "dispatched"},
                             to_state="failed",
                             effect_disposition="none",
                             error=_send_result_error(result) or "send failed",
@@ -809,7 +827,7 @@ class DeliveryRouter:
             try:
                 journal.transition(
                     delivery_id,
-                    from_states={"dispatched"},
+                    from_states={"running", "dispatched"},
                     to_state="confirmed",
                     effect_disposition="landed",
                     result=self._journal_receipt(target, result),

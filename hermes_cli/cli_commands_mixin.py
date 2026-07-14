@@ -285,11 +285,30 @@ class CLICommandsMixin:
         running_d = [d for d in delegations if d.get("status") == "running"]
         if delegations:
             _cprint(f"  Background delegations: {len(running_d)} running")
+            session_db = self._session_db
+            if not session_db:
+                try:
+                    from hermes_state import SessionDB
+
+                    session_db = SessionDB()
+                    self._session_db = session_db
+                except Exception:
+                    pass
             for d in delegations:
                 goal = (d.get("goal") or "")[:60]
+                resume_ids = d.get("child_session_ids") or []
+                resume_hint = ""
+                if d.get("status") == "interrupted" and resume_ids and session_db:
+                    for resume_id in resume_ids:
+                        try:
+                            if session_db.get_session(resume_id):
+                                resume_hint = f" · /resume {resume_id}"
+                                break
+                        except Exception:
+                            continue
                 _cprint(
                     f"    {d.get('delegation_id', '?')} · "
-                    f"{d.get('status', '?')} · {goal}"
+                    f"{d.get('status', '?')} · {goal}{resume_hint}"
                 )
 
         agent_running = getattr(self, "_agent_running", False)
@@ -2494,7 +2513,7 @@ class CLICommandsMixin:
 
         Usage:
             /reasoning              Show current effort level and display state
-            /reasoning <level>      Set reasoning effort (none, minimal, low, medium, high, xhigh)
+            /reasoning <level>      Set effort (none, minimal, low, medium, high, xhigh, max, ultra)
             /reasoning show|on      Show model thinking/reasoning in output
             /reasoning hide|off     Hide model thinking/reasoning from output
             /reasoning full         Show complete thinking (no 10-line clamp)
@@ -2516,7 +2535,7 @@ class CLICommandsMixin:
             full_state = "full" if getattr(self, "reasoning_full", False) else "clamped to 10 lines"
             _cprint(f"  {_ACCENT}Reasoning effort:  {level}{_RST}")
             _cprint(f"  {_ACCENT}Reasoning display: {display_state} ({full_state}){_RST}")
-            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|show|hide|full|clamp>{_RST}")
+            _cprint(f"  {_DIM}Usage: /reasoning <none|minimal|low|medium|high|xhigh|max|ultra|show|hide|full|clamp>{_RST}")
             return
 
         arg = parts[1].strip().lower()
@@ -2557,7 +2576,7 @@ class CLICommandsMixin:
         parsed = _parse_reasoning_config(arg)
         if parsed is None:
             _cprint(f"  {_DIM}(._.) Unknown argument: {arg}{_RST}")
-            _cprint(f"  {_DIM}Valid levels: none, minimal, low, medium, high, xhigh{_RST}")
+            _cprint(f"  {_DIM}Valid levels: none, minimal, low, medium, high, xhigh, max, ultra{_RST}")
             _cprint(f"  {_DIM}Display:      show, hide{_RST}")
             return
 

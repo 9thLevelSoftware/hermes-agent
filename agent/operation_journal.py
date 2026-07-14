@@ -7,11 +7,38 @@ belong to higher-level callers.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from hermes_state import SessionDB
+
+
+def _process_start_time(pid: int) -> Optional[int]:
+    try:
+        from gateway.status import get_process_start_time
+
+        return get_process_start_time(pid)
+    except Exception:
+        return None
+
+
+def _owner_is_live(pid: Optional[int], started_at: Optional[int]) -> bool:
+    if not pid:
+        return False
+    try:
+        from gateway.status import _pid_exists, get_process_start_time
+
+        if not _pid_exists(pid):
+            return False
+        current_start = get_process_start_time(pid)
+        return started_at is None or current_start is None or current_start == started_at
+    except Exception:
+        # gateway.status is the authoritative cross-platform PID probe. If it
+        # is unavailable, fail closed rather than using os.kill(pid, 0), which
+        # has destructive console semantics on Windows.
+        return False
 
 
 _STATES = frozenset(
@@ -33,7 +60,7 @@ _TRANSITIONS = {
     "running": frozenset({"dispatched", "confirmed", "failed", "unknown", "cancelled"}),
     "dispatched": frozenset({"confirmed", "failed", "unknown"}),
     "confirmed": frozenset(),
-    "failed": frozenset(),
+    "failed": frozenset({"running"}),
     "unknown": frozenset(),
     "cancelled": frozenset(),
 }
@@ -149,6 +176,12 @@ class OperationJournal:
                     now,
                 ),
             )
+            conn.execute(
+                """INSERT INTO agent_operation_owners (
+                       operation_id, owner_pid, owner_started_at
+                   ) VALUES (?, ?, ?)""",
+                (operation_id, os.getpid(), _process_start_time(os.getpid())),
+            )
             return conn.execute(
                 "SELECT * FROM agent_operations WHERE operation_id = ?",
                 (operation_id,),
@@ -222,11 +255,13 @@ class OperationJournal:
         return self._db._execute_write(_acknowledge)
 
     def get(self, operation_id: str) -> Optional[OperationRecord]:
-        with self._db._lock:
-            row = self._db._conn.execute(
+        def _read(conn):
+            return conn.execute(
                 "SELECT * FROM agent_operations WHERE operation_id = ?",
                 (operation_id,),
             ).fetchone()
+
+        row = self._db._execute_read(_read)
         return self._record(row) if row is not None else None
 
     def list_unacknowledged(self, kind: Optional[str] = None) -> list[OperationRecord]:
@@ -236,21 +271,52 @@ class OperationJournal:
             query += " AND kind = ?"
             params.append(kind)
         query += " ORDER BY created_at, operation_id"
-        with self._db._lock:
-            rows = self._db._conn.execute(query, params).fetchall()
+
+        def _read(conn):
+            return conn.execute(query, params).fetchall()
+
+        rows = self._db._execute_read(_read)
         return [self._record(row) for row in rows]
 
-    def reconcile_after_restart(self) -> int:
-        def _reconcile(conn):
+    def reconcile_after_restart(self, *, owner_fenced: bool = False) -> int:
+        if not owner_fenced:
+            def _reconcile(conn):
+                cursor = conn.execute(
+                    """UPDATE agent_operations
+                           SET state = 'unknown', effect_disposition = 'unknown', updated_at = ?
+                         WHERE state IN ('running', 'dispatched')""",
+                    (time.time(),),
+                )
+                return cursor.rowcount
+
+            return self._db._execute_write(_reconcile)
+
+        def _reconcile_fenced(conn):
+            rows = conn.execute(
+                """SELECT operations.operation_id, owners.owner_pid, owners.owner_started_at
+                     FROM agent_operations AS operations
+                LEFT JOIN agent_operation_owners AS owners
+                       ON owners.operation_id = operations.operation_id
+                    WHERE operations.state IN ('running', 'dispatched')"""
+            ).fetchall()
+            stale_ids = [
+                row["operation_id"]
+                for row in rows
+                if not _owner_is_live(row["owner_pid"], row["owner_started_at"])
+            ]
+            if not stale_ids:
+                return 0
+            placeholders = ",".join("?" for _ in stale_ids)
             cursor = conn.execute(
-                """UPDATE agent_operations
+                f"""UPDATE agent_operations
                        SET state = 'unknown', effect_disposition = 'unknown', updated_at = ?
-                     WHERE state IN ('running', 'dispatched')""",
-                (time.time(),),
+                     WHERE operation_id IN ({placeholders})
+                       AND state IN ('running', 'dispatched')""",
+                (time.time(), *stale_ids),
             )
             return cursor.rowcount
 
-        return self._db._execute_write(_reconcile)
+        return self._db._execute_write(_reconcile_fenced)
 
     def prune_terminal(self, older_than_days: float = 30) -> int:
         """Delete acknowledged confirmed/failed/cancelled rows older than cutoff.

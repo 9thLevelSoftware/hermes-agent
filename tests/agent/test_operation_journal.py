@@ -570,3 +570,46 @@ def test_database_checks_states_and_effects(db):
                 ("bad-effect", "tool", "pending", "invalid", 1.0, 1.0),
             )
         )
+
+
+def test_reads_use_closed_database_guard(db):
+    journal = _journal(db)
+    db.close()
+    from hermes_state import SessionDBClosedError
+
+    with pytest.raises(SessionDBClosedError):
+        journal.get("missing")
+    with pytest.raises(SessionDBClosedError):
+        journal.list_unacknowledged()
+
+
+def test_reconcile_owner_fence_preserves_live_operations(db):
+    journal = OperationJournal(db)
+    journal.create(operation_id="live", kind="test")
+    journal.transition("live", from_states={"pending"}, to_state="running", effect_disposition="none")
+    journal.create(operation_id="dead", kind="test")
+    journal.transition("dead", from_states={"pending"}, to_state="running", effect_disposition="none")
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE agent_operation_owners SET owner_pid = 0, owner_started_at = NULL WHERE operation_id = ?",
+            ("dead",),
+        )
+    )
+
+    assert journal.reconcile_after_restart(owner_fenced=True) == 1
+    assert journal.get("live").state == "running"
+    assert journal.get("dead").state == "unknown"
+
+
+def test_fenced_reconcile_skips_live_owner(db):
+    journal = _journal(db)
+    journal.create(operation_id="live", kind="async_delegation")
+    journal.transition(
+        "live",
+        from_states={"pending"},
+        to_state="running",
+        effect_disposition="none",
+    )
+
+    assert journal.reconcile_after_restart(owner_fenced=True) == 0
+    assert journal.get("live").state == "running"

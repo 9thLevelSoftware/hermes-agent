@@ -30,6 +30,7 @@ from utils import base_url_host_matches
 
 
 _PROVIDER_ENV_HINTS = (
+    "DEEPINFRA_API_KEY",
     "OPENROUTER_API_KEY",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -274,13 +275,6 @@ def _render_toolset_health_rows(registry) -> int:
 
 
 def _read_pyproject_version() -> str | None:
-    """Read the ``version = "..."`` from ``pyproject.toml`` at the project root.
-
-    Returns None when running from an installed wheel (no pyproject.toml ships
-    with the package) or when the file can't be parsed. Reads only the
-    ``[project]`` version, ignoring any version strings that appear in other
-    tables.
-    """
     """Read the ``version = "..."`` from ``pyproject.toml`` at the project root.
 
     Returns None when running from an installed wheel (no pyproject.toml ships
@@ -904,6 +898,10 @@ def run_doctor(args):
                 # (accounts/fireworks/models/... and .../routers/...), so a "/"
                 # is expected, not an aggregator vendor prefix.
                 "fireworks",
+                # DeepInfra is an aggregator-style gateway: its catalog
+                # is exclusively ``vendor/model`` slugs (Qwen/Qwen3.5-…,
+                # meta-llama/Llama-3-…, anthropic/claude-opus-4-7, …).
+                "deepinfra",
             }
             provider_accepts_vendor_slug = (
                 provider_policy_id in providers_accepting_vendor_slugs

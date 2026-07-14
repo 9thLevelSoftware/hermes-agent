@@ -74,6 +74,7 @@ class TestInterruptForSession:
         with ad._records_lock:
             ad._records[delegation_id] = {
                 "delegation_id": delegation_id,
+                "_home": str(ad._records_path().parent),
                 "status": status,
                 "session_key": session_key,
                 "origin_ui_session_id": origin_ui_session_id,

@@ -484,6 +484,31 @@ def test_complete_rejects_non_list_artifacts(worker_env):
     assert "artifacts must be a list" in err
 
 
+def test_complete_missing_scratch_artifact_stays_in_flight(worker_env):
+    """A false deliverable claim must return retry guidance, not mark Done."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, worker_env, workspace)
+
+    output = kt._handle_complete({
+        "summary": "report complete",
+        "artifacts": [str(workspace / "missing-report.md")],
+    })
+    error = json.loads(output).get("error", "")
+
+    assert "could not preserve" in error
+    assert "still in-flight" in error
+    assert "retry kanban_complete" in error
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+    assert workspace.exists()
+
+
 def test_complete_rejects_no_handoff(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({})
@@ -1456,6 +1481,120 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     assert 1_500 < len(KANBAN_GUIDANCE) < 5_500, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
+
+
+def test_kanban_orchestrator_guidance_not_worker_language(monkeypatch, tmp_path):
+    """An orchestrator session (kanban toolset, no HERMES_KANBAN_TASK) must
+    NOT receive worker-only language like "You have been assigned ONE task"
+    or the implicit no-argument ``kanban_show()`` instruction.
+
+    It should receive the concise orchestrator hint that directs board
+    review to ``kanban_list`` with an explicit board.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("toolsets:\n  - kanban\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from tools.registry import invalidate_check_fn_cache
+    from model_tools import _clear_tool_defs_cache
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+    from run_agent import AIAgent
+    a = AIAgent(
+        api_key="test",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    prompt = a._build_system_prompt()
+    # Worker-only language must be absent
+    assert "You have been assigned ONE task" not in prompt
+    assert "Kanban task execution protocol" not in prompt
+    # Orchestrator hint must be present
+    assert "Kanban orchestrator mode" in prompt
+    assert "kanban_list" in prompt
+    # Must NOT tell the model to call kanban_show() with no args
+    assert "kanban_show() first" not in prompt
+
+
+def test_kanban_orchestrator_guidance_size_bounded():
+    """The orchestrator guidance block stays lean."""
+    from agent.prompt_builder import KANBAN_ORCHESTRATOR_GUIDANCE
+    assert 200 < len(KANBAN_ORCHESTRATOR_GUIDANCE) < 2_000, (
+        f"KANBAN_ORCHESTRATOR_GUIDANCE is {len(KANBAN_ORCHESTRATOR_GUIDANCE)} chars — "
+        "too short (missing?) or too long"
+    )
+
+
+def test_kanban_normal_session_no_kanban_block(monkeypatch, tmp_path):
+    """A normal chat session (no kanban toolset, no HERMES_KANBAN_TASK)
+    must not receive either the worker or orchestrator guidance block."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    # No toolsets config — no kanban tools at all
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from tools.registry import invalidate_check_fn_cache
+    from model_tools import _clear_tool_defs_cache
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+    from run_agent import AIAgent
+    a = AIAgent(
+        api_key="test",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    prompt = a._build_system_prompt()
+    assert "Kanban task execution protocol" not in prompt
+    assert "Kanban orchestrator mode" not in prompt
+    assert "kanban_show()" not in prompt
+    assert "kanban_list" not in prompt
+
+
+def test_kanban_worker_gets_full_guidance(monkeypatch, tmp_path):
+    """A dispatcher-spawned worker (HERMES_KANBAN_TASK set) still receives
+    the full KANBAN_GUIDANCE lifecycle block, including kanban_show() first
+    and the completion/block handoff rules."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from tools.registry import invalidate_check_fn_cache
+    from model_tools import _clear_tool_defs_cache
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+    from run_agent import AIAgent
+    a = AIAgent(
+        api_key="test",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    prompt = a._build_system_prompt()
+    assert "Kanban task execution protocol" in prompt
+    assert "kanban_show()" in prompt
+    assert "kanban_complete" in prompt
+    assert "kanban_block" in prompt
+    assert "kanban_create" in prompt
+    # Must NOT get the orchestrator hint
+    assert "Kanban orchestrator mode" not in prompt
 
 
 # ---------------------------------------------------------------------------

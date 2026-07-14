@@ -516,10 +516,13 @@ def test_capabilities_endpoint_lists_implemented_and_unsupported_primitives(clie
 
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["triggers"]["implemented"] == ["manual", "schedule"]
-    assert "webhook" in body["triggers"]["unsupported"]
+    assert "manual" in body["triggers"]["implemented"]
+    assert "schedule" in body["triggers"]["implemented"]
+    assert "webhook" in body["triggers"]["implemented"]
+    assert "kanban_event" in body["triggers"]["implemented"]
     assert "agent_task" in body["nodes"]["implemented"]
-    assert "send_message" in body["nodes"]["unsupported"]
+    assert "send_message" in body["nodes"]["implemented"]
+    assert "subworkflow" in body["nodes"]["implemented"]
 
 
 def test_status_endpoint_reports_dispatcher_config(client, monkeypatch):
@@ -2100,9 +2103,10 @@ def test_dashboard_bundle_is_prompt_first_not_yaml_first():
     assert "Generate From Prompt" in bundle
     assert "Advanced YAML" in bundle or "YAML" in bundle
     assert "Validate / deploy definition" not in bundle
-    # In the 3-zone layout, goal builder is in the sidebar which renders before the canvas
-    assert render_tree.index("renderSidebar()") < render_tree.index(
-        "renderBottomPanel()"
+    # AI-first creation remains in the palette, which renders before the
+    # extracted bottom drawer in the canvas-first layout.
+    assert render_tree.index("renderPalette(") < render_tree.index(
+        "renderBottomPanelModule("
     )
     assert bundle.index("New workflow") < bundle.index("renderBuilderToolbar")
 
@@ -2123,7 +2127,7 @@ def test_dashboard_bundle_wires_draft_refine_before_advanced_yaml():
     assert 'setRefineText("")' in bundle
     assert "nodeSummaryRows" in bundle
     # In the 3-zone layout, draft review is in the bottom panel which renders before advanced YAML
-    assert render_tree.index("renderBottomPanel()") < render_tree.index(
+    assert render_tree.index("renderBottomPanelModule(") < render_tree.index(
         "renderAdvancedYaml()"
     )
 
@@ -2249,8 +2253,11 @@ def test_dashboard_bundle_contains_visual_editor_markers():
     bundle = (PLUGIN_DIR / "src" / "app.js").read_text(encoding="utf-8")
     assert "SDK.ReactFlow" in bundle or "SDK.reactFlow" in bundle
     assert "ReactFlowProvider" in bundle
-    for marker in ["Background", "Controls", "MiniMap", "Handle", "Position"]:
+    for marker in ["Controls", "MiniMap", "Handle", "Position"]:
         assert marker in bundle
+    css = (PLUGIN_DIR / "style.css").read_text(encoding="utf-8") if (PLUGIN_DIR / "style.css").exists() else (PLUGIN_DIR / "src" / "style.css").read_text(encoding="utf-8")
+    assert "react-flow__pane" in css
+    assert "linear-gradient(to right" in css
     for marker in ["upsertSpecEdge", "Connection added to workflow draft"]:
         assert marker in bundle
 

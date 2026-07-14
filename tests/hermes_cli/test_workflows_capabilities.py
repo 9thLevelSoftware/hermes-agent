@@ -34,7 +34,8 @@ def test_capabilities_match_workflows_spec_literals():
 
 def test_capabilities_payload_is_dashboard_friendly():
     payload = workflow_capabilities()
-    assert payload["triggers"]["implemented"] == sorted(IMPLEMENTED_TRIGGER_TYPES)
+    assert payload["triggers"]["implemented"] == sorted(DECLARED_TRIGGER_TYPES)
+    assert payload["nodes"]["implemented"] == sorted(DECLARED_NODE_TYPES)
     assert payload["nodes"]["unsupported"] == sorted(UNSUPPORTED_NODE_TYPES)
     assert payload["assistant"]["allowed_triggers"] == sorted(IMPLEMENTED_TRIGGER_TYPES)
     assert payload["assistant"]["allowed_nodes"] == sorted(IMPLEMENTED_NODE_TYPES)

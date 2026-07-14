@@ -1385,13 +1385,13 @@ def _build_child_agent(
                 child_cleanup_closed_db = (
                     getattr(child, "_session_db", None) is child_session_db
                     and bool(getattr(child, "_session_db_closed", False))
-                ) or getattr(child_session_db, "_conn", "missing") is None
+                ) or not getattr(child_session_db, "is_open", True)
         except Exception:
             pass
         if (
             child_session_db is not None
             and not child_cleanup_closed_db
-            and getattr(child_session_db, "_conn", "missing") is not None
+            and getattr(child_session_db, "is_open", True)
         ):
             try:
                 child_session_db.close()
@@ -1412,6 +1412,7 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._delegate_progress_callback = child_progress_cb
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
@@ -2907,21 +2908,72 @@ def delegate_task(
             _origin_ui_session_id = ""
         _parent_session_id = getattr(parent_agent, "session_id", None)
         _child_agents = [c for (_, _, c) in children]
+        _child_session_ids = [
+            str(getattr(child, "session_id", "") or "")
+            for child in _child_agents
+            if getattr(child, "session_id", None)
+        ]
 
-        # Detach every child from the parent's interrupt-propagation list — the
-        # batch's lifecycle is owned by the async registry now, not the parent
-        # turn. _build_child_agent attached them (correct for sync runs).
-        if hasattr(parent_agent, "_active_children"):
-            _ac_lock = getattr(parent_agent, "_active_children_lock", None)
-            for _c in _child_agents:
-                try:
-                    if _ac_lock:
-                        with _ac_lock:
-                            parent_agent._active_children.remove(_c)
-                    else:
-                        parent_agent._active_children.remove(_c)
-                except ValueError:
-                    pass
+        def _detach_children(*, close: bool = False) -> None:
+            if hasattr(parent_agent, "_active_children"):
+                lock = getattr(parent_agent, "_active_children_lock", None)
+                for child in _child_agents:
+                    try:
+                        if lock:
+                            with lock:
+                                parent_agent._active_children.remove(child)
+                        else:
+                            parent_agent._active_children.remove(child)
+                    except ValueError:
+                        pass
+                    if close:
+                        try:
+                            if hasattr(child, "close"):
+                                child.close()
+                        except Exception:
+                            logger.debug("Failed to close rejected child agent")
+
+        def _reject_unstarted_children(error: str) -> None:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+            except Exception:
+                _invoke_hook = None
+            for child in _child_agents:
+                callback = getattr(child, "_delegate_progress_callback", None)
+                if callable(callback):
+                    try:
+                        callback(
+                            "subagent.complete",
+                            preview=error,
+                            status="failed",
+                            duration_seconds=0,
+                            summary=error,
+                        )
+                    except Exception:
+                        logger.debug("Rejected child completion relay failed")
+                if _invoke_hook is not None:
+                    try:
+                        _invoke_hook(
+                            "subagent_stop",
+                            parent_session_id=_parent_session_id,
+                            parent_turn_id=getattr(
+                                parent_agent, "_current_turn_id", ""
+                            ) or "",
+                            child_session_id=getattr(child, "session_id", None),
+                            child_role=getattr(child, "_delegate_role", None),
+                            child_summary=error,
+                            child_status="error",
+                            duration_ms=0,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Rejected child subagent_stop hook failed",
+                            exc_info=True,
+                        )
+                subagent_id = getattr(child, "_subagent_id", None)
+                if subagent_id:
+                    _unregister_subagent(subagent_id)
+            _detach_children(close=True)
 
         def _batch_runner():
             return _execute_and_aggregate()
@@ -2948,12 +3000,16 @@ def delegate_task(
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             parent_session_id=_parent_session_id,
+            child_session_ids=_child_session_ids,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
         )
 
         if dispatch.get("status") == "dispatched":
+            # The async registry now owns cancellation. Detach only after the
+            # durable dispatch is accepted; the worker closes children later.
+            _detach_children()
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -2977,9 +3033,26 @@ def delegate_task(
             }
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        if dispatch.get("reason") != "capacity":
+            _reject_unstarted_children(
+                dispatch.get("error", "Background dispatch failed.")
+            )
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "mode": "background",
+                    "error": dispatch.get("error", "Background dispatch failed."),
+                    "reason": dispatch.get("reason", "dispatch"),
+                    "note": (
+                        "The background delegation was not started. Its unstarted "
+                        "child resources were released safely."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        # Pool at capacity — keep the parent-owned children attached while the
+        # batch runs synchronously.
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
             "batch synchronously instead.",

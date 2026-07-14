@@ -302,6 +302,42 @@ class TestMemoryStoreAdd:
         assert "usage" in result
         assert "retry" in result["error"].lower()
 
+    def test_add_archives_oldest_entries_when_enabled(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        rotating = MemoryStore(
+            memory_char_limit=50,
+            user_char_limit=50,
+            archive_on_overflow=True,
+        )
+        rotating.load_from_disk()
+        first = "a" * 20
+        second = "b" * 20
+        newest = "c" * 20
+        assert rotating.add("memory", first)["success"] is True
+        assert rotating.add("memory", second)["success"] is True
+
+        result = rotating.add("memory", newest)
+
+        assert result["success"] is True
+        assert result["archived_entries"] == 1
+        assert rotating.memory_entries == [second, newest]
+        assert MemoryStore._read_file(tmp_path / "archive" / "MEMORY.md") == [first]
+
+    def test_add_does_not_archive_when_one_entry_cannot_fit(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        rotating = MemoryStore(
+            memory_char_limit=10,
+            user_char_limit=10,
+            archive_on_overflow=True,
+        )
+        rotating.load_from_disk()
+
+        result = rotating.add("memory", "x" * 11)
+
+        assert result["success"] is False
+        assert rotating.memory_entries == []
+        assert not (tmp_path / "archive" / "MEMORY.md").exists()
+
     def test_replace_exceeding_limit_returns_consolidation_context(self, store):
         # A replace that blows the budget should mirror the add-overflow shape:
         # echo current_entries + usage and tell the model to retry in-turn.
@@ -659,6 +695,31 @@ class TestMemoryBatch:
         assert "limit" in result["error"].lower()
         assert len(store.memory_entries) == 0
 
+    def test_batch_archives_oldest_entries_when_enabled(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        rotating = MemoryStore(
+            memory_char_limit=50,
+            user_char_limit=50,
+            archive_on_overflow=True,
+        )
+        rotating.load_from_disk()
+        first = "a" * 20
+        second = "b" * 20
+        newest = "c" * 20
+        rotating.add("memory", first)
+        rotating.add("memory", second)
+
+        result = json.loads(memory_tool(
+            target="memory",
+            operations=[{"action": "add", "content": newest}],
+            store=rotating,
+        ))
+
+        assert result["success"] is True
+        assert result["archived_entries"] == 1
+        assert rotating.memory_entries == [second, newest]
+        assert MemoryStore._read_file(tmp_path / "archive" / "MEMORY.md") == [first]
+
     def test_batch_duplicate_add_is_noop_not_failure(self, store):
         store.add("memory", "already here")
         result = json.loads(memory_tool(
@@ -757,6 +818,19 @@ class TestExternalDriftGuard:
         updated = path.read_text(encoding="utf-8")
         assert "New entry under drift." in updated
         assert "extra content no delimiter" in updated
+
+    def test_rotation_refuses_to_rewrite_external_drift(self, store):
+        store.archive_on_overflow = True
+        store.add("memory", "Existing entry.")
+        path = self._plant_drift(store)
+        original = path.read_text(encoding="utf-8")
+
+        result = store.add("memory", "New durable fact.")
+
+        assert result["success"] is False
+        assert "drift_backup" in result
+        assert path.read_text(encoding="utf-8") == original
+        assert not store._archive_path("memory").exists()
 
     def test_remove_refuses_on_drift(self, store):
         store.add("memory", "Target entry to remove.")

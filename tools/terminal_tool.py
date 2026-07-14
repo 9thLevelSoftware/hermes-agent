@@ -2303,6 +2303,8 @@ def terminal_tool(
                             )
                             if key in approval
                         },
+                        "smart_denied": approval.get("smart_denied", False),
+                        "allow_permanent": approval.get("allow_permanent", True),
                     }, ensure_ascii=False)
                 # Command was blocked
                 desc = approval.get("description", "command flagged")

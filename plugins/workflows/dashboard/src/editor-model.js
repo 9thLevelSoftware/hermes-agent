@@ -1,8 +1,8 @@
 // Pure form conversions for the workflow editor. No DOM, no React, no side-effects.
 // Shared by app.js inspector renderers and editor-model.test.js.
 
-export var SUPPORTED_TRIGGERS = ["manual", "schedule"];
-export var SUPPORTED_NODES = ["agent_task", "fail", "join", "parallel", "pass", "switch", "wait"];
+export var SUPPORTED_TRIGGERS = ["manual", "schedule", "webhook", "kanban_event"];
+export var SUPPORTED_NODES = ["agent_task", "fail", "join", "parallel", "pass", "switch", "wait", "send_message", "subworkflow"];
 export var SUPPORTED_INTAKE_MODES = ["continuous", "single"];
 export var RESULT_CONTRACT_PRIMITIVES = ["string", "number", "boolean", "array", "object"];
 export var CONDITION_OPS = ["eq", "ne", "gt", "gte", "lt", "lte", "exists", "missing", "contains", "starts_with", "ends_with"];
@@ -17,6 +17,8 @@ var NODE_TYPE_FIELDS = {
   fail: ["output"],
   parallel: [],
   join: [],
+  send_message: ["target", "message_text", "platform"],
+  subworkflow: ["workflow_ref", "input_mapping"],
 };
 
 export function supportedEditorCoverage() {
@@ -25,6 +27,13 @@ export function supportedEditorCoverage() {
     nodes: SUPPORTED_NODES.slice(),
     intakeModes: SUPPORTED_INTAKE_MODES.slice(),
   };
+}
+
+export function defaultTriggerForType(type, triggerId) {
+  var trigger = { type: type, id: triggerId };
+  if (type === "schedule") trigger.schedule = "0 9 * * *";
+  else if (type === "webhook") trigger.path = "/webhook/" + triggerId;
+  return trigger;
 }
 
 export function editorSections(spec) {
@@ -82,6 +91,13 @@ export function changeNodeType(spec, nodeId, nextType) {
     if (!node.cases) node.cases = [];
   } else if (nextType === "pass") {
     if (!node.output) node.output = {};
+  } else if (nextType === "send_message") {
+    if (node.target === undefined) node.target = "";
+    if (node.message_text === undefined) node.message_text = "";
+    if (node.platform === undefined) node.platform = "telegram";
+  } else if (nextType === "subworkflow") {
+    if (node.workflow_ref === undefined) node.workflow_ref = "";
+    if (node.input_mapping === undefined) node.input_mapping = {};
   }
 
   return { spec: next, removedFields: removedFields.sort() };
