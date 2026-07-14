@@ -359,12 +359,37 @@ def test_idle_reaper_expires_kernel_without_registry_access_after_wait():
         pid = kernel.process.pid
         tmpdir = kernel._tmpdir
 
-        time.sleep(0.5)
-        assert not psutil.pid_exists(pid)
-        assert not os.path.exists(tmpdir)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not psutil.pid_exists(pid) and not os.path.exists(tmpdir):
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("Kernel process did not terminate or clean up within timeout")
     finally:
         registry.close_all()
         code_execution_tool._kernel_registry = old_registry
+
+
+def test_new_kernel_preserves_active_tool_definitions():
+    registry = ExecutionKernelRegistry()
+    definitions = [{
+        "type": "function",
+        "function": {"name": "kernel_fixture", "parameters": {}},
+    }]
+    try:
+        kernel = registry.get_or_create(
+            "kernel-definitions",
+            "persistent",
+            frozenset({"kernel_fixture"}),
+            code_execution_tool.CodeExecutionContext(
+                "kernel-definitions", "session", (), (),
+            ),
+            active_tool_definitions=definitions,
+        )
+        assert kernel.active_tool_definitions == definitions
+    finally:
+        registry.close_all()
 
 
 def test_cleanup_is_task_scoped_idempotent_and_reaps_children():

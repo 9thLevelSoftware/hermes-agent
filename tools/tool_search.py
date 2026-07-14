@@ -662,7 +662,7 @@ def scoped_tool_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     return frozenset(
         name
         for td in tool_defs
-        if (name := (td.get("function") or {}).get("name", ""))
+        if (name := (td.get("function") or td).get("name", ""))
     )
 
 

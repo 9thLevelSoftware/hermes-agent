@@ -185,6 +185,14 @@ def _scriptable_tool_names(
     return names - SCRIPT_DENIED_TOOLS
 
 
+def _tool_definition_name(item: Any) -> str:
+    """Extract a name from either a wrapped or flat tool definition."""
+    if not isinstance(item, dict):
+        return ""
+    definition = item.get("function") or item
+    return str(definition.get("name", "")) if isinstance(definition, dict) else ""
+
+
 def _script_tool_surface(
     enabled_tools: Optional[Iterable[str]],
     enabled_toolsets: Optional[Iterable[str]],
@@ -227,11 +235,7 @@ def _script_tool_surface(
             quiet_mode=True,
             skip_tool_search_assembly=True,
         )
-        requested = {
-            str(item.get("function", {}).get("name", ""))
-            for item in definitions
-            if isinstance(item, dict) and isinstance(item.get("function"), dict)
-        }
+        requested = {_tool_definition_name(item) for item in definitions}
     else:
         requested = set(SANDBOX_ALLOWED_TOOLS)
 
@@ -247,7 +251,7 @@ def _script_tool_surface(
     definitions = [
         item for item in definitions
         if isinstance(item, dict)
-        and str((item.get("function") or {}).get("name", "")) in requested
+        and _tool_definition_name(item) in requested
     ]
     return requested, definitions
 
@@ -272,7 +276,7 @@ def _legacy_generation_needed(
     if enabled_toolsets or disabled_toolsets:
         return False
     available = {
-        str((item.get("function") or {}).get("name", ""))
+        _tool_definition_name(item)
         for item in (active_tool_definitions or ())
         if isinstance(item, dict)
     }
@@ -403,7 +407,7 @@ def _dispatch_catalog_action(
         if err or not underlying_name:
             return {"error": err or "tool_call could not be resolved"}
         scoped_names = {
-            str((item.get("function") or {}).get("name", ""))
+            _tool_definition_name(item)
             for item in current_defs
             if isinstance(item, dict)
         }
@@ -412,6 +416,27 @@ def _dispatch_catalog_action(
             or underlying_name in SCRIPT_DENIED_TOOLS
         ):
             return {"error": f"'{underlying_name}' is not available in this session."}
+        operation_metadata = _operation_metadata_for(underlying_name)
+        decision = _script_operation_decision(underlying_name, operation_metadata)
+        if decision == "deny":
+            return {
+                "error": f"Tool '{underlying_name}' is not available to execute_code scripts."
+            }
+        if decision == "approval_required":
+            try:
+                from hermes_cli.plugins import has_middleware
+                has_approval_middleware = has_middleware("tool_execution")
+            except Exception:
+                has_approval_middleware = False
+            if not has_approval_middleware:
+                return {
+                    "status": "approval_required",
+                    "tool_name": underlying_name,
+                    "requester": context.session_id or "",
+                    "task_id": context.task_id,
+                    "session_id": context.session_id,
+                    "operation_metadata": operation_metadata,
+                }
     if context.session_id is not None:
         dispatch_kwargs["session_id"] = context.session_id
     if context.enabled_toolsets:
@@ -610,6 +635,16 @@ def _image_parts_from_output(output: str) -> list[dict]:
             part = normalize_image_artifact(candidate)
             if part and part not in parts:
                 parts.append(part)
+    # A bounded stdout result may contain a truncation marker in the middle of
+    # an otherwise valid JSON value. Scan the retained text for complete data
+    # URLs as a fallback so an image in the retained head or tail is not lost.
+    for match in re.finditer(
+        r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=_-]+",
+        output,
+    ):
+        part = normalize_image_artifact(match.group(0))
+        if part and part not in parts:
+            parts.append(part)
     return parts
 
 
@@ -884,6 +919,7 @@ def _prepare_execute_output(
     limit: int,
     *,
     budget: Optional[ArtifactBudget] = None,
+    already_truncated: bool = False,
 ) -> tuple[str, Optional[str], list[dict]]:
     """Clean output, preserve images, and spill oversized text before truncating."""
     cleaned = _clean_execute_text(text)
@@ -895,7 +931,8 @@ def _prepare_execute_output(
     artifact_path = None
     if len(cleaned) > limit:
         artifact_path = _persist_execute_artifact(cleaned, budget=budget)
-        cleaned = _truncate_execute_output(cleaned, limit)
+        if not already_truncated:
+            cleaned = _truncate_execute_output(cleaned, limit)
     return cleaned, artifact_path, image_parts
 
 
@@ -1248,9 +1285,7 @@ def _normalize_tool_definitions(value: Any) -> List[dict]:
             else:
                 function["parameters"] = {"type": "object", "properties": {}}
         normalized.append({"type": "function", "function": function})
-    return sorted(normalized, key=lambda item: str(
-        (item.get("function") or {}).get("name", "")
-    ))
+    return sorted(normalized, key=_tool_definition_name)
 
 
 def _sanitize_registry_definitions(definitions: List[dict]) -> List[dict]:
@@ -1444,7 +1479,7 @@ def generate_hermes_tools_module(
         definitions = _sanitize_registry_definitions(definitions)
         definitions = [
             item for item in definitions
-            if str((item.get("function") or {}).get("name", ""))
+            if _tool_definition_name(item)
             not in SCRIPT_DENIED_TOOLS | SCRIPT_INTERNAL_TOOLS
         ]
         used_names: set[str] = {
@@ -2919,12 +2954,12 @@ class ExecutionKernelRegistry:
             kernel = self._kernels.get(key)
             if kernel is not None and kernel.alive:
                 incoming_names = {
-                    str((item.get("function") or {}).get("name", ""))
+                    _tool_definition_name(item)
                     for item in (active_tool_definitions or [])
                     if isinstance(item, dict)
                 }
                 existing_names = {
-                    str((item.get("function") or {}).get("name", ""))
+                    _tool_definition_name(item)
                     for item in (kernel.active_tool_definitions or [])
                     if isinstance(item, dict)
                 }
@@ -2943,6 +2978,7 @@ class ExecutionKernelRegistry:
                 kernel.close()
             kernel = ExecutionKernel(
                 key[0], key[1], sandbox_tools, context,
+                active_tool_definitions=active_tool_definitions,
                 idle_ttl=self.idle_ttl if idle_ttl is None else idle_ttl,
                 max_tool_calls=max_tool_calls,
                 max_stdout_bytes=max_stdout_bytes,
@@ -3489,8 +3525,8 @@ def execute_code(
         deadline = time.monotonic() + timeout
         stderr_chunks: list = []
 
-        # Background readers avoid pipe-buffer deadlocks. Keep complete stdout
-        # so a redacted copy can be persisted before the display value is capped.
+        # Background readers avoid pipe-buffer deadlocks. Keep only a bounded
+        # head and rolling tail so an unbounded script cannot exhaust memory.
         def _drain(pipe, chunks, max_bytes):
             """Head-only drain for stderr."""
             total = 0
@@ -3506,19 +3542,53 @@ def execute_code(
             except (ValueError, OSError) as e:
                 logger.debug("Error reading process output: %s", e, exc_info=True)
 
-        def _drain_full(pipe, chunks):
+        _stdout_head_bytes = int(max_stdout_bytes * 0.4)
+        _stdout_tail_bytes = max_stdout_bytes - _stdout_head_bytes
+        stdout_total_bytes = [0]
+
+        def _drain_head_tail(pipe, head_chunks, tail_chunks, head_bytes, tail_bytes, total_ref):
+            """Drain stdout while retaining bounded head and tail data."""
+            head_collected = 0
+            from collections import deque
+            tail_buf = deque()
+            tail_collected = 0
             try:
                 while True:
                     data = pipe.read(4096)
                     if not data:
                         break
-                    chunks.append(data)
+                    total_ref[0] += len(data)
+                    if head_collected < head_bytes:
+                        keep = min(len(data), head_bytes - head_collected)
+                        head_chunks.append(data[:keep])
+                        head_collected += keep
+                        data = data[keep:]
+                        if not data:
+                            continue
+                    tail_buf.append(data)
+                    tail_collected += len(data)
+                    while tail_collected > tail_bytes and tail_buf:
+                        overflow = tail_collected - tail_bytes
+                        oldest = tail_buf[0]
+                        if len(oldest) <= overflow:
+                            tail_buf.popleft()
+                            tail_collected -= len(oldest)
+                        else:
+                            tail_buf[0] = oldest[overflow:]
+                            tail_collected -= overflow
             except (ValueError, OSError) as e:
                 logger.debug("Error reading process output: %s", e, exc_info=True)
+            tail_chunks.extend(tail_buf)
 
-        stdout_full_chunks: list = []
+        stdout_head_chunks: list = []
+        stdout_tail_chunks: list = []
         stdout_reader = threading.Thread(
-            target=_drain_full, args=(proc.stdout, stdout_full_chunks), daemon=True,
+            target=_drain_head_tail,
+            args=(
+                proc.stdout, stdout_head_chunks, stdout_tail_chunks,
+                _stdout_head_bytes, _stdout_tail_bytes, stdout_total_bytes,
+            ),
+            daemon=True,
         )
         stderr_reader = threading.Thread(
             target=_drain, args=(proc.stderr, stderr_chunks, max_stderr_bytes), daemon=True
@@ -3563,12 +3633,26 @@ def execute_code(
         stdout_reader.join(timeout=3)
         stderr_reader.join(timeout=3)
 
-        stdout_full = b"".join(stdout_full_chunks).decode("utf-8", errors="replace")
+        stdout_head = b"".join(stdout_head_chunks).decode("utf-8", errors="replace")
+        stdout_tail = b"".join(stdout_tail_chunks).decode("utf-8", errors="replace")
+        if stdout_total_bytes[0] > max_stdout_bytes:
+            omitted = stdout_total_bytes[0] - len(stdout_head) - len(stdout_tail)
+            stdout_full = (
+                stdout_head
+                + f"\n\n... [OUTPUT TRUNCATED - {omitted:,} chars omitted "
+                f"out of {stdout_total_bytes[0]:,} total] ...\n\n"
+                + stdout_tail
+            )
+        else:
+            stdout_full = stdout_head + stdout_tail
         stderr_text = _clean_execute_text(
             b"".join(stderr_chunks).decode("utf-8", errors="replace")
         )
         stdout_text, stdout_artifact_path, stdout_image_parts = _prepare_execute_output(
-            stdout_full, max_stdout_bytes, budget=context.artifact_budget,
+            stdout_full,
+            max_stdout_bytes,
+            budget=context.artifact_budget,
+            already_truncated=stdout_total_bytes[0] > max_stdout_bytes,
         )
 
         exit_code = proc.returncode if proc.returncode is not None else -1

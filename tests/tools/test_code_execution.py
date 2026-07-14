@@ -137,7 +137,9 @@ def _dispatch_script(code, context, definitions):
         artifact_roots=(tmpdir, artifact_dir),
         artifact_budget=ArtifactBudget(),
     )
-    sock_path = os.path.join("/tmp", f"hermes_code_mode_{uuid.uuid4().hex}.sock")
+    sock_path = os.path.join(
+        tempfile.gettempdir(), f"hermes_code_mode_{uuid.uuid4().hex}.sock",
+    )
     server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server_sock.bind(sock_path)
     server_sock.listen(1)
@@ -445,6 +447,71 @@ print(json.dumps([
         finally:
             registry.deregister(safe_name)
             registry.deregister(unsafe_name)
+
+    def test_catalog_bridge_requires_approval_for_destructive_tool_without_middleware(
+        self, monkeypatch,
+    ):
+        from tools.registry import registry
+
+        tool_name = "code_mode_catalog_destructive"
+        called = []
+
+        def handler(args, **kwargs):
+            called.append((dict(args), dict(kwargs)))
+            return json.dumps({"ok": True})
+
+        registry.register(
+            tool_name,
+            "mcp-code-mode-catalog-destructive",
+            _fixture_definition(tool_name),
+            handler,
+            read_only=False,
+            destructive=True,
+            idempotent=False,
+        )
+        try:
+            monkeypatch.setattr(
+                "hermes_cli.plugins.get_plugin_manager",
+                lambda: SimpleNamespace(_middleware={}),
+            )
+            context = CodeExecutionContext(
+                "catalog-approval-task",
+                "catalog-approval-session",
+                (),
+                (),
+                allowed_tools=(tool_name,),
+            )
+            result = _dispatch_script_call(
+                "__code_mode_catalog__",
+                {
+                    "action": "tool_call",
+                    "arguments": {"name": tool_name, "arguments": {"value": "secret"}},
+                },
+                context,
+            )
+
+            assert result == {
+                "status": "approval_required",
+                "tool_name": tool_name,
+                "requester": "catalog-approval-session",
+                "task_id": "catalog-approval-task",
+                "session_id": "catalog-approval-session",
+                "operation_metadata": {
+                    "read_only": False,
+                    "destructive": True,
+                    "idempotent": False,
+                },
+            }
+            assert called == []
+        finally:
+            registry.deregister(tool_name)
+
+    def test_scoped_tool_names_accepts_flat_definitions(self):
+        from tools.tool_search import scoped_tool_names
+
+        assert scoped_tool_names([_fixture_definition("flat_fixture")]) == {
+            "flat_fixture",
+        }
 
 
 class TestSandboxRequirements(unittest.TestCase):
@@ -1991,7 +2058,7 @@ def test_execute_code_spills_redacted_large_output_to_durable_file(tmp_path, mon
     assert result["truncated"] is True
     artifact_path = result["artifact_path"]
     assert os.path.isfile(artifact_path)
-    artifact = open(artifact_path, encoding="utf-8").read()
+    artifact = Path(artifact_path).read_text(encoding="utf-8")
     assert "TOP_SECRET" not in artifact
     assert "[REDACTED]" in artifact
     assert len(result["output"]) < 2000
