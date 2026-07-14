@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import sys
 
 from hermes_cli.status import show_status
 
@@ -132,6 +133,88 @@ def test_show_status_reports_nous_inference_key_without_portal_login(monkeypatch
     assert "Nous Portal   ✗ not logged in (Nous inference key configured)" in output
     assert "Inference:  https://inference.example.com/v1" in output
     assert "Nous inference credentials are configured" in output
+
+
+# ---------------------------------------------------------------------------
+# Capability Health (status-side renderer)
+# ---------------------------------------------------------------------------
+
+def _dummy_runtime_registry(entries):
+    from types import SimpleNamespace
+    return SimpleNamespace(get_runtime_health=lambda: dict(entries))
+
+
+class TestStatusToolsetHealthRows:
+    """Status surface for ``registry.get_runtime_health()``."""
+
+    def test_status_includes_capability_health_section(self, monkeypatch, capsys, tmp_path):
+        from hermes_cli import status as status_mod
+
+        _base_xai_mocks(monkeypatch, tmp_path)
+        monkeypatch.setitem(
+            sys.modules,
+            "tools.registry",
+            SimpleNamespace(registry=_dummy_runtime_registry({
+                "toolset:telegram": {
+                    "state": "open_circuit",
+                    "suppressed_failures": 4,
+                    "next_probe_at": 1234567890.0,
+                },
+            })),
+        )
+
+        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        out = capsys.readouterr().out
+
+        assert "◆ Capability Health" in out
+        assert "telegram" in out
+        assert "state=open_circuit" in out
+        assert "suppressed=4" in out
+
+    def test_status_with_all_healthy_shows_check_mark(self, monkeypatch, capsys, tmp_path):
+        from hermes_cli import status as status_mod
+
+        _base_xai_mocks(monkeypatch, tmp_path)
+        monkeypatch.setitem(
+            sys.modules,
+            "tools.registry",
+            SimpleNamespace(registry=_dummy_runtime_registry({
+                "toolset:discord": {"state": "healthy", "suppressed_failures": 0, "next_probe_at": 0.0},
+            })),
+        )
+
+        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        out = capsys.readouterr().out
+
+        assert "◆ Capability Health" in out
+        assert "All toolsets:" in out
+
+    def test_status_health_section_does_not_crash_on_broken_registry(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        from hermes_cli import status as status_mod
+
+        _base_xai_mocks(monkeypatch, tmp_path)
+
+        class _Boom:
+            def get_runtime_health(self):
+                raise RuntimeError("nope")
+
+        monkeypatch.setitem(
+            sys.modules,
+            "tools.registry",
+            SimpleNamespace(registry=_Boom()),
+        )
+
+        # Inner renderer swallows the failure → show_status proceeds and
+        # reports "all toolsets healthy" rather than crashing.
+        status_mod.show_status(SimpleNamespace(all=False, deep=False))
+        out = capsys.readouterr().out
+
+        assert "◆ Capability Health" in out
+        # The renderer defensively returned 0 on the raising registry, so
+        # the "all healthy" line is what the user sees.
+        assert "All toolsets:" in out
 
 
 # ---------------------------------------------------------------------------

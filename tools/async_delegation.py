@@ -87,6 +87,163 @@ _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
 _DB_LOCK = threading.Lock()
 
+# Durable operation journal is cached per Hermes profile, not process-wide.
+# ponytail: one lazy journal per profile avoids cross-profile state bleed without
+# adding a broader lifecycle manager.
+_journal_lock = threading.Lock()
+_journal_cache: Dict[str, Any] = {}
+_journal_override: Any = None
+_journal_override_enabled = False
+_restored_ids: set[str] = set()
+_restored_lock = threading.Lock()
+_KIND = "async_delegation"
+_STATUS_MAP = {
+    "completed": ("confirmed", "none"),
+    "success": ("confirmed", "none"),
+    "error": ("failed", "none"),
+    "failed": ("failed", "none"),
+    "interrupted": ("cancelled", "none"),
+    "cancelled": ("cancelled", "none"),
+}
+
+
+def _open_journal():
+    if _journal_override_enabled:
+        return _journal_override
+    profile = str(get_hermes_home())
+    with _journal_lock:
+        if profile in _journal_cache:
+            return _journal_cache[profile]
+        try:
+            from agent.operation_journal import OperationJournal
+            from hermes_state import SessionDB
+
+            journal = OperationJournal(SessionDB())
+        except Exception as exc:
+            logger.warning(
+                "Async delegation durable journal unavailable for %s: %s",
+                profile,
+                exc,
+            )
+            journal = None
+        _journal_cache[profile] = journal
+        return journal
+
+
+def _set_journal_for_tests(journal) -> None:
+    global _journal_override, _journal_override_enabled, _journal_cache
+    with _journal_lock:
+        if journal is None:
+            _journal_override = None
+            _journal_override_enabled = False
+            _journal_cache = {}
+        else:
+            _journal_override = journal
+            _journal_override_enabled = True
+
+
+def _journal_for_tests():
+    return _journal_override if _journal_override_enabled else _open_journal()
+
+
+def _terminal_state_for(status: str) -> tuple[str, str]:
+    return _STATUS_MAP.get(status, ("unknown", "unknown"))
+
+
+def _persist_operation_dispatch(record: Dict[str, Any]) -> None:
+    journal = _open_journal()
+    if journal is None:
+        return
+    try:
+        delegation_id = record["delegation_id"]
+        journal.create(
+            operation_id=delegation_id,
+            kind=_KIND,
+            session_id=record.get("session_key", "") or "",
+            destination=record.get("parent_session_id", "") or "",
+            payload_hash=f"{delegation_id}|{record['dispatched_at']:.6f}",
+        )
+        journal.transition(
+            delegation_id,
+            from_states={"pending"},
+            to_state="running",
+            effect_disposition="none",
+        )
+    except Exception as exc:
+        logger.debug("Async delegation %s journal dispatch failed: %s", record.get("delegation_id"), exc)
+
+
+def _persist_operation_completion(event: Dict[str, Any]) -> None:
+    journal = _open_journal()
+    if journal is None:
+        return
+    status = str(event.get("status") or "unknown")
+    to_state, effect = _terminal_state_for(status)
+    try:
+        from_states = {"running"} if to_state == "cancelled" else {"running", "dispatched"}
+        journal.transition(
+            str(event["delegation_id"]),
+            from_states=from_states,
+            to_state=to_state,
+            effect_disposition=effect,
+            result=event,
+            error=str(event.get("error")) if event.get("error") else None,
+        )
+    except Exception as exc:
+        logger.debug("Async delegation %s journal completion failed: %s", event.get("delegation_id"), exc)
+
+
+def acknowledge_async_delegation(operation_id: str) -> bool:
+    journal = _open_journal()
+    if journal is None:
+        return False
+    try:
+        return bool(journal.acknowledge(operation_id))
+    except Exception as exc:
+        logger.debug("Async delegation %s journal acknowledge failed: %s", operation_id, exc)
+        return False
+
+
+def _record_to_event(record) -> Optional[Dict[str, Any]]:
+    if not record.result_json:
+        return None
+    try:
+        event = json.loads(record.result_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(event, dict):
+        return None
+    event.setdefault("type", "async_delegation")
+    event.setdefault("delegation_id", record.operation_id)
+    return event
+
+
+def restore_unacknowledged_delegations(queue, put_fn) -> int:
+    journal = _open_journal()
+    if journal is None:
+        return 0
+    try:
+        records = journal.list_unacknowledged(kind=_KIND)
+    except Exception as exc:
+        logger.warning("Async delegation restore failed: %s", exc)
+        return 0
+    restored = 0
+    with _restored_lock:
+        for record in records:
+            if record.operation_id in _restored_ids:
+                continue
+            event = _record_to_event(record)
+            if event is None:
+                continue
+            try:
+                put_fn(event)
+            except Exception as exc:
+                logger.warning("Async delegation restore enqueue failed: %s", exc)
+                continue
+            _restored_ids.add(record.operation_id)
+            restored += 1
+    return restored
+
 
 def _db_path():
     return get_hermes_home() / "state.db"
@@ -157,6 +314,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
              record["dispatched_at"], now, __import__("os").getpid(),
              owner_started_at, json.dumps(task_payload)),
         )
+    _persist_operation_dispatch(record)
     _prune_durable_records()
 
 
@@ -214,6 +372,7 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
             (event.get("status", "completed"), event.get("completed_at", now), now,
              json.dumps(event), json.dumps(result), event["delegation_id"]),
         )
+    _persist_operation_completion(event)
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -773,6 +932,24 @@ def dispatch_async_delegation(
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
+def _push_completion_event(evt: Dict[str, Any]) -> None:
+    # A worker can finish after the test/runtime reset cleared its record;
+    # don't let that stale completion leak into a later consumer.
+    with _records_lock:
+        if evt.get("delegation_id") not in _records:
+            return
+    try:
+        from tools.process_registry import process_registry
+
+        process_registry.completion_queue.put(evt)
+    except Exception as exc:
+        logger.error(
+            "Async delegation %s finished but completion enqueue failed: %s",
+            evt.get("delegation_id"),
+            exc,
+        )
+
+
 def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     """Mark a record complete and push the completion event onto the queue."""
     with _records_lock:
@@ -789,7 +966,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         _prune_completed_locked(record.get("_home"))
         _persist_records_locked(record.get("_home"))
 
-    _push_completion_event(event_record, result, status)
+    _emit_completion_event(event_record, result, status)
     with _records_lock:
         record = _records.get(delegation_id)
         if record is not None:
@@ -797,7 +974,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         _prune_completed_locked()
 
 
-def _push_completion_event(
+def _emit_completion_event(
     record: Dict[str, Any], result: Dict[str, Any], status: str
 ) -> None:
     """Push a type='async_delegation' event onto the shared completion queue.
@@ -805,16 +982,6 @@ def _push_completion_event(
     Best-effort: a failure here must not crash the worker, but it WOULD mean a
     silently-lost result, so we log loudly.
     """
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s finished but process_registry import failed; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
-        return
-
     summary = result.get("summary")
     error = result.get("error")
     dispatched_at = record.get("dispatched_at") or time.time()
@@ -845,14 +1012,7 @@ def _push_completion_event(
         "exit_reason": result.get("exit_reason"),
     }
     _persist_completion(evt, result)
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s: failed to enqueue completion event; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
+    _push_completion_event(evt)
 
 
 def dispatch_async_delegation_batch(
@@ -1022,16 +1182,6 @@ def _finalize_batch(
         _prune_completed_locked(record.get("_home"))
         _persist_records_locked(record.get("_home"))
 
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s finished but process_registry import "
-            "failed; result lost: %s",
-            delegation_id, exc,
-        )
-        return
-
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
     evt = {
@@ -1058,20 +1208,12 @@ def _finalize_batch(
         "completed_at": completed_at,
     }
     _persist_completion(evt, combined)
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
-            delegation_id, exc,
-        )
-    finally:
-        with _records_lock:
-            record = _records.get(delegation_id)
-            if record is not None:
-                record["status"] = status
-            _prune_completed_locked()
+    _push_completion_event(evt)
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not None:
+            record["status"] = status
+        _prune_completed_locked()
 
 
 def list_async_delegations() -> List[Dict[str, Any]]:
@@ -1184,12 +1326,15 @@ def interrupt_for_session(
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state, persistent records, and the executor."""
-    global _executor, _executor_max_workers
+    global _executor, _executor_max_workers, _journal_cache
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
         _executor = None
         _executor_max_workers = 0
+    with _journal_lock:
+        _journal_cache = {}
+        _restored_ids.clear()
     with _records_lock:
         _records.clear()
         try:

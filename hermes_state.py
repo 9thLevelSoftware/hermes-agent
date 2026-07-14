@@ -33,21 +33,12 @@ logger = logging.getLogger(__name__)
 
 
 def workspace_key(row: Dict[str, Any]) -> Optional[str]:
-    """A session's workspace grouping key: its git repo root when known, else
-    its cwd.
-
-    Branch is deliberately excluded so checking out a new branch doesn't
-    fragment a workspace's session history. Returns None for cwd-less (unbound)
-    sessions. Both fields are already recorded on ``sessions`` — this just picks
-    the coarser identity for grouping/filtering.
-    """
+    """Return the repository root, or cwd, used to group a session."""
     root = (row.get("git_repo_root") or "").strip()
     if root:
         return root
-
     cwd = (row.get("cwd") or "").strip()
     return cwd or None
-
 
 def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
@@ -140,7 +131,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 20
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -356,36 +347,6 @@ def _apply_macos_checkpoint_barrier(conn: sqlite3.Connection) -> None:
         pass
 
 
-def _enforce_macos_synchronous_full(conn: sqlite3.Connection) -> None:
-    """Enforce ``PRAGMA synchronous=FULL`` on macOS to prevent btree corruption.
-
-    On Darwin, the default ``synchronous=NORMAL`` only calls ``fsync()``,
-    which Apple's fsync(2) man page explicitly states does *not* guarantee
-    data-on-platter or write-ordering. During a WAL checkpoint race with
-    process termination (e.g., launchd shutdown), this can leave the main
-    DB with half-written btree pages → ``btreeInitPage error 11``.
-
-    WAL mode's durability guarantee assumes the OS honors fsync barriers;
-    macOS does not unless we explicitly set ``synchronous=FULL``, which issues
-    a real ``fsync()`` on every transaction commit.  The ``F_FULLFSYNC``
-    barrier at checkpoint boundaries is handled separately by
-    :func:`_apply_macos_checkpoint_barrier`.
-
-    This function is called after any successful WAL activation (either
-    from ``apply_wal_with_fallback()`` setting a fresh WAL or when probing
-    an existing WAL mode). It ensures macOS connections always use FULL
-    synchronous mode, even if a prior connection set ``synchronous=NORMAL``.
-
-    Best-effort: never raises.
-    """
-    if sys.platform != "darwin":
-        return
-    try:
-        conn.execute("PRAGMA synchronous=FULL")
-    except sqlite3.OperationalError:
-        pass
-
-
 def apply_wal_with_fallback(
     conn: sqlite3.Connection,
     *,
@@ -416,16 +377,18 @@ def apply_wal_with_fallback(
     try:
         current_mode = conn.execute("PRAGMA journal_mode").fetchone()
         if current_mode and current_mode[0] == "wal":
+            if sys.platform == "darwin":
+                conn.execute("PRAGMA synchronous=FULL")
             _apply_macos_checkpoint_barrier(conn)
-            _enforce_macos_synchronous_full(conn)
             return "wal"
     except sqlite3.OperationalError:
         pass
 
     try:
         conn.execute("PRAGMA journal_mode=WAL")
+        if sys.platform == "darwin":
+            conn.execute("PRAGMA synchronous=FULL")
         _apply_macos_checkpoint_barrier(conn)
-        _enforce_macos_synchronous_full(conn)
         return "wal"
     except sqlite3.OperationalError as exc:
         msg = str(exc).lower()
@@ -438,6 +401,8 @@ def apply_wal_with_fallback(
             raise
         _log_wal_fallback_once(db_label, exc)
         conn.execute("PRAGMA journal_mode=DELETE")
+        if sys.platform == "darwin":
+            conn.execute("PRAGMA synchronous=FULL")
         return "delete"
 
 
@@ -860,6 +825,48 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_leases (
+    session_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS agent_operations (
+    operation_id TEXT NOT NULL PRIMARY KEY,
+    kind TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT '',
+    turn_id TEXT NOT NULL DEFAULT '',
+    tool_call_id TEXT NOT NULL DEFAULT '',
+    destination TEXT NOT NULL DEFAULT '',
+    payload_hash TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL CHECK (state IN (
+        'pending', 'running', 'dispatched', 'confirmed',
+        'failed', 'unknown', 'cancelled'
+    )),
+    effect_disposition TEXT NOT NULL CHECK (
+        effect_disposition IN ('none', 'landed', 'unknown')
+    ),
+    result_json TEXT,
+    error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    acknowledged_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_operations_kind_state_updated
+    ON agent_operations(kind, state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_agent_operations_session_updated
+    ON agent_operations(session_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS agent_operation_owners (
+    operation_id TEXT PRIMARY KEY
+        REFERENCES agent_operations(operation_id) ON DELETE CASCADE,
+    owner_pid INTEGER NOT NULL,
+    owner_started_at INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,
@@ -881,6 +888,9 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
+CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
+    ON async_delegations(delivery_state, completed_at);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -889,8 +899,6 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
-CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
-    ON async_delegations(delivery_state, completed_at);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -966,6 +974,19 @@ END;
 """
 
 
+class SessionDBClosedError(RuntimeError):
+    """Raised when a SessionDB operation is attempted on a closed handle.
+
+    A ``RuntimeError`` subclass so existing ``except RuntimeError`` callers
+    keep working, and so callers can use ``isinstance`` to distinguish a
+    closed handle (explicit, non-retryable — disable the DB on the agent)
+    from transient SQLite errors (busy / locked / I/O — retryable).
+
+    ponetail: keep the message short — callers surface ``str(exc)`` to logs
+    and route on type, not on message contents.
+    """
+
+
 class SessionDB:
     """
     SQLite-backed session storage with FTS5 search.
@@ -998,10 +1019,8 @@ class SessionDB:
     # pays almost nothing; the cadence is deliberately coarse so the one-off
     # merge cost is amortised far below the checkpoint cadence.
     _OPTIMIZE_EVERY_N_WRITES = 1000
-    # Session imports intentionally use a lower cap than exports: import holds
-    # one BEGIN IMMEDIATE transaction, so bounded batches avoid starving live
-    # gateway/CLI writers. The dashboard accepts one exported JSON/JSONL file
-    # at a time, so these still cover normal history restores.
+    # Session imports are bounded because import_sessions holds one write
+    # transaction and must not starve live gateway/CLI writers.
     _IMPORT_MAX_SESSIONS = 500
     _IMPORT_MAX_MESSAGES_PER_SESSION = 10_000
     _IMPORT_MAX_TOTAL_MESSAGES = 50_000
@@ -1098,6 +1117,10 @@ class SessionDB:
             # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
+
+    def fork(self):
+        """Open an independently-owned handle to the same database."""
+        return type(self)(db_path=self.db_path, read_only=self.read_only)
 
     # ── Core write helper ──
 
@@ -1261,17 +1284,25 @@ class SessionDB:
 
         Returns whatever *fn* returns.
         """
+        # Single chokepoint: fail explicitly when the handle is closed.
+        # Transient sqlite3.OperationalError (busy / locked) is still
+        # retryable below — the chokepoint only filters the explicit,
+        # non-retryable "handle is closed" case so the agent can
+        # distinguish and drop the DB on the first trip.
+        self._require_open()
+        conn = self._conn
+        assert conn is not None, "_require_open did not raise"
         last_err: Optional[Exception] = None
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
                 with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    conn.execute("BEGIN IMMEDIATE")
                     try:
-                        result = fn(self._conn)
-                        self._conn.commit()
+                        result = fn(conn)
+                        conn.commit()
                     except BaseException:
                         try:
-                            self._conn.rollback()
+                            conn.rollback()
                         except Exception:
                             pass
                         raise
@@ -1361,6 +1392,50 @@ class SessionDB:
                     pass
                 self._conn.close()
                 self._conn = None
+
+    @property
+    def is_open(self) -> bool:
+        """True while the underlying connection is alive.
+
+        ``close()`` flips this to False; a failed ``__init__`` may leave
+        it False from the start. Read entrypoints and ``_execute_write``
+        route through :meth:`_require_open` (which uses this) so the
+        agent can ask "do I still have a usable handle?" without
+        touching ``self._conn`` directly.
+        """
+        return self._conn is not None
+
+    def _require_open(self) -> None:
+        """Raise :class:`SessionDBClosedError` if the handle is closed.
+
+        Single shared chokepoint for every public path that needs the
+        underlying connection. Reads, writes, and the closing sequence
+        all bounce through here so a closed handle always surfaces the
+        same explicit error type — never a leaky
+        ``sqlite3.ProgrammingError`` from a closed cursor.
+        """
+        if self._conn is None:
+            raise SessionDBClosedError(
+                "SessionDB is closed (path=%s)" % (self.db_path,)
+            )
+
+    def _execute_read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        """Run *fn* against the connection under :attr:`_lock`, gating on
+        :meth:`_require_open`.
+
+        Companion to :meth:`_execute_write` — both are the *shared
+        chokepoints* for "the handle was closed" failures. Reads that
+        route through here get the same explicit
+        :class:`SessionDBClosedError` semantics as writes; transient
+        errors (busy / locked) still propagate from ``fn`` untouched.
+        """
+        with self._lock:
+            self._require_open()
+            # _require_open either raised or left the conn alive; the
+            # type-checker can't follow the gate so widen explicitly.
+            conn = self._conn
+            assert conn is not None, "_require_open did not raise"
+            return fn(conn)
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
@@ -2113,10 +2188,9 @@ class SessionDB:
         pruned after process-level restart bugs.  New gateway sessions persist
         the deterministic ``session_key`` on the durable session row so the
         mapping can be rebuilt exactly.  Rows ended only by older gateway
-        cleanup's ``agent_close`` bug or a mistaken TUI ``ws_orphan_reap``
-        (dashboard viewer disconnect before #60609) are treated as recoverable;
-        explicit conversation boundaries such as /new, /resume switches, and
-        compression splits are not.
+        cleanup's ``agent_close`` bug are treated as recoverable; explicit
+        conversation boundaries such as /new, /resume switches, and compression
+        splits are not.
         """
         if not session_key:
             return None
@@ -2187,6 +2261,38 @@ class SessionDB:
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),
             )
+        self._execute_write(_do)
+
+    def get_compression_fallback_streak(self, session_id: str) -> int:
+        """Return the persisted deterministic-fallback streak."""
+        if not session_id:
+            return 0
+        row = self._execute_read(
+            lambda conn: conn.execute(
+                "SELECT compression_fallback_streak FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        )
+        if row is None:
+            return 0
+        value = row["compression_fallback_streak"]
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def set_compression_fallback_streak(self, session_id: str, streak: int) -> None:
+        """Persist the deterministic-fallback streak for one session."""
+        if not session_id:
+            return
+        normalized = max(0, int(streak))
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET compression_fallback_streak = ? WHERE id = ?",
+                (normalized, session_id),
+            )
+
         self._execute_write(_do)
 
     def update_session_cwd(
@@ -2329,45 +2435,6 @@ class SessionDB:
                 "clear_compression_failure_cooldown(%s) failed: %s",
                 session_id, exc,
             )
-
-    def get_compression_fallback_streak(self, session_id: str) -> int:
-        """Return the persisted deterministic-fallback streak."""
-        if not session_id:
-            return 0
-        with self._lock:
-            conn = self._conn
-            if conn is None:
-                return 0
-            row = conn.execute(
-                "SELECT compression_fallback_streak FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
-        if row is None:
-            return 0
-        value = (
-            row["compression_fallback_streak"]
-            if isinstance(row, sqlite3.Row)
-            else row[0]
-        )
-        try:
-            return max(0, int(value or 0))
-        except (TypeError, ValueError):
-            return 0
-
-    def set_compression_fallback_streak(self, session_id: str, streak: int) -> None:
-        """Persist the deterministic-fallback streak for one session."""
-        if not session_id:
-            return
-        normalized = max(0, int(streak))
-
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET compression_fallback_streak = ? WHERE id = ?",
-                (normalized, session_id),
-            )
-
-        self._execute_write(_do)
-
     # ──────────────────────────────────────────────────────────────────────
     # Compression locks
     # ──────────────────────────────────────────────────────────────────────
@@ -2522,6 +2589,185 @@ class SessionDB:
         if row is None:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Session leases
+    # ──────────────────────────────────────────────────────────────────────
+    # Conservative ownership claim on a session row, time-bounded by TTL.
+    # Reclamation is end-only (no live takeover): reconciliation ends
+    # EXPIRED lease rows and marks the session as ``abandoned``. Unleased
+    # open sessions are untouched. There is no background heartbeat thread
+    # — agents touch on every turn, and reconciliation runs synchronously
+    # from explicit callers (startup sweep, before/after flush, etc.).
+    def claim_session_lease(
+        self,
+        session_id: str,
+        owner_id: str,
+        ttl_seconds: float,
+    ) -> bool:
+        """Claim the session lease for ``owner_id`` if no live lease exists.
+
+        Returns True when ``owner_id`` now owns the lease (either inserted
+        fresh or reclaimed from an EXPIRED row). Returns False when a
+        live lease is held by someone else. Also returns False when the
+        session row does not exist (no FK target to lease against).
+        """
+        if not session_id or not owner_id or ttl_seconds <= 0:
+            return False
+        now = time.time()
+        expires_at = now + ttl_seconds
+
+        def _do(conn):
+            # Reclaim expired rows first so the INSERT below can race-free
+            # acquire the slot. Mirrors try_acquire_compression_lock.
+            conn.execute(
+                "DELETE FROM session_leases "
+                "WHERE session_id = ? AND expires_at < ?",
+                (session_id, now),
+            )
+            # Verify the session row exists — FK is enforced on cascade
+            # but we want claim() to return False for unknown ids, not
+            # raise IntegrityError.
+            exists = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if exists is None:
+                return False
+            conn.execute(
+                "INSERT OR IGNORE INTO session_leases "
+                "(session_id, owner_id, acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, owner_id, now, expires_at),
+            )
+            row = conn.execute(
+                "SELECT owner_id FROM session_leases WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None and (
+                row["owner_id"] if isinstance(row, sqlite3.Row) else row[0]
+            ) == owner_id
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "claim_session_lease(%s, %s) failed: %s",
+                session_id, owner_id, exc,
+            )
+            return False
+
+    def touch_session_lease(
+        self,
+        session_id: str,
+        owner_id: str,
+        ttl_seconds: float,
+    ) -> bool:
+        """Extend the session lease TTL iff ``owner_id`` still owns it.
+
+        Returns True on a successful extension, False otherwise (no lease,
+        wrong owner, DB error). Fail-open callers (run_conversation
+        prologue) just skip — the lease is informational, not blocking.
+        """
+        if not session_id or not owner_id or ttl_seconds <= 0:
+            return False
+        now = time.time()
+        expires_at = now + ttl_seconds
+
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE session_leases SET expires_at = ? "
+                "WHERE session_id = ? AND owner_id = ? AND expires_at >= ?",
+                (expires_at, session_id, owner_id, now),
+            )
+            return cur.rowcount > 0
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "touch_session_lease(%s, %s) failed: %s",
+                session_id, owner_id, exc,
+            )
+            return False
+
+    def release_session_lease(self, session_id: str, owner_id: str) -> bool:
+        """Release the session lease iff ``owner_id`` owns it.
+
+        Returns True if a row was deleted, False if no matching lease
+        existed (idempotent — release of an already-released or never-
+        claimed session is a no-op success on the caller's side).
+        """
+        if not session_id or not owner_id:
+            return False
+
+        def _do(conn):
+            cur = conn.execute(
+                "DELETE FROM session_leases "
+                "WHERE session_id = ? AND owner_id = ?",
+                (session_id, owner_id),
+            )
+            return cur.rowcount > 0
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "release_session_lease(%s, %s) failed: %s",
+                session_id, owner_id, exc,
+            )
+            return False
+
+    def reconcile_expired_session_leases(
+        self,
+        now: Optional[float] = None,
+    ) -> int:
+        """End only EXPIRED lease rows; mark their sessions ``abandoned``.
+
+        Conservative: unleased open sessions are untouched, and sessions
+        already ended for another reason (compression, agent_close, ...)
+        are NOT overwritten — lease reclamation only marks live sessions.
+
+        Returns the number of lease rows reclaimed. Runs synchronously —
+        callers (startup sweep, before/after flush) decide cadence.
+        """
+        if now is None:
+            now = time.time()
+
+        def _do(conn):
+            expired = conn.execute(
+                "SELECT session_id, expires_at FROM session_leases "
+                "WHERE expires_at < ?",
+                (now,),
+            ).fetchall()
+            if not expired:
+                return 0
+            ids = [row["session_id"] for row in expired]
+            ph = ",".join("?" * len(ids))
+            # End the live sessions with reason 'abandoned', pinned to
+            # expires_at (not `now`) so the ended_at reflects the actual
+            # TTL expiry rather than the reconciliation wall clock. Only
+            # sessions that are still open are touched — already-ended
+            # sessions keep their original end_reason.
+            pairs = [
+                (row["expires_at"], row["session_id"]) for row in expired
+            ]
+            for expires_at, sid in pairs:
+                conn.execute(
+                    "UPDATE sessions SET ended_at = ?, end_reason = 'abandoned' "
+                    "WHERE id = ? AND ended_at IS NULL",
+                    (expires_at, sid),
+                )
+            conn.execute(
+                f"DELETE FROM session_leases WHERE session_id IN ({ph})",
+                ids,
+            )
+            return len(ids)
+
+        try:
+            return int(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("reconcile_expired_session_leases failed: %s", exc)
+            return 0
 
     def update_session_meta(
         self,
@@ -2931,11 +3177,13 @@ class SessionDB:
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
-        with self._lock:
-            cursor = self._conn.execute(
+        def _do(conn):
+            cursor = conn.execute(
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
             )
-            row = cursor.fetchone()
+            return cursor.fetchone()
+
+        row = self._execute_read(_do)
         return dict(row) if row else None
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
@@ -4126,9 +4374,7 @@ class SessionDB:
             # SQLite's OFFSET requires LIMIT; -1 means "no limit".
             sql += " LIMIT ? OFFSET ?"
             params.extend([-1 if limit is None else limit, offset])
-        with self._lock:
-            cursor = self._conn.execute(sql, params)
-            rows = cursor.fetchall()
+        rows = self._execute_read(lambda conn: conn.execute(sql, params).fetchall())
         result = []
         for row in rows:
             msg = dict(row)
@@ -5449,18 +5695,6 @@ class SessionDB:
         base["messages"] = [msg for seg in segments for msg in (seg.get("messages") or [])]
         return base
 
-    def export_all(self, source: str = None) -> List[Dict[str, Any]]:
-        """
-        Export all sessions (with messages) as a list of dicts.
-        Suitable for writing to a JSONL file for backup/analysis.
-        """
-        sessions = self.search_sessions(source=source, limit=100000)
-        results = []
-        for session in sessions:
-            messages = self.get_messages(session["id"])
-            results.append({**session, "messages": messages})
-        return results
-
     @staticmethod
     def _import_text_or_none(value: Any, field: str) -> Optional[str]:
         if value is None:
@@ -5857,6 +6091,19 @@ class SessionDB:
             }
 
         return self._execute_write(_do)
+
+
+    def export_all(self, source: str = None) -> List[Dict[str, Any]]:
+        """
+        Export all sessions (with messages) as a list of dicts.
+        Suitable for writing to a JSONL file for backup/analysis.
+        """
+        sessions = self.search_sessions(source=source, limit=100000)
+        results = []
+        for session in sessions:
+            messages = self.get_messages(session["id"])
+            results.append({**session, "messages": messages})
+        return results
 
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
@@ -7026,6 +7273,7 @@ class SessionDB:
         min_interval_hours: int = 24,
         vacuum: bool = True,
         sessions_dir: Optional[Path] = None,
+        operation_retention_days: int = 30,
     ) -> Dict[str, Any]:
         """Idempotent auto-maintenance: prune old sessions + optional VACUUM.
 
@@ -7037,16 +7285,27 @@ class SessionDB:
         (``.json`` / ``.jsonl`` / ``request_dump_*``) for pruned sessions
         are removed as part of the same sweep (issue #3015).
 
+        Operation-journal retention runs alongside session pruning: only
+        acknowledged terminal rows (confirmed/failed/cancelled) older than
+        ``operation_retention_days`` are deleted. Unacknowledged or
+        in-flight records are never touched.
+
         Never raises. On any failure, logs a warning and returns a dict
         with ``"error"`` set.
 
         Returns a dict with keys:
           - ``"skipped"`` (bool) — true if within min_interval_hours of last run
           - ``"pruned"`` (int)   — number of sessions deleted
+          - ``"operations_pruned"`` (int) — number of operation rows deleted
           - ``"vacuumed"`` (bool) — true if VACUUM ran
           - ``"error"`` (str, optional) — present only on failure
         """
-        result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
+        result: Dict[str, Any] = {
+            "skipped": False,
+            "pruned": 0,
+            "operations_pruned": 0,
+            "vacuumed": False,
+        }
         try:
             # Skip if another process/call did maintenance recently.
             last_raw = self.get_meta("last_auto_prune")
@@ -7066,9 +7325,23 @@ class SessionDB:
             )
             result["pruned"] = pruned
 
+            # Bounded retention of the operation journal: same sweep, same
+            # idempotent interval. Lazy-imported to avoid the operation_journal
+            # -> hermes_state cycle at module load.
+            try:
+                from agent.operation_journal import OperationJournal  # ponytail: local import, avoids hermes_state <-> operation_journal cycle
+
+                ops_pruned = OperationJournal(self).prune_terminal(
+                    older_than_days=operation_retention_days
+                )
+                result["operations_pruned"] = ops_pruned
+            except Exception as exc:
+                logger.warning("operation journal prune failed: %s", exc)
+
             # Only VACUUM if we actually freed rows — VACUUM on a tight DB
             # is wasted I/O. Threshold keeps small DBs from paying the cost.
-            if vacuum and pruned > 0:
+            freed = pruned + result["operations_pruned"]
+            if vacuum and freed > 0:
                 try:
                     self.vacuum()
                     result["vacuumed"] = True
@@ -7079,11 +7352,13 @@ class SessionDB:
             # every startup within the min_interval_hours window.
             self.set_meta("last_auto_prune", str(now))
 
-            if pruned > 0:
+            if freed > 0:
                 logger.info(
-                    "state.db auto-maintenance: pruned %d session(s) older than %d days%s",
+                    "state.db auto-maintenance: pruned %d session(s) and %d operation row(s) older than %d/%d days%s",
                     pruned,
+                    result["operations_pruned"],
                     retention_days,
+                    operation_retention_days,
                     " + VACUUM" if result["vacuumed"] else "",
                 )
         except Exception as exc:

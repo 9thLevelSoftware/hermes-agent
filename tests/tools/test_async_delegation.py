@@ -8,6 +8,7 @@ formatting, capacity rejection, and crash handling.
 import json
 import os
 import queue
+from collections import deque
 import subprocess
 import sys
 import threading
@@ -1233,5 +1234,692 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
+
+
+# ---------------------------------------------------------------------------
+# Task 8 — durable delegation completion & acknowledgement
+# ---------------------------------------------------------------------------
+# Completion of a background delegation must persist to state.db via
+# OperationJournal BEFORE the completion event is enqueued, so a crash
+# between persist and enqueue cannot lose the result; consumers must
+# acknowledge after successful injection so a redelivery on restart
+# never double-fires.
+
+import importlib as _importlib_t8
+import json as _json_t8
+import sys as _sys_t8
+from pathlib import Path as _Path_t8
+from unittest.mock import MagicMock as _MM_t8, patch as _patch_t8
+
+import pytest as _pytest_t8
+
+from agent.operation_journal import OperationJournal as _OpJournal_t8
+from hermes_state import SessionDB as _SessionDB_t8
+
+
+@_pytest_t8.fixture()
+def _journal_db(tmp_path):
+    db = _SessionDB_t8(db_path=tmp_path / "state.db")
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _open_journal_db(path: _Path_t8) -> _SessionDB_t8:
+    """Return a SECOND SessionDB instance against the same path."""
+    return _SessionDB_t8(db_path=path)
+
+
+def _make_cli_for_drain_test():
+    """HermesCLI instance with prompt_toolkit stubbed — only enough to exercise
+    the idle notification drain path. Mirrors tests/cli/test_cli_interrupt_ack_race.py."""
+    _clean_config = {
+        "model": {
+            "default": "anthropic/claude-opus-4.6",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "auto",
+        },
+        "display": {"compact": False, "tool_progress": "all"},
+        "agent": {},
+        "terminal": {"env_type": "local"},
+    }
+    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
+    prompt_toolkit_stubs = {
+        "prompt_toolkit": _MM_t8(),
+        "prompt_toolkit.history": _MM_t8(),
+        "prompt_toolkit.styles": _MM_t8(),
+        "prompt_toolkit.patch_stdout": _MM_t8(),
+        "prompt_toolkit.application": _MM_t8(),
+        "prompt_toolkit.layout": _MM_t8(),
+        "prompt_toolkit.layout.processors": _MM_t8(),
+        "prompt_toolkit.filters": _MM_t8(),
+        "prompt_toolkit.layout.dimension": _MM_t8(),
+        "prompt_toolkit.layout.menus": _MM_t8(),
+        "prompt_toolkit.widgets": _MM_t8(),
+        "prompt_toolkit.key_binding": _MM_t8(),
+        "prompt_toolkit.completion": _MM_t8(),
+        "prompt_toolkit.formatted_text": _MM_t8(),
+        "prompt_toolkit.auto_suggest": _MM_t8(),
+    }
+    with _patch_t8.dict(_sys_t8.modules, prompt_toolkit_stubs), _patch_t8.dict(
+        "os.environ", clean_env, clear=False
+    ):
+        import cli as _cli_mod_t8
+
+        _cli_mod_t8 = _importlib_t8.reload(_cli_mod_t8)
+        with _patch_t8.object(_cli_mod_t8, "get_tool_definitions", return_value=[]), _patch_t8.dict(
+            _cli_mod_t8.__dict__, {"CLI_CONFIG": _clean_config}
+        ):
+            return _cli_mod_t8.HermesCLI()
+
+
+def test_dispatch_creates_pending_record_and_completion_persists_before_queue(_journal_db):
+    """At dispatch, OperationJournal sees a pending 'async_delegation' row.
+    On completion, the row reaches a terminal state (confirmed/failed/...)
+    AND the event is enqueued — never the other way around."""
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    # Replace _push_completion_event with a publisher that asserts the
+    # terminal row is already persisted before the queue sees the event.
+    ad._completion_publisher_spy = []
+    original_push = ad._push_completion_event
+
+    def _spy_push(evt):
+        # By the time this fires, the journal must already hold the
+        # terminal row for the same delegation_id.
+        rec = journal.get(evt["delegation_id"])
+        assert rec is not None, (
+            f"queue published evt {evt['delegation_id']!r} BEFORE "
+            "terminal transition was persisted"
+        )
+        assert rec.state in {"confirmed", "failed", "cancelled", "unknown"}, (
+            f"unexpected terminal state {rec.state!r} for {evt['delegation_id']!r}"
+        )
+        # Mirror the normal put so consumer tests downstream still see it.
+        from tools.process_registry import process_registry
+        process_registry.completion_queue.put(dict(evt))
+        ad._completion_publisher_spy.append((rec.state, rec.effect_disposition, evt["delegation_id"]))
+
+    ad._push_completion_event = _spy_push
+    try:
+        def runner():
+            return {"status": "completed", "summary": "ok",
+                    "api_calls": 1, "duration_seconds": 0.1, "model": "m"}
+
+        res = ad.dispatch_async_delegation(
+            goal="durable", context=None, toolsets=None, role="leaf", model="m",
+            session_key="", runner=runner, max_async_children=3,
+        )
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not ad._completion_publisher_spy:
+            time.sleep(0.02)
+
+        assert res["status"] == "dispatched"
+        assert len(ad._completion_publisher_spy) == 1
+        state, effect, did = ad._completion_publisher_spy[0]
+        assert state == "confirmed"
+        assert effect == "none"
+        assert did == res["delegation_id"]
+    finally:
+        ad._push_completion_event = original_push
+
+
+def test_completed_persists_to_db_with_bounded_event_dict(_journal_db):
+    """On completion, result_json holds the bounded event dict with the
+    fields the consumer needs (summary, status, error, dispatched_at, etc.)"""
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    def runner():
+        return {"status": "completed", "summary": "the answer",
+                "error": None, "api_calls": 4, "duration_seconds": 1.2,
+                "model": "m", "exit_reason": "completed"}
+
+    res = ad.dispatch_async_delegation(
+        goal="bg", context=None, toolsets=None, role="leaf", model="m",
+        session_key="agent:main:telegram:dm:1",
+        parent_session_id="parent-1",
+        runner=runner, max_async_children=3,
+    )
+    _drain_one()
+
+    record = journal.get(res["delegation_id"])
+    assert record is not None
+    assert record.state == "confirmed"
+    assert record.effect_disposition == "none"
+    assert record.kind == "async_delegation"
+    payload = _json_t8.loads(record.result_json)
+    assert payload["status"] == "completed"
+    assert payload["summary"] == "the answer"
+    assert payload["session_key"] == "agent:main:telegram:dm:1"
+    assert payload["parent_session_id"] == "parent-1"
+    assert payload["model"] == "m"
+
+
+def test_failed_completion_persists_with_failed_state(_journal_db):
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    def boom():
+        raise RuntimeError("kaboom")
+
+    res = ad.dispatch_async_delegation(
+        goal="x", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=boom, max_async_children=3,
+    )
+    _drain_one()
+
+    record = journal.get(res["delegation_id"])
+    assert record is not None
+    assert record.state == "failed"
+    assert record.effect_disposition == "none"
+    assert "kaboom" in (record.error or "")
+
+
+def test_interrupted_completion_persists_with_cancelled_state(_journal_db):
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    ev = threading.Event()
+
+    def blocker():
+        ev.wait(timeout=5)
+        return {"status": "interrupted", "summary": None,
+                "error": "cancelled"}
+
+    def interrupt_fn():
+        ev.set()
+
+    res = ad.dispatch_async_delegation(
+        goal="block", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=blocker, interrupt_fn=interrupt_fn,
+        max_async_children=3,
+    )
+    ad.interrupt_all(reason="t")
+    _drain_one()
+
+    record = journal.get(res["delegation_id"])
+    assert record is not None
+    assert record.state == "cancelled"
+    assert record.effect_disposition == "none"
+
+
+def test_unknown_status_persists_with_unknown_state(_journal_db):
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    def runner():
+        return {"status": "weird", "summary": "?"}
+
+    res = ad.dispatch_async_delegation(
+        goal="weird", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, max_async_children=3,
+    )
+    _drain_one()
+
+    record = journal.get(res["delegation_id"])
+    assert record is not None
+    assert record.state == "unknown"
+    assert record.effect_disposition == "unknown"
+
+
+def test_acknowledge_marks_record_and_is_idempotent(_journal_db):
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    def runner():
+        return {"status": "completed", "summary": "ok"}
+
+    res = ad.dispatch_async_delegation(
+        goal="ack", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, max_async_children=3,
+    )
+    _drain_one()
+    assert journal.get(res["delegation_id"]).acknowledged_at is None
+
+    assert ad.acknowledge_async_delegation(res["delegation_id"]) is True
+    assert ad.acknowledge_async_delegation(res["delegation_id"]) is False
+    assert ad.acknowledge_async_delegation(res["delegation_id"]) is False
+    assert journal.get(res["delegation_id"]).acknowledged_at is not None
+
+
+def test_acknowledge_pending_or_unknown_id_returns_false(_journal_db):
+    """If the row hasn't reached a terminal state yet (still pending/running),
+    acknowledge is a no-op and returns False. Once terminal, ack is True."""
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    # Block the worker long enough for the test thread to observe pre-terminal state.
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "x"}
+
+    res = ad.dispatch_async_delegation(
+        goal="pending", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, max_async_children=3,
+    )
+    # Worker is blocked on gate → row is still "running", not terminal.
+    # acknowledge must return False (only terminal rows can be acked).
+    assert ad.acknowledge_async_delegation(res["delegation_id"]) is False
+
+    # Let the worker finish + terminal transition land.
+    gate.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        rec = journal.get(res["delegation_id"])
+        if rec and rec.state in {"confirmed", "failed", "cancelled", "unknown"}:
+            break
+        time.sleep(0.02)
+
+    # After terminal transition, can be acknowledged.
+    assert ad.acknowledge_async_delegation(res["delegation_id"]) is True
+
+
+def test_restore_unacknowledged_returns_count_and_enqueues(tmp_path):
+    """A fresh process opening the same db must see terminal unacked
+    delegations as 'to enqueue' — idem-potent within process scope."""
+    db_path = tmp_path / "state.db"
+
+    # Process 1: dispatch + finish a delegation
+    db1 = _SessionDB_t8(db_path=db_path)
+    journal1 = _OpJournal_t8(db1)
+    ad._set_journal_for_tests(journal1)
+
+    def runner():
+        return {"status": "completed", "summary": "delivered"}
+
+    res = ad.dispatch_async_delegation(
+        goal="persist", context=None, toolsets=None, role="leaf", model="m",
+        session_key="agent:main:telegram:dm:7",
+        parent_session_id="p-7",
+        runner=runner, max_async_children=3,
+    )
+    _drain_one()
+    db1.close()
+
+    # Process 2 — fresh SessionDB instance, fresh journal
+    db2 = _SessionDB_t8(db_path=db_path)
+    journal2 = _OpJournal_t8(db2)
+    ad._set_journal_for_tests(journal2)
+
+    captured = []
+
+    def _capture_put(evt):
+        captured.append(evt)
+
+    # Restore must return the count and requeue events
+    enqueued = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue, _capture_put,
+    )
+    assert enqueued == 1
+    assert len(captured) == 1
+    evt = captured[0]
+    assert evt["type"] == "async_delegation"
+    assert evt["delegation_id"] == res["delegation_id"]
+    assert evt["session_key"] == "agent:main:telegram:dm:7"
+    assert evt["status"] == "completed"
+    assert evt["summary"] == "delivered"
+
+    # Idempotent within process: a second restore within the same process
+    # in the same in-memory cache must NOT double-enqueue.
+    enqueued2 = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue, _capture_put,
+    )
+    assert enqueued2 == 0
+    assert len(captured) == 1
+
+    # ...but a fresh process (new restore cache) DOES re-emit on restart.
+    # ``_reset_for_tests()`` simulates process death: it clears the per-process
+    # restored-ids cache + closes the prior journal handle, the same way a real
+    # process boundary would.
+    db2.close()
+    ad._reset_for_tests()
+    db3 = _SessionDB_t8(db_path=db_path)
+    journal3 = _OpJournal_t8(db3)
+    ad._set_journal_for_tests(journal3)
+    captured2 = []
+    enqueued3 = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue,
+        lambda e: captured2.append(e),
+    )
+    assert enqueued3 == 1
+    assert len(captured2) == 1
+    db3.close()
+
+
+def test_acknowledge_via_restore_loop_skips_already_acked(_journal_db):
+    """Once ack'd, restore_unacknowledged_delegations() must not re-enqueue
+    on a subsequent call (with a fresh in-process cache that still loads
+    only terminal+unacknowledged rows)."""
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    def runner():
+        return {"status": "completed", "summary": "ok"}
+
+    res = ad.dispatch_async_delegation(
+        goal="ack-then-restore", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=runner, max_async_children=3,
+    )
+    _drain_one()
+    ad.acknowledge_async_delegation(res["delegation_id"])
+
+    captured = []
+    enqueued = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue, lambda e: captured.append(e),
+    )
+    assert enqueued == 0
+    assert captured == []
+
+
+def test_durable_journal_fail_open_when_db_unavailable(tmp_path, monkeypatch):
+    """If state.db can't be opened, dispatch must still work — fail-open
+    by logging and proceeding without persistence."""
+    from tools import async_delegation as ad_mod
+
+    # Force the journal helper to raise.
+    class _BrokenDB:
+        @staticmethod
+        def _execute_write(_fn):
+            raise RuntimeError("db corrupt")
+
+    monkeypatch.setattr(ad_mod, "_open_journal", lambda: (_OpJournal_t8(_BrokenDB())))
+
+    def runner():
+        return {"status": "completed", "summary": "yes"}
+
+    res = ad_mod.dispatch_async_delegation(
+        goal="no-db", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, max_async_children=3,
+    )
+    assert res["status"] == "dispatched"
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["status"] == "completed"
+    # And acknowledge is a no-op (returns False).
+    assert ad_mod.acknowledge_async_delegation("nonexistent") is False
+
+
+def test_batch_dispatch_also_persists_as_one_record(_journal_db):
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    def runner():
+        return {"status": "completed", "summary": None,
+                "results": [
+                    {"status": "completed", "summary": "a"},
+                    {"status": "completed", "summary": "b"},
+                ],
+                "total_duration_seconds": 1.0}
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["a", "b"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, max_async_children=3,
+    )
+    _drain_one()
+
+    record = journal.get(res["delegation_id"])
+    assert record is not None
+    assert record.state == "confirmed"
+    assert record.kind == "async_delegation"
+
+
+def test_startup_reconcile_recovers_in_flight_after_process_restart(tmp_path):
+    """Simulate a hard crash: process1 creates pending+running rows, then
+    dies. process2 startup must reconcile them to 'unknown' on creation."""
+    db_path = tmp_path / "state.db"
+    db1 = _SessionDB_t8(db_path=db_path)
+    journal1 = _OpJournal_t8(db1)
+
+    journal1.create(operation_id="inflight-1", kind="async_delegation")
+    journal1.create(operation_id="inflight-2", kind="async_delegation")
+    journal1.transition(
+        "inflight-1",
+        from_states={"pending"},
+        to_state="running",
+        effect_disposition="none",
+    )
+    # 'inflight-2' stays in pending.
+    db1.close()
+
+    db2 = _SessionDB_t8(db_path=db_path)
+    journal2 = _OpJournal_t8(db2)
+    moved = journal2.reconcile_after_restart()
+    assert moved == 1
+    assert journal2.get("inflight-1").state == "unknown"
+    assert journal2.get("inflight-2").state == "pending"  # pending is NOT in-flight
+    db2.close()
+
+
+def test_startup_reconcile_then_restore_emits_orphans_only(tmp_path):
+    db_path = tmp_path / "state.db"
+    db1 = _SessionDB_t8(db_path=db_path)
+    journal1 = _OpJournal_t8(db1)
+
+    # An 'orphaned' terminal row: confirmed, never acknowledged.
+    journal1.create(operation_id="orphan-1", kind="async_delegation")
+    journal1.transition(
+        "orphan-1",
+        from_states={"pending"},
+        to_state="running",
+        effect_disposition="none",
+    )
+    journal1.transition(
+        "orphan-1",
+        from_states={"running"},
+        to_state="confirmed",
+        effect_disposition="none",
+        result={"status": "completed", "summary": "save me"},
+    )
+
+    # An already-acked row: must not re-emit.
+    journal1.create(operation_id="acked-1", kind="async_delegation")
+    journal1.transition(
+        "acked-1",
+        from_states={"pending"},
+        to_state="running",
+        effect_disposition="none",
+    )
+    journal1.transition(
+        "acked-1",
+        from_states={"running"},
+        to_state="confirmed",
+        effect_disposition="none",
+        result={"status": "completed", "summary": "delivered"},
+    )
+    journal1.acknowledge("acked-1")
+
+    db1.close()
+
+    db2 = _SessionDB_t8(db_path=db_path)
+    journal2 = _OpJournal_t8(db2)
+    journal2.reconcile_after_restart()
+
+    ad._set_journal_for_tests(journal2)
+    captured = []
+    n = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue, lambda e: captured.append(e),
+    )
+    assert n == 1
+    assert len(captured) == 1
+    assert captured[0]["delegation_id"] == "orphan-1"
+    assert captured[0]["summary"] == "save me"
+    db2.close()
+
+
+def test_cli_idle_drain_does_not_ack_synchronously_after_enqueue(tmp_path, monkeypatch):
+    """The CLI idle drain puts the synthetic prompt into _pending_input but
+    MUST NOT synchronously call acknowledge_async_delegation(). If the process
+    dies between put() and the agent loop actually picking up + processing
+    the item, the durable row must remain unacked so a restart replays the
+    completion. Acknowledgement belongs on the *consumer* path, gated by
+    the moment we commit to running the turn.
+
+    We exercise the CLI's drain helper directly. Pre-fix the helper does
+    not exist (or acks synchronously); in both cases the durable row gets
+    acked before the agent can process the queued synth, which would lose
+    a completion across a crash + restart. Post-fix the helper stages the
+    ack for the consumer path.
+    """
+    db_path = tmp_path / "state.db"
+    db = _SessionDB_t8(db_path=db_path)
+    journal = _OpJournal_t8(db)
+    journal.create(operation_id="t8-cli-drain", kind="async_delegation")
+    journal.transition(
+        "t8-cli-drain", from_states={"pending"}, to_state="running",
+        effect_disposition="none",
+    )
+    journal.transition(
+        "t8-cli-drain", from_states={"running"}, to_state="confirmed",
+        effect_disposition="none",
+        result={"status": "completed", "summary": "from-drain",
+                "session_key": "", "parent_session_id": None},
+    )
+    ad._set_journal_for_tests(journal)
+
+    cli = _make_cli_for_drain_test()
+    cli._pending_input = queue.Queue()
+
+    fake_synth = "[SYSTEM: async delegation completed: from-drain]"
+    fake_evt = {"type": "async_delegation", "delegation_id": "t8-cli-drain",
+                "summary": "from-drain", "session_key": "",
+                "parent_session_id": None, "status": "completed"}
+
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.drain_notifications",
+        lambda session_key="": [(_dict_copy(fake_evt), fake_synth)],
+    )
+
+    # Helper under test (defined post-fix). Pre-fix this raises AttributeError.
+    cli._drain_idle_async_delegations()
+
+    # Drain put the synth into _pending_input.
+    assert not cli._pending_input.empty()
+    assert cli._pending_input.get_nowait() == fake_synth
+
+    # KEY invariant: the row is NOT yet acked — the consumer commit must ack.
+    # Pre-fix this assertion FAILS because the synchronous ack already
+    # marked acknowledged_at, so a crash between put and consumption loses
+    # the result forever on restart.
+    rec = journal.get("t8-cli-drain")
+    assert rec is not None
+    assert rec.acknowledged_at is None, (
+        "row was acked synchronously after enqueue; a crash before consumption "
+        "would lose the result on restart"
+    )
+
+    # Simulate a process restart: new journal handle, restore MUST replay
+    # because we did not ack. This is the operational truth: a crash
+    # between put and consume must NOT lose the completion.
+    db.close()
+    ad._reset_for_tests()
+    db2 = _SessionDB_t8(db_path=db_path)
+    journal2 = _OpJournal_t8(db2)
+    ad._set_journal_for_tests(journal2)
+    captured = []
+    n = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue, lambda e: captured.append(e),
+    )
+    db2.close()
+    assert n == 1, "row lost after simulated process death"
+    assert captured and captured[0]["delegation_id"] == "t8-cli-drain"
+
+
+def test_cli_consumer_path_acks_after_commit_to_run(tmp_path, monkeypatch):
+    """Once the consumer path commits to processing the queued synth (the
+    point where a future crash becomes the agent's responsibility, not
+    the durable journal's), the row must be acknowledged. Without this
+    edge, every successfully-processed completion would replay on restart
+    and double-fire the [SYSTEM: ...] block."""
+    db_path = tmp_path / "state.db"
+    db = _SessionDB_t8(db_path=db_path)
+    journal = _OpJournal_t8(db)
+    journal.create(operation_id="t8-cli-consume", kind="async_delegation")
+    journal.transition(
+        "t8-cli-consume", from_states={"pending"}, to_state="running",
+        effect_disposition="none",
+    )
+    journal.transition(
+        "t8-cli-consume", from_states={"running"}, to_state="confirmed",
+        effect_disposition="none",
+        result={"status": "completed", "summary": "consumed"},
+    )
+    ad._set_journal_for_tests(journal)
+
+    cli = _make_cli_for_drain_test()
+    cli._pending_input = queue.Queue()
+
+    fake_synth = "[SYSTEM: async delegation completed: consumed]"
+    fake_evt = {"type": "async_delegation", "delegation_id": "t8-cli-consume",
+                "summary": "consumed", "session_key": "",
+                "parent_session_id": None, "status": "completed"}
+
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.drain_notifications",
+        lambda session_key="": [(_dict_copy(fake_evt), fake_synth)],
+    )
+
+    # Stage the drain (does not ack by itself).
+    cli._drain_idle_async_delegations()
+    assert journal.get("t8-cli-consume").acknowledged_at is None
+
+    # Simulate the consumer pulling the item off the queue and committing
+    # to run it. The CLI ack hook lives at this commit point; if it is
+    # missing, every completion replays on restart (the second part of
+    # the original bug — never-acked rows double-fire).
+    queued = cli._pending_input.get_nowait()
+    assert queued == fake_synth
+    cli._ack_pending_async_delegations(getattr(queued, "delegation_id", ""))
+
+    rec = journal.get("t8-cli-consume")
+    assert rec is not None
+    assert rec.acknowledged_at is not None, (
+        "row was not acknowledged after committing to run it; "
+        "every completion would double-fire on restart"
+    )
+    db.close()
+
+
+def _dict_copy(d):
+    return {k: v for k, v in d.items()}
+
+
+def test_cli_ack_is_scoped_to_consumed_delegation():
+    cli = _make_cli_for_drain_test()
+    cli._pending_delegation_acks = deque(["a", "b"])
+    acknowledged = []
+
+    import tools.async_delegation as async_delegation
+    original = async_delegation.acknowledge_async_delegation
+    async_delegation.acknowledge_async_delegation = acknowledged.append
+    try:
+        cli._ack_pending_async_delegations("a")
+        cli._ack_pending_async_delegations("unrelated")
+    finally:
+        async_delegation.acknowledge_async_delegation = original
+
+    assert acknowledged == ["a"]
+    assert list(cli._pending_delegation_acks) == ["b"]
+
+
+def test_operation_journal_cache_is_scoped_to_profile(monkeypatch):
+    class FakeDB:
+        def __init__(self):
+            self.home = str(ad.get_hermes_home())
+
+    monkeypatch.setattr("hermes_state.SessionDB", FakeDB)
+    ad._set_journal_for_tests(None)
+    monkeypatch.setenv("HERMES_HOME", "/tmp/hermes-profile-a")
+    first = ad._open_journal()
+    monkeypatch.setenv("HERMES_HOME", "/tmp/hermes-profile-b")
+    second = ad._open_journal()
+
+    assert first is not second
+    assert first._db.home != second._db.home
 
 

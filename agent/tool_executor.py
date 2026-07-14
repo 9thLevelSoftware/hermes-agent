@@ -643,10 +643,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
+            result_preview = _multimodal_text_summary(result)
             if is_error:
-                logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
+                logger.info("tool %s failed (%.2fs): %s", function_name, duration, result_preview[:200])
             else:
-                logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+                logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result_preview))
             results[index] = (function_name, function_args, result, duration, is_error, False, middleware_trace)
         finally:
             # Tear down worker-tid tracking.  Clear any interrupt bit we may

@@ -100,6 +100,29 @@ class TestHandleFunctionCall:
             ),
         ]
 
+    def test_execute_code_dispatch_receives_toolset_scope(self):
+        with patch("model_tools.registry.dispatch", return_value='{"ok":true}') as mock_dispatch:
+            result = handle_function_call(
+                "execute_code",
+                {"code": "pass"},
+                task_id="task",
+                session_id="session",
+                enabled_tools=["read_file"],
+                enabled_toolsets=["safe"],
+                disabled_toolsets=["blocked"],
+            )
+
+        assert result == '{"ok":true}'
+        mock_dispatch.assert_called_once_with(
+            "execute_code",
+            {"code": "pass"},
+            task_id="task",
+            session_id="session",
+            enabled_tools=["read_file"],
+            enabled_toolsets=["safe"],
+            disabled_toolsets=["blocked"],
+        )
+
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):
         """Regression: post_tool_call and transform_tool_result hooks must
         receive a non-negative integer ``duration_ms`` kwarg measuring

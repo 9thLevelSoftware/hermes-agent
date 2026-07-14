@@ -63,6 +63,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from hermes_constants import get_hermes_home
+# Imported at module scope so _flush_messages_to_session_db can catch
+# SessionDBClosedError explicitly (and drop _session_db on the first
+# closed-handle failure) without paying an inline import per flush.
+from hermes_state import SessionDBClosedError  # noqa: F401
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -508,6 +512,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         suppress_status_output: bool = False,
+        owns_session_db: bool = False,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -575,6 +580,7 @@ class AIAgent:
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
             session_db=session_db,
+            owns_session_db=owns_session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
             fallback_model=fallback_model,
@@ -607,6 +613,7 @@ class AIAgent:
             from hermes_state import SessionDB
 
             self._session_db = SessionDB()
+            self._owns_session_db = True
             return self._session_db
         except Exception as exc:
             logger.debug("SessionDB unavailable for recall", exc_info=True)
@@ -636,6 +643,74 @@ class AIAgent:
             # _session_db_created stays False so next run_conversation() retries.
             logger.warning(
                 "Session DB creation failed (will retry next turn): %s", e
+            )
+
+    # ── Session lease (Task4) ──────────────────────────────────────────────
+    # Conservative ownership claim on the session row. The lease is
+    # informational — agents touch it on every turn prologue, close()
+    # releases it, and reconciliation (separate caller, no background
+    # thread) ends expired rows + marks their sessions abandoned.
+    def _lease_owner_id_for(self) -> str:
+        """Stable owner id for this agent process.
+
+        Lazily built on first use so non-session-DB agents never pay for
+        it. Format mirrors _compression_lock_holder (pid:tid:agent-instance)
+        so the two locking systems share an identifiable owner shape.
+        """
+        owner = getattr(self, "_lease_owner_id", None)
+        if owner:
+            return owner
+        import os
+        import threading
+        owner = (
+            f"pid={os.getpid()}"
+            f":tid={threading.get_ident()}"
+            f":agent={id(self):x}"
+        )
+        self._lease_owner_id = owner
+        return owner
+
+    def _claim_or_touch_session_lease(self) -> None:
+        """First-turn claim; subsequent turns touch. Never raises.
+
+        Best-effort — the lease is informational. A failed claim (someone
+        else owns the lease) or DB error leaves the existing owner in
+        place; we don't compete, we just note our presence.
+        """
+        if getattr(self, "_persist_disabled", False):
+            return
+        db = getattr(self, "_session_db", None)
+        sid = getattr(self, "session_id", None)
+        if db is None or not sid:
+            return
+        try:
+            from agent.agent_init import SESSION_LEASE_TTL_SECONDS
+            owner = self._lease_owner_id_for()
+            # Try touch first; if that fails (no lease yet, or someone else
+            # owns it), fall back to claim. Order matters: subsequent
+            # turns almost always hit the touch path and skip the claim's
+            # DELETE-expired round-trip.
+            if not db.touch_session_lease(sid, owner, SESSION_LEASE_TTL_SECONDS):
+                db.claim_session_lease(sid, owner, SESSION_LEASE_TTL_SECONDS)
+        except Exception as exc:
+            logger.debug(
+                "session lease claim/touch skipped for %s: %s", sid, exc,
+            )
+
+    def _release_session_lease(self) -> None:
+        """Best-effort release on close. Never raises."""
+        if getattr(self, "_persist_disabled", False):
+            return
+        db = getattr(self, "_session_db", None)
+        sid = getattr(self, "session_id", None)
+        owner = getattr(self, "_lease_owner_id", None)
+        if db is None or not sid or not owner:
+            return
+        try:
+            db.release_session_lease(sid, owner)
+        except Exception as exc:
+            logger.debug(
+                "session lease release skipped for %s: %s", sid, exc,
             )
 
     def _transition_context_engine_session(
@@ -1973,6 +2048,15 @@ class AIAgent:
             # allocated next turn at a recycled address.
             self._flushed_db_message_ids = set()
             self._last_flushed_db_idx = len(messages)
+        except SessionDBClosedError:
+            # Handle was closed mid-flush (gateway disconnect, profile
+            # switch, explicit shutdown). Drop the reference so subsequent
+            # turns degrade cleanly via `if not self._session_db:` instead
+            # of repeatedly tripping the closed handle. Transient sqlite
+            # errors stay in the `except Exception` branch and keep the
+            # handle alive for next-turn retry.
+            self._session_db = None
+            logger.warning("Session DB closed mid-flush; disabling _session_db")
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
 
@@ -3636,14 +3720,58 @@ class AIAgent:
         # must leave it open). end_session() is first-reason-wins and no-ops on
         # an already-ended row, so this never clobbers a 'compression' /
         # 'cron_complete' / 'cli_close' reason set by an earlier terminal path.
-        try:
-            if getattr(self, "_end_session_on_close", True):
-                session_db = getattr(self, "_session_db", None)
-                session_id = getattr(self, "session_id", None)
-                if session_db and session_id:
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "session_id", None)
+        session_db_close_lock = getattr(self, "_session_db_close_lock", None)
+        if session_db_close_lock is None:
+            session_db_close_lock = threading.Lock()
+            self._session_db_close_lock = session_db_close_lock
+        with session_db_close_lock:
+            session_end_failed = False
+            if (
+                getattr(self, "_end_session_on_close", True)
+                and not getattr(self, "_session_end_called", False)
+                and session_db is not None
+                and session_id
+            ):
+                try:
                     session_db.end_session(session_id, "agent_close")
-        except Exception:
-            pass
+                except Exception:
+                    session_end_failed = True
+                else:
+                    self._session_end_called = True
+
+            # Session lease release (Task4): after end_session so the
+            # lease is the last thing we touch on the row in this
+            # process. Best-effort and never raises (helper swallows).
+            if (
+                not session_end_failed
+                and session_db is not None
+                and session_id
+            ):
+                try:
+                    self._release_session_lease()
+                except Exception:
+                    pass
+
+            if (
+                getattr(self, "_owns_session_db", False)
+                and not getattr(self, "_session_db_closed", False)
+                and session_db is not None
+            ):
+                # ponytail: detect partial close after raise — close() may
+                # have torn down _conn and then raised; treat the observed
+                # state as authoritative so a non-idempotent DB isn't
+                # closed twice on a follow-up agent.close(). The DB is
+                # considered closed if close() returned without raising OR
+                # if its observed _conn is None post-attempt.
+                close_raised = False
+                try:
+                    session_db.close()
+                except Exception:
+                    close_raised = True
+                if not close_raised or not getattr(session_db, "is_open", False):
+                    self._session_db_closed = True
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
@@ -5740,10 +5868,10 @@ class AIAgent:
         self,
         tool_name: str,
         function_args: dict,
-        function_result: str,
+        function_result: Any,
         *,
         failed: bool,
-    ) -> str:
+    ) -> Any:
         decision = self._tool_guardrails.after_call(
             tool_name,
             function_args,
@@ -5751,7 +5879,19 @@ class AIAgent:
             failed=failed,
         )
         if decision.action in {"warn", "halt"}:
-            function_result = append_toolguard_guidance(function_result, decision)
+            if _is_multimodal_tool_result(function_result):
+                function_result = dict(function_result)
+                content = list(function_result.get("content") or [])
+                summary = append_toolguard_guidance(
+                    _multimodal_text_summary(function_result), decision,
+                )
+                function_result["text_summary"] = summary
+                function_result["content"] = [
+                    {"type": "text", "text": summary},
+                    *content,
+                ]
+            else:
+                function_result = append_toolguard_guidance(function_result, decision)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
         return function_result
