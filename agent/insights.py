@@ -1173,3 +1173,45 @@ class InsightsEngine:
                 lines.append(f"**Best streak:** {act['max_streak']} consecutive days")
 
         return "\n".join(lines)
+
+    def format_terminal_learning(self, report: Dict) -> str:
+        """Format the learning/verbose insights report for terminal display.
+
+        Extends the standard report with per-skill utility details
+        (samples/helped/hurt/utility) and reflection trigger counts.
+        The default format_terminal output is unchanged by learning data.
+        """
+        base = self.format_terminal(report)
+        lines = [base]
+
+        # Skill utility details
+        skill_utility = report.get("skill_utility") or []
+        if skill_utility:
+            lines.append("")
+            lines.append("  🔬 Skill Utility (learning)")
+            lines.append("  " + "─" * 56)
+            lines.append(f"  {'Skill':<28} {'Samples':>7} {'Helped':>7} {'Hurt':>5} {'Utility':>8}")
+            for row in skill_utility[:15]:
+                name = str(row.get("skill", "?"))[:28]
+                samples = row.get("count", 0)
+                helped = row.get("helped", 0)
+                hurt = row.get("hurt", 0)
+                utility = row.get("utility")
+                util_str = f"{utility:.2f}" if utility is not None else "n/a"
+                lines.append(f"  {name:<28} {samples:>7} {helped:>7} {hurt:>5} {util_str:>8}")
+            if len(skill_utility) > 15:
+                lines.append(f"  ... and {len(skill_utility) - 15} more skills")
+            lines.append("")
+
+        # Reflection trigger counts
+        triggers = report.get("reflection_triggers") or []
+        if triggers:
+            lines.append("  🔔 Reflection Triggers")
+            lines.append("  " + "─" * 56)
+            for t in triggers:
+                kind = t.get("kind", "unknown")
+                count = t.get("count", 0)
+                lines.append(f"  {kind:<28} {count:>7}")
+            lines.append("")
+
+        return "\n".join(lines)

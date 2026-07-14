@@ -1464,6 +1464,74 @@ def _current_session_platform_hint() -> str:
         return ""
 
 
+# =========================================================================
+# Utility-based skill ranking
+# =========================================================================
+
+
+def _load_utility_ranking_config() -> dict:
+    """Read skills.utility_ranking config. Returns dict with enabled/min_samples/utility_weight."""
+    defaults = {"enabled": False, "min_samples": 5, "utility_weight": 0.7}
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        if isinstance(cfg, dict):
+            skills_cfg = cfg.get("skills") or {}
+            if isinstance(skills_cfg, dict):
+                ur = skills_cfg.get("utility_ranking") or {}
+                if isinstance(ur, dict):
+                    defaults["enabled"] = bool(ur.get("enabled", defaults["enabled"]))
+                    defaults["min_samples"] = int(ur.get("min_samples", defaults["min_samples"]))
+                    defaults["utility_weight"] = float(ur.get("utility_weight", defaults["utility_weight"]))
+    except Exception:
+        pass
+    return defaults
+
+
+def _load_skill_utility_records() -> dict[str, dict]:
+    """Load per-skill utility data from the sidecar. Returns {} on failure.
+
+    Reads the sidecar once per snapshot-build; callers cache the result.
+    """
+    try:
+        from tools.skill_usage import load_usage, get_skill_utility, MIN_UTILITY_SAMPLES
+        data = load_usage()
+    except Exception:
+        return {}
+    records: dict[str, dict] = {}
+    for name in data:
+        try:
+            util = get_skill_utility(name)
+            records[name] = util
+        except Exception:
+            continue
+    return records
+
+
+def _utility_sort_key(
+    name: str,
+    utility_records: dict,
+    utility_weight: float,
+    min_samples: int,
+) -> tuple:
+    """Sort key for skills within a category when utility ranking is enabled.
+
+    Returns (eligible_flag, -score, name). Ineligible skills sort last
+    (eligible_flag=0) and keep alphabetical order. Eligible skills sort
+    first (eligible_flag=1) by blended score descending.
+    """
+    rec = utility_records.get(name, {})
+    eligible = bool(rec.get("eligible"))
+    utility = rec.get("utility")
+    if not eligible or utility is None:
+        return (0, 0.0, name)  # ineligible: sort after eligible, alpha within
+    # ponytail: lexical_relevance is constant (no query context) — all skills
+    # have the same lexical relevance when there's no search query. Use 1.0
+    # so the formula reduces to utility_weight * utility + (1 - weight) * 1.0.
+    score = utility_weight * utility + (1 - utility_weight) * 1.0
+    return (1, -score, name)  # eligible: sort first, higher score first
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
@@ -1666,6 +1734,12 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
+        # Load utility records once when ranking is enabled (not per API call)
+        ur_cfg = _load_utility_ranking_config()
+        utility_records = _load_skill_utility_records() if ur_cfg["enabled"] else {}
+        utility_weight = ur_cfg["utility_weight"]
+        min_samples = ur_cfg["min_samples"]
+
         index_lines = []
         for category in sorted(skills_by_category.keys()):
             # Deduplicate and sort skills within each category
@@ -1679,7 +1753,16 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+
+            if utility_records:
+                _ur = utility_records
+                _uw = utility_weight
+                _ms = min_samples
+                sort_key = lambda x: _utility_sort_key(x[0], _ur, _uw, _ms)
+            else:
+                sort_key = lambda x: x[0]
+
+            for name, desc in sorted(skills_by_category[category], key=sort_key):
                 if name in seen:
                     continue
                 seen.add(name)

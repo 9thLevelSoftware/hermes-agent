@@ -14,6 +14,7 @@ which misled users into thinking consolidated skills had been pruned.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1123,3 +1124,40 @@ def test_rename_summary_pin_hint_picks_one_umbrella_when_multiple_absorbed(curat
     # Exactly one hint line, not one per umbrella.
     pin_lines = [ln for ln in result.splitlines() if "hermes curator pin" in ln]
     assert len(pin_lines) == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 4 — utility evidence in curator candidate list
+# ---------------------------------------------------------------------------
+
+
+def test_render_candidate_list_includes_utility_evidence(curator_env, monkeypatch):
+    """Curator candidate list includes utility counts for skills with outcome data."""
+    from tools import skill_usage as su
+
+    # Mock agent_created_report to return a known candidate
+    mock_rows = [
+        {"name": "good-skill", "state": "active", "pinned": False,
+         "activity_count": 10, "use_count": 10, "view_count": 5,
+         "patch_count": 1, "last_activity_at": "2026-01-01T00:00:00+00:00"},
+    ]
+    monkeypatch.setattr(su, "agent_created_report", lambda: mock_rows)
+    # Mock get_skill_utility to return outcome data
+    mock_utility = {
+        "skill": "good-skill", "count": 10, "helped": 8, "hurt": 2,
+        "neutral": 0, "cost_usd": 0.05, "eligible": True, "utility": 9/12,
+    }
+    monkeypatch.setattr(su, "get_skill_utility", lambda name: mock_utility if name == "good-skill" else {"skill": name, "count": 0, "helped": 0, "hurt": 0, "neutral": 0, "cost_usd": 0.0, "eligible": False, "utility": None})
+
+    result = curator_env._render_candidate_list()
+    assert "good-skill" in result
+    assert "utility=" in result
+    assert "samples=" in result
+    assert "helped=" in result
+    assert "hurt=" in result
+
+
+def test_curator_prompt_mentions_utility_caveat(curator_env):
+    """The curator prompt includes the caveat that utility cannot authorize deletion."""
+    prompt = curator_env.CURATOR_REVIEW_PROMPT
+    assert "usage counters" in prompt.lower()

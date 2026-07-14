@@ -1649,6 +1649,156 @@ class TestParallelToolCallGuidance:
 
 
 # =========================================================================
+# Task 4 — utility ranking in skill index
+# =========================================================================
+
+
+class TestUtilityRankingConfig:
+    """Config defaults for skills.utility_ranking exist."""
+
+    def test_default_config_has_utility_ranking_keys(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+        assert "utility_ranking" in DEFAULT_CONFIG["skills"]
+        ur = DEFAULT_CONFIG["skills"]["utility_ranking"]
+        assert ur["enabled"] is False
+        assert ur["min_samples"] == 5
+        assert ur["utility_weight"] == 0.7
+
+
+class TestUtilityRankedSkillIndex:
+    """When utility ranking is enabled, eligible skills are reordered by utility."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_skills_cache(self):
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        yield
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+
+    def _make_skill(self, skills_dir, category, name, desc):
+        d = skills_dir / category / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {desc}\n---\n"
+        )
+
+    def test_utility_ranking_disabled_preserves_alphabetical(self, monkeypatch, tmp_path):
+        """With ranking disabled (default), order is alphabetical within category."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        sd = tmp_path / "skills"
+        self._make_skill(sd, "tools", "aaa-first", "First skill")
+        self._make_skill(sd, "tools", "zzz-last", "Last skill")
+        result = build_skills_system_prompt()
+        idx_first = result.index("aaa-first")
+        idx_last = result.index("zzz-last")
+        assert idx_first < idx_last
+
+    def test_utility_ranking_reorders_eligible_skills(self, monkeypatch, tmp_path):
+        """Eligible skills with high utility rank above those with low utility."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # Enable utility ranking via config
+        (tmp_path / "config.yaml").write_text(
+            "skills:\n  utility_ranking:\n    enabled: true\n    min_samples: 5\n    utility_weight: 0.7\n"
+        )
+        sd = tmp_path / "skills"
+        self._make_skill(sd, "tools", "aaa-low", "Low utility skill")
+        self._make_skill(sd, "tools", "zzz-high", "High utility skill")
+        # Seed utility sidecar
+        from tools import skill_usage as su
+        import importlib
+        (tmp_path / "skills").mkdir(parents=True, exist_ok=True)
+        importlib.reload(su)
+        su.save_usage({
+            "zzz-high": {
+                "use_count": 10, "helped": 10, "hurt": 0, "neutral": 0,
+                "outcome_counts": {"verified": 10}, "outcome_cost_usd": 0.1,
+                "last_outcome_at": "2026-01-01T00:00:00+00:00",
+            },
+            "aaa-low": {
+                "use_count": 10, "helped": 2, "hurt": 8, "neutral": 0,
+                "outcome_counts": {"verified": 2, "failed": 8}, "outcome_cost_usd": 0.1,
+                "last_outcome_at": "2026-01-01T00:00:00+00:00",
+            },
+        })
+        result = build_skills_system_prompt()
+        # With utility ranking, zzz-high (utility ~11/12) should appear
+        # before aaa-low (utility ~3/12) within the tools category
+        idx_high = result.index("zzz-high")
+        idx_low = result.index("aaa-low")
+        assert idx_high < idx_low, "High-utility skill should rank before low-utility"
+
+    def test_below_min_samples_preserves_existing_order(self, monkeypatch, tmp_path):
+        """Skills below min_samples keep alphabetical order even when ranking is on."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # Enable utility ranking via config
+        (tmp_path / "config.yaml").write_text(
+            "skills:\n  utility_ranking:\n    enabled: true\n    min_samples: 5\n    utility_weight: 0.7\n"
+        )
+        sd = tmp_path / "skills"
+        self._make_skill(sd, "tools", "aaa-sparse", "Sparse skill")
+        self._make_skill(sd, "tools", "zzz-sparse2", "Sparse skill 2")
+        from tools import skill_usage as su
+        import importlib
+        (tmp_path / "skills").mkdir(parents=True, exist_ok=True)
+        importlib.reload(su)
+        su.save_usage({
+            "zzz-sparse2": {
+                "use_count": 3, "helped": 3, "hurt": 0, "neutral": 0,
+                "outcome_counts": {"verified": 3}, "outcome_cost_usd": 0.0,
+                "last_outcome_at": "2026-01-01T00:00:00+00:00",
+            },
+        })
+        result = build_skills_system_prompt()
+        idx_aaa = result.index("aaa-sparse")
+        idx_zzz = result.index("zzz-sparse2")
+        assert idx_aaa < idx_zzz, "Below-min skills stay alphabetical"
+
+    def test_skill_index_utility_order_is_snapshot_stable(self, monkeypatch, tmp_path):
+        """Ordering is session-stable: calling again with different sidecar data
+        returns the cached result until the snapshot is cleared."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # Enable utility ranking via config
+        (tmp_path / "config.yaml").write_text(
+            "skills:\n  utility_ranking:\n    enabled: true\n    min_samples: 5\n    utility_weight: 0.7\n"
+        )
+        sd = tmp_path / "skills"
+        self._make_skill(sd, "tools", "aaa-skill", "Skill A")
+        self._make_skill(sd, "tools", "zzz-skill", "Skill Z")
+        from tools import skill_usage as su
+        import importlib
+        (tmp_path / "skills").mkdir(parents=True, exist_ok=True)
+        importlib.reload(su)
+        su.save_usage({
+            "zzz-skill": {
+                "use_count": 8, "helped": 8, "hurt": 0, "neutral": 0,
+                "outcome_counts": {"verified": 8}, "outcome_cost_usd": 0.1,
+                "last_outcome_at": "2026-01-01T00:00:00+00:00",
+            },
+            "aaa-skill": {
+                "use_count": 8, "helped": 1, "hurt": 7, "neutral": 0,
+                "outcome_counts": {"verified": 1, "failed": 7}, "outcome_cost_usd": 0.1,
+                "last_outcome_at": "2026-01-01T00:00:00+00:00",
+            },
+        })
+        first = build_skills_system_prompt()
+        # Now change the sidecar (flip utility)
+        su.save_usage({
+            "zzz-skill": {
+                "use_count": 8, "helped": 1, "hurt": 7, "neutral": 0,
+                "outcome_counts": {"verified": 1, "failed": 7}, "outcome_cost_usd": 0.1,
+                "last_outcome_at": "2026-01-01T00:00:00+00:00",
+            },
+            "aaa-skill": {
+                "use_count": 8, "helped": 8, "hurt": 0, "neutral": 0,
+                "outcome_counts": {"verified": 8}, "outcome_cost_usd": 0.1,
+                "last_outcome_at": "2026-01-01T00:00:00+00:00",
+            },
+        })
+        second = build_skills_system_prompt()
+        assert first == second, "Snapshot must be stable until explicitly cleared"
+
+
+# =========================================================================
 # Budget warning history stripping
 # =========================================================================
 

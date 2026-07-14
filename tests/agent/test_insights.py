@@ -938,3 +938,75 @@ class TestEdgeCases:
         # Depending on timing, might catch the session if created <1s ago
         # Just verify it doesn't crash
         assert "empty" in report
+
+
+# =========================================================================
+# Task 4 — Insights verbose/learning format includes utility + trigger counts
+# =========================================================================
+
+
+class TestLearningVerboseFormat:
+    def test_format_terminal_learning_shows_skill_utility_details(self, populated_db, tmp_path):
+        """Verbose learning format shows per-skill samples/helped/hurt/utility."""
+        from tools import skill_usage as su
+        import importlib
+
+        home = tmp_path / ".hermes_v"
+        home.mkdir()
+        (home / "skills").mkdir()
+        os.environ["HERMES_HOME"] = str(home)
+        importlib.reload(su)
+
+        su.save_usage({
+            "plan": {
+                "use_count": 10, "helped": 8, "hurt": 2, "neutral": 0,
+                "outcome_counts": {"verified": 8, "failed": 2},
+                "outcome_cost_usd": 0.05,
+                "last_outcome_at": "2026-01-01T00:00:00+00:00",
+            },
+        })
+
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30, learning=True)
+        text = engine.format_terminal_learning(report)
+
+        assert "plan" in text
+        assert "samples" in text.lower()
+        assert "helped" in text.lower()
+        assert "hurt" in text.lower()
+
+    def test_format_terminal_learning_shows_trigger_counts(self, db):
+        """Verbose learning format shows reflection trigger counts when data exists."""
+        from agent.turn_ledger import TurnOutcomeRecord
+
+        db.create_session(session_id="sT", source="cli", model="m")
+        db.record_turn_outcome(TurnOutcomeRecord(
+            session_id="sT", turn_id="t1", created_at=time.time(),
+            outcome="failed", outcome_reason="err", turn_exit_reason="text_response",
+            api_calls=1, tool_iterations=0, retry_count=0, guardrail_halt=None,
+            cost_usd_delta=0.0, input_tokens_delta=0, output_tokens_delta=0,
+            cache_read_tokens_delta=0, skills_loaded=("plan",), model="m",
+        ))
+        db.record_turn_outcome(TurnOutcomeRecord(
+            session_id="sT", turn_id="t2", created_at=time.time(),
+            outcome="verified", outcome_reason="ok", turn_exit_reason="text_response",
+            api_calls=1, tool_iterations=0, retry_count=0, guardrail_halt=None,
+            cost_usd_delta=0.0, input_tokens_delta=0, output_tokens_delta=0,
+            cache_read_tokens_delta=0, skills_loaded=("plan",), model="m",
+        ))
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30, learning=True)
+        text = engine.format_terminal_learning(report)
+
+        assert "trigger" in text.lower() or "reflection" in text.lower()
+
+    def test_format_terminal_default_unchanged_by_learning(self, populated_db):
+        """Default format_terminal output is unchanged when learning data exists."""
+        engine = InsightsEngine(populated_db)
+        report_without = engine.generate(days=30, learning=False)
+        report_with = engine.generate(days=30, learning=True)
+        text_without = engine.format_terminal(report_without)
+        text_with = engine.format_terminal(report_with)
+        # Default format should be identical regardless of learning data
+        assert text_without == text_with
