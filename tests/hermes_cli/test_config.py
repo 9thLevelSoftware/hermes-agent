@@ -118,6 +118,20 @@ class TestLoadConfigDefaults:
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
 
+    def test_code_execution_defaults_are_backward_compatible(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config()
+
+        code_execution = config["code_execution"]
+        assert code_execution["mode"] == "project"
+        assert code_execution["persistent"] is False
+        assert code_execution["kernel_idle_ttl"] == 900
+        assert code_execution["timeout"] == 300
+        assert code_execution["max_tool_calls"] == 50
+        assert code_execution["max_stdout_bytes"] == 50_000
+        assert code_execution["max_stderr_bytes"] == 10_000
+        assert code_execution["artifact_dir"] == "/tmp/hermes-results"
+
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             config_path = tmp_path / "config.yaml"
