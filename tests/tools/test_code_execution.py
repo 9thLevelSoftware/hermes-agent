@@ -1858,6 +1858,25 @@ def test_execute_code_spills_redacted_large_output_to_durable_file(tmp_path, mon
     assert len(result["output"]) < 2000
 
 
+def test_execute_code_spills_oversized_text_even_with_image_content(monkeypatch):
+    monkeypatch.setattr(code_execution_tool, "MAX_STDOUT_BYTES", 128)
+    result = json.loads(execute_code(
+        "import json\n"
+        "print(json.dumps(['x' * 2000, 'data:image/png;base64,AAAA']))",
+        task_id="structured-image-mixed-large-output",
+    ))
+
+    assert result["status"] == "success"
+    assert result["_multimodal"] is True
+    assert result["content"] == [{
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,AAAA"},
+    }]
+    assert result["truncated"] is True
+    assert os.path.isfile(result["artifact_path"])
+    assert len(result["output"]) < 2000
+
+
 def test_generated_save_artifact_persists_a_real_file(tmp_path):
     source = tmp_path / "report.txt"
     source.write_text("artifact output", encoding="utf-8")

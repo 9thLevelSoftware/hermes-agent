@@ -552,13 +552,11 @@ def _prepare_execute_output(text: Any, limit: int) -> tuple[str, Optional[str], 
     """Clean output, preserve images, and spill oversized text before truncating."""
     cleaned = _clean_execute_text(text)
     image_parts = _image_parts_from_output(cleaned)
-    if image_parts:
-        return cleaned, None, image_parts
     artifact_path = None
     if len(cleaned) > limit:
         artifact_path = _persist_execute_artifact(cleaned)
         cleaned = _truncate_execute_output(cleaned, limit)
-    return cleaned, artifact_path, []
+    return cleaned, artifact_path, image_parts
 
 
 def _attach_execute_artifacts(
