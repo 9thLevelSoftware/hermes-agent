@@ -1516,18 +1516,25 @@ def _utility_sort_key(
 ) -> tuple:
     """Sort key for skills within a category when utility ranking is enabled.
 
-    Returns (eligible_flag, -score, name). Ineligible skills sort last
-    (eligible_flag=0) and keep alphabetical order. Eligible skills sort
-    first (eligible_flag=1) by blended score descending.
+    Returns (eligible_flag, -score, name). Eligible skills sort first
+    (eligible_flag=1) by blended score descending; ineligible sort last
+    (eligible_flag=0) and keep alphabetical order.
+
+    Eligibility is determined by the *caller's* ``min_samples`` (from config),
+    not the sidecar's hardcoded ``MIN_UTILITY_SAMPLES``.  This lets users
+    tune the floor up or down.
     """
     rec = utility_records.get(name, {})
-    eligible = bool(rec.get("eligible"))
-    utility = rec.get("utility")
-    if not eligible or utility is None:
-        return (0, 0.0, name)  # ineligible: sort after eligible, alpha within
+    # Recompute from raw counts so config min_samples controls eligibility
+    helped = int(rec.get("helped", 0))
+    hurt = int(rec.get("hurt", 0))
+    count = helped + hurt
+    if count < min_samples:
+        return (0, 0.0, name)  # below configured threshold: keep alpha order
     # ponytail: lexical_relevance is constant (no query context) — all skills
     # have the same lexical relevance when there's no search query. Use 1.0
     # so the formula reduces to utility_weight * utility + (1 - weight) * 1.0.
+    utility = (helped + 1.0) / (helped + hurt + 2.0)
     score = utility_weight * utility + (1 - utility_weight) * 1.0
     return (1, -score, name)  # eligible: sort first, higher score first
 

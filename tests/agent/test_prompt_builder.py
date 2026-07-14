@@ -1753,6 +1753,48 @@ class TestUtilityRankedSkillIndex:
         idx_zzz = result.index("zzz-sparse2")
         assert idx_aaa < idx_zzz, "Below-min skills stay alphabetical"
 
+    def test_config_min_samples_controls_eligibility(self, monkeypatch, tmp_path):
+        """Configured min_samples overrides the hardcoded MIN_UTILITY_SAMPLES.
+
+        With min_samples=3 in config, a skill with 3 helped samples should
+        become eligible for ranking — even though the sidecar's hardcoded
+        MIN_UTILITY_SAMPLES is 5.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # min_samples: 3 means 3 samples is enough
+        (tmp_path / "config.yaml").write_text(
+            "skills:\n  utility_ranking:\n    enabled: true\n    min_samples: 3\n    utility_weight: 0.7\n"
+        )
+        sd = tmp_path / "skills"
+        self._make_skill(sd, "tools", "aaa-low", "Low skill")
+        self._make_skill(sd, "tools", "zzz-high", "High skill")
+        from tools import skill_usage as su
+        import importlib
+        (tmp_path / "skills").mkdir(parents=True, exist_ok=True)
+        importlib.reload(su)
+        # Both have exactly 3 samples — below hardcoded MIN_UTILITY_SAMPLES=5
+        # but at or above config min_samples=3
+        su.save_usage({
+            "zzz-high": {
+                "use_count": 3, "helped": 3, "hurt": 0, "neutral": 0,
+                "outcome_counts": {"verified": 3}, "outcome_cost_usd": 0.0,
+                "last_outcome_at": "2026-01-01T00:00:00+00:00",
+            },
+            "aaa-low": {
+                "use_count": 3, "helped": 0, "hurt": 3, "neutral": 0,
+                "outcome_counts": {"failed": 3}, "outcome_cost_usd": 0.0,
+                "last_outcome_at": "2026-01-01T00:00:00+00:00",
+            },
+        })
+        result = build_skills_system_prompt()
+        # zzz-high has utility ~0.80 (4/5), aaa-low has utility ~0.20 (1/5)
+        # With min_samples=3, both are eligible; zzz-high should rank first
+        idx_high = result.index("zzz-high")
+        idx_low = result.index("aaa-low")
+        assert idx_high < idx_low, (
+            "Config min_samples=3 should make 3-sample skills eligible for ranking"
+        )
+
     def test_skill_index_utility_order_is_snapshot_stable(self, monkeypatch, tmp_path):
         """Ordering is session-stable: calling again with different sidecar data
         returns the cached result until the snapshot is cleared."""

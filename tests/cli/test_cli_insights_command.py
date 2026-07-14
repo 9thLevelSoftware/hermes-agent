@@ -16,6 +16,9 @@ class _InsightsEngineStub:
     def format_terminal(self, report):
         return f"days={report['days']} source={report['source']}"
 
+    def format_terminal_learning(self, report):
+        return f"LEARNING days={report['days']} source={report['source']}"
+
 
 def _run_show_insights(command: str):
     cli_obj = HermesCLI.__new__(HermesCLI)
@@ -41,3 +44,23 @@ def test_cli_insights_keeps_days_flag_and_source(capsys):
     assert calls == [{"days": 14, "source": "discord"}]
     db.close.assert_called_once()
     assert "days=14 source=discord" in capsys.readouterr().out
+
+
+def test_cli_insights_learning_flag(capsys):
+    """--learning flag routes to format_terminal_learning instead of format_terminal."""
+    calls, db = _run_show_insights("/insights --learning")
+
+    assert calls == [{"days": 30, "source": None}]
+    out = capsys.readouterr().out
+    assert "LEARNING" in out, "format_terminal_learning should be called when --learning is passed"
+    assert "days=30" in out
+
+
+def test_cli_insights_learning_with_days_and_source(capsys):
+    """--learning works alongside --days and --source."""
+    calls, db = _run_show_insights("/insights --days 7 --source cli --learning")
+
+    assert calls == [{"days": 7, "source": "cli"}]
+    out = capsys.readouterr().out
+    assert "LEARNING" in out
+    assert "days=7" in out
