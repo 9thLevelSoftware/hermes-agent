@@ -76,6 +76,81 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["agent_persisted"] is True
 
 
+def test_codex_turn_exit_reason_is_not_turn_id():
+    """Regression: codex_runtime must NOT store turn.turn_id as the
+    turn_exit_reason. The ``turn_id`` is an opaque codex identifier (UUID
+    like ``01938e75-...``) — it is not an exit reason and would corrupt any
+    downstream analytics that group by exit reason. The ledger should see
+    a stable fallback (``codex_response`` on success, ``codex_error`` on
+    failure).
+    """
+    from agent.codex_runtime import run_codex_app_server_turn
+    from agent.turn_ledger import TurnOutcomeRecord
+
+    captured = []
+
+    agent = _make_agent(session_db=None)
+    agent._session_db = _CapturingDB(captured)
+
+    # Success path
+    success_turn = SimpleNamespace(
+        interrupted=False,
+        error=None,
+        thread_id="thread-1",
+        turn_id="OPQAQUE-UUID-01938e75-DO-NOT-LEAK",
+        projected_messages=[{"role": "assistant", "content": "ok"}],
+        tool_iterations=0,
+        final_text="ok",
+        should_retire=False,
+    )
+    agent._codex_session.run_turn.return_value = success_turn
+    run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+    assert captured, "ledger write never happened on codex success path"
+    success_record = captured[-1]
+    assert isinstance(success_record, TurnOutcomeRecord)
+    # Must be the stable fallback, NOT the opaque codex turn_id.
+    assert success_record.turn_exit_reason == "codex_response"
+    assert "01938e75" not in (success_record.turn_exit_reason or "")
+
+    # Error path
+    captured.clear()
+    error_turn = SimpleNamespace(
+        interrupted=False,
+        error="RPC timeout",
+        thread_id="thread-2",
+        turn_id="OPQAQUE-UUID-2",
+        projected_messages=[],
+        tool_iterations=0,
+        final_text="",
+        should_retire=False,
+    )
+    agent._codex_session.run_turn.return_value = error_turn
+    run_codex_app_server_turn(
+        agent,
+        user_message="hi",
+        original_user_message="hi",
+        messages=[{"role": "user", "content": "hi"}],
+        effective_task_id="task-2",
+    )
+    assert captured
+    error_record = captured[-1]
+    assert error_record.turn_exit_reason == "codex_error"
+
+
+class _CapturingDB:
+    def __init__(self, sink):
+        self._sink = sink
+
+    def record_turn_outcome(self, record):
+        self._sink.append(record)
+
+
 def test_codex_turn_persists_each_message_exactly_once():
     """The user turn (flushed at turn start) must not be duplicated; the
     projected assistant message must land once.  Uses a real SessionDB and the

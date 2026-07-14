@@ -534,11 +534,18 @@ def run_codex_app_server_turn(
             build_turn_outcome_record,
             record_turn_outcome_safely,
         )
+        # turn.turn_id is an opaque codex UUID, NOT an exit reason — store
+        # a stable fallback so downstream analytics can group codex turns
+        # alongside chat-completions turns without leaking UUIDs into the
+        # ledger's reason dimension.
+        codex_exit_reason = (
+            "codex_error" if getattr(turn, "error", None) else "codex_response"
+        )
         _turn_outcome_record = build_turn_outcome_record(
             agent,
             outcome=turn_outcome["outcome"],
             outcome_reason=turn_outcome["reason"],
-            turn_exit_reason=turn.turn_id or "",
+            turn_exit_reason=codex_exit_reason,
             api_calls=api_calls,
             tool_iterations=turn.tool_iterations,
         )

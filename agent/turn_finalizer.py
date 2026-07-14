@@ -166,13 +166,25 @@ def finalize_turn(
             build_turn_outcome_record,
             record_turn_outcome_safely,
         )
+        # tool_iterations must reflect the actual tool-call count from the
+        # turn's messages — NOT ``agent._iters_since_skill`` (a skill-nudge
+        # cadence counter with no relation to model-issued tool calls).
+        # ``_turn_tool_count`` is already computed below in the diagnostic
+        # block; recompute it here so the ledger row is independent of
+        # diagnostic ordering and survives refactors of the trailing log.
+        _turn_tool_count = sum(
+            1 for m in messages
+            if isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and m.get("tool_calls")
+        )
         _turn_outcome_record = build_turn_outcome_record(
             agent,
             outcome=_turn_outcome["outcome"],
             outcome_reason=_turn_outcome["reason"],
             turn_exit_reason=_turn_exit_reason,
             api_calls=api_call_count,
-            tool_iterations=getattr(agent, "_iters_since_skill", 0) or 0,
+            tool_iterations=_turn_tool_count,
         )
         record_turn_outcome_safely(getattr(agent, "_session_db", None),
                                    _turn_outcome_record)

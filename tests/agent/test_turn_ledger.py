@@ -485,6 +485,379 @@ def _finalizer_agent(verification_status="passed"):
     return agent
 
 
+# ---------------------------------------------------------------------------
+# Per-turn token/cost snapshot + delta computation.
+#
+# The chat-completions path now captures the agent's session counters at the
+# turn-start boundary inside ``build_turn_context``. Without that snapshot,
+# the deltas reported in the ledger would equal the session totals from turn
+# 1 onward — overstating every turn's cost by the cumulative session spend
+# and breaking any learning pipeline that aggregates per-turn cost.
+# ---------------------------------------------------------------------------
+
+
+def test_build_turn_outcome_record_uses_turn_start_snapshot_for_deltas(monkeypatch):
+    """Snapshot captured at turn start yields exact end-minus-start deltas.
+
+    Models the chat-completions path: ``build_turn_context`` stashes the
+    agent's token/cost counters on ``agent._turn_token_cost_snapshot`` at
+    turn-start, then ``build_turn_outcome_record`` subtracts them from the
+    end-of-turn counters. Asserts the four canonical fields (input, output,
+    cache_read, cost) and the missing-counter → zero behavior.
+    """
+    from agent.turn_ledger import build_turn_outcome_record
+
+    # Start of turn (prologue just ran).
+    agent = SimpleNamespace(
+        session_id="s1",
+        _current_turn_id="t1",
+        session_input_tokens=100,
+        session_output_tokens=10,
+        session_cache_read_tokens=50,
+        session_estimated_cost_usd=0.05,
+        model="test-model",
+        _tool_guardrail_halt_decision=None,
+        _invalid_tool_retries=0,
+        _invalid_json_retries=0,
+        _empty_content_retries=0,
+        _incomplete_scratchpad_retries=0,
+        _codex_incomplete_retries=0,
+        _thinking_prefill_retries=0,
+        _skills_loaded=(),
+    )
+    # Mock turn_context so we don't need to spin up the full prologue.
+    turn_context = SimpleNamespace(
+        token_cost_snapshot={
+            "session_input_tokens": 100,
+            "session_output_tokens": 10,
+            "session_cache_read_tokens": 50,
+            "session_estimated_cost_usd": 0.05,
+        },
+        turn_id="t1",
+    )
+
+    # Simulate turn-end: counters advanced by some amount.
+    agent.session_input_tokens = 350  # +250
+    agent.session_output_tokens = 42  # +32
+    agent.session_cache_read_tokens = 80  # +30
+    agent.session_estimated_cost_usd = 0.11  # +0.06
+
+    record = build_turn_outcome_record(
+        agent,
+        outcome="verified",
+        outcome_reason="ok",
+        turn_exit_reason="text_response",
+        api_calls=1,
+        tool_iterations=0,
+        turn_context=turn_context,
+    )
+    assert record.input_tokens_delta == 250
+    assert record.output_tokens_delta == 32
+    assert record.cache_read_tokens_delta == 30
+    assert record.cost_usd_delta == pytest.approx(0.06)
+
+
+def test_build_turn_outcome_record_missing_counters_default_to_zero(monkeypatch):
+    """End counters missing entirely → 0 deltas (not None arithmetic).
+
+    The schema forbids NULL on the delta columns. If the agent lacks one of
+    the session counters at end-of-turn, the ledger row must still serialize
+    cleanly. The snapshot missing the same fields yields 0 for the start
+    value and the end missing yields 0 for the end value.
+    """
+    from agent.turn_ledger import build_turn_outcome_record
+
+    agent = SimpleNamespace(
+        session_id="s1",
+        _current_turn_id="t1",
+        # session_input_tokens / output / cache_read / cost all absent on agent.
+        model="test-model",
+        _tool_guardrail_halt_decision=None,
+        _invalid_tool_retries=0,
+        _invalid_json_retries=0,
+        _empty_content_retries=0,
+        _incomplete_scratchpad_retries=0,
+        _codex_incomplete_retries=0,
+        _thinking_prefill_retries=0,
+        _skills_loaded=(),
+    )
+    turn_context = SimpleNamespace(
+        token_cost_snapshot={},  # empty snapshot → all starts are 0
+        turn_id="t1",
+    )
+
+    record = build_turn_outcome_record(
+        agent,
+        outcome="verified",
+        outcome_reason="ok",
+        turn_exit_reason="text_response",
+        api_calls=1,
+        tool_iterations=0,
+        turn_context=turn_context,
+    )
+    assert record.input_tokens_delta == 0
+    assert record.output_tokens_delta == 0
+    assert record.cache_read_tokens_delta == 0
+    assert record.cost_usd_delta == 0.0
+
+
+def test_build_turn_context_captures_token_cost_snapshot():
+    """Prologue must snapshot session counters at turn-start so deltas are
+    per-turn rather than cumulative-session.
+
+    Without this snapshot, build_turn_outcome_record would treat the agent's
+    session_input_tokens (cumulative across the whole session) as the
+    per-turn input count — overstating every turn's spend.
+    """
+    from agent.turn_context import build_turn_context
+
+    agent = _SnapshotAgent()
+    # Seed session counters BEFORE the prologue runs.
+    agent.session_input_tokens = 500
+    agent.session_output_tokens = 25
+    agent.session_cache_read_tokens = 200
+    agent.session_estimated_cost_usd = 0.42
+
+    ctx = _build_snapshot(agent)
+
+    # The prologue captured the snapshot exactly at turn start — both on the
+    # TurnContext (so chat-completions finalizers can pass it explicitly)
+    # and on the agent (the fallback ``build_turn_outcome_record`` already
+    # reads when ``turn_context`` isn't threaded through).
+    expected = {
+        "session_input_tokens": 500,
+        "session_output_tokens": 25,
+        "session_cache_read_tokens": 200,
+        "session_estimated_cost_usd": 0.42,
+    }
+    assert getattr(agent, "_turn_token_cost_snapshot") == expected
+    assert ctx.token_cost_snapshot == expected
+
+
+class _SnapshotAgent:
+    """Lightweight stand-in for the turn-snapshot test (independent of the
+    full _FakeAgent fixture so this test stays focused on one assertion)."""
+
+    def __init__(self):
+        self.session_id = "sess-1"
+        self.model = "test/model"
+        self.provider = "openrouter"
+        self.base_url = ""
+        self.api_key = ""
+        self.api_mode = "chat_completions"
+        self.platform = "cli"
+        self.quiet_mode = True
+        self.max_iterations = 90
+        self.tools = []
+        self.valid_tool_names = set()
+        self.compression_enabled = False
+        self.context_compressor = SimpleNamespace(
+            protect_first_n=2, protect_last_n=2
+        )
+        self._cached_system_prompt = "SYSTEM"
+        self._memory_store = None
+        self._memory_manager = None
+        self._memory_nudge_interval = 0
+        self._turns_since_memory = 0
+        self._user_turn_count = 0
+        self._todo_store = SimpleNamespace(has_items=lambda: True)
+        self._tool_guardrails = SimpleNamespace(reset_for_turn=lambda: None)
+        self._compression_warning = None
+        self._interrupt_requested = False
+        self._memory_write_origin = "assistant_tool"
+        self._stream_context_scrubber = None
+        self._stream_think_scrubber = None
+        self._invalid_tool_retries = 0
+        self._vision_supported = None
+        self._persist_calls = 0
+        self._pending_cli_user_message = None
+        self._session_persist_lock = None
+        # Token/cost counters (the snapshot captures these at turn start).
+        self.session_input_tokens = 0
+        self.session_output_tokens = 0
+        self.session_cache_read_tokens = 0
+        self.session_estimated_cost_usd = 0.0
+
+    def _ensure_db_session(self):
+        pass
+
+    def _restore_primary_runtime(self):
+        pass
+
+    def _cleanup_dead_connections(self):
+        return False
+
+    def _emit_status(self, _msg):
+        pass
+
+    def _replay_compression_warning(self):
+        pass
+
+    def _hydrate_todo_store(self, *_a, **_k):
+        pass
+
+    def _safe_print(self, *_a, **_k):
+        pass
+
+    def _persist_session(self, *_a, **_k):
+        pass
+
+
+def _build_snapshot(agent):
+    """Run the prologue with no-ops for the callbacks the snapshot test
+    doesn't care about."""
+    from agent.turn_context import build_turn_context
+    return build_turn_context(
+        agent=agent,
+        user_message="hello",
+        system_message=None,
+        conversation_history=None,
+        task_id=None,
+        stream_callback=None,
+        persist_user_message=None,
+        restore_or_build_system_prompt=lambda *a, **k: None,
+        install_safe_stdio=lambda: None,
+        sanitize_surrogates=lambda s: s,
+        summarize_user_message_for_log=lambda s: s,
+        set_session_context=lambda _sid: None,
+        set_current_write_origin=lambda _o: None,
+        ra=lambda: SimpleNamespace(_set_interrupt=lambda *a, **k: None),
+    )
+
+
+def test_finalizer_tool_iterations_count_actual_tool_calls_not_iters_since_skill(monkeypatch):
+    """Finalizer must report actual tool-call count, not the skill-nudge counter.
+
+    ``_iters_since_skill`` is a per-turn counter the agent bumps as a skill
+    nudge cadence — it has no relationship to how many tool calls the model
+    issued. A turn with no tool calls but several nudges would otherwise be
+    recorded with ``tool_iterations > 0``, corrupting per-turn tool usage
+    analytics. The ledger must reflect the actual number of assistant
+    messages with ``tool_calls`` in the turn's messages list.
+    """
+    from agent import turn_finalizer
+    from agent.turn_ledger import build_turn_outcome_record as _orig_build
+
+    captured = []
+
+    def _capture_record(*args, **kwargs):
+        # Capture the args/kwargs the finalizer passed, then defer to the
+        # real builder so the assertions reflect actual ledger semantics.
+        record = _orig_build(*args, **kwargs)
+        captured.append(record)
+        return record
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "agent.turn_ledger.record_turn_outcome_safely",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "agent.turn_ledger.build_turn_outcome_record",
+        _capture_record,
+    )
+
+    agent = _finalizer_agent(verification_status="passed")
+    # Skill-nudge counter is non-zero (simulates mid-turn nudge cadence),
+    # but the actual tool-call count in the messages is 2.
+    agent._iters_since_skill = 7
+
+    messages = [
+        {"role": "user", "content": "do it"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call-1", "type": "function", "function": {"name": "terminal"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call-2", "type": "function", "function": {"name": "web"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-2", "content": "ok"},
+        {"role": "assistant", "content": "done"},
+    ]
+    turn_finalizer.finalize_turn(
+        agent,
+        final_response="done",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="t-fin-tools",
+        user_message="do it",
+        original_user_message="do it",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert captured, "build_turn_outcome_record was not called"
+    record = captured[-1]
+    # The real count of assistant messages with tool_calls is 2.
+    assert record.tool_iterations == 2, (
+        f"tool_iterations must reflect the actual tool-call count "
+        f"(2), not _iters_since_skill (7). Got {record.tool_iterations}."
+    )
+
+
+def test_finalizer_tool_iterations_zero_when_no_tool_calls(monkeypatch):
+    """A turn with no tool calls and a non-zero nudge counter must still
+    record tool_iterations=0. This is the user-visible false-positive the
+    prior bug produced — nudges counted as tool activity."""
+    from agent import turn_finalizer
+    from agent.turn_ledger import build_turn_outcome_record as _orig_build
+
+    captured = []
+
+    def _capture_record(*args, **kwargs):
+        record = _orig_build(*args, **kwargs)
+        captured.append(record)
+        return record
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *a, **k: [])
+    monkeypatch.setattr(
+        "agent.turn_ledger.record_turn_outcome_safely",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        "agent.turn_ledger.build_turn_outcome_record",
+        _capture_record,
+    )
+
+    agent = _finalizer_agent(verification_status="passed")
+    agent._iters_since_skill = 5  # nudges happened, but no real tools
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    turn_finalizer.finalize_turn(
+        agent,
+        final_response="hello",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="t-fin-zero",
+        user_message="hi",
+        original_user_message="hi",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert captured
+    assert captured[-1].tool_iterations == 0
+
+
 def test_finalizer_paths_call_safe_writer_with_canonical_vocabulary(monkeypatch):
     """Both finalizer paths (chat-completions and codex app-server) must
     funnel through record_turn_outcome_safely with one of the 8 canonical
