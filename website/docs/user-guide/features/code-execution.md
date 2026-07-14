@@ -59,17 +59,22 @@ these generic helpers:
 
 ```python
 from hermes_tools import search_tools, describe_tool, call_tool, save_artifact
+from pathlib import Path
+import os
 
 hits = search_tools("issue tracker read-only lookup", limit=5)
 metadata = describe_tool(hits["results"][0]["name"])
 result = call_tool(metadata["name"], {"limit": 10})
-artifact = save_artifact("/tmp/report.json", name="report.json", mime_type="application/json")
+source = Path(os.environ["HERMES_ARTIFACTS_DIR"]) / "report.json"
+source.write_text('{"result": "generated"}', encoding="utf-8")
+artifact = save_artifact(str(source), name="report.json", mime_type="application/json")
 print({"result": result, "artifact": artifact})
 ```
 
 `json_parse`, `shell_quote`, and `retry` are also embedded convenience helpers.
-`save_artifact` asks the parent to copy a local file into the configured durable
-artifact directory; it is not a replacement for `write_file` or `terminal`.
+`save_artifact` accepts bytes directly or copies a path that is inside the
+execution's `HERMES_ARTIFACTS_DIR` into the configured durable artifact
+directory; it is not a replacement for `write_file` or `terminal`.
 
 ## Tool scope, denylist, and approval behavior
 
@@ -173,9 +178,10 @@ The local fresh-process child receives `HERMES_ARTIFACTS_DIR` for generated
 files. Those files are collected before local staging cleanup when they are
 recognized as image artifacts or oversized text. `save_artifact(path,
 name=None, mime_type=None)` copies a child file to `artifact_dir` and returns
-its durable path. Remote execution uses the remote sandbox for code and RPC;
-its stdout spill is persisted by the parent, while remote file artifacts remain
-backend-managed.
+its durable path. Remote execution uses the remote sandbox for code and RPC.
+Recognized remote image artifacts and oversized remote text files are collected
+before sandbox cleanup, transferred as bounded content, and persisted under the
+parent `artifact_dir`; remote-only source paths are never returned to the model.
 
 ## Structured image results
 
