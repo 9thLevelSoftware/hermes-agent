@@ -407,7 +407,8 @@ Identifies an executable access path, not just a model brand:
 
 - canonical provider ID;
 - model ID;
-- authentication mode or non-secret credential-profile identity;
+- authentication mode plus the non-secret addressable credential-profile identity;
+- exact credential-pool identity when rotation is configured;
 - custom endpoint identity when applicable;
 - API mode;
 - local backend identity when applicable; and
@@ -467,6 +468,7 @@ Contains:
 - normalized scoring inputs and final scores;
 - selected runtime and reasoning effort;
 - projected fallback chain;
+- validated full-runtime safe-default snapshot and effort;
 - classifier usage/cost and routing latency; and
 - safe-default or degradation reason when applicable.
 
@@ -499,7 +501,7 @@ The selector follows this order:
 9. Match and score eligible profiles and targets.
 10. Select reasoning effort and clamp it to the target's approved range.
 11. Resolve the complete runtime through Hermes's canonical resolver.
-12. On pre-call resolution failure, try the profile fallback chain, then `safe_default`; post-call provider failures follow the recorded failover contract in section 10.7.
+12. On pre-call resolution failure, try the profile fallback chain, then the decision's validated full-runtime `safe_default` snapshot; post-call provider failures follow the recorded failover contract in section 10.7.
 13. Persist the explanation before allowing the provider call.
 
 ### 10.2 Structured classification
@@ -548,15 +550,15 @@ Unsupported reasoning configurations make a target ineligible or clamp to a vali
 
 ### 10.5 Fresh sessions
 
-Routing occurs after receiving the first user message but before building or sending the stable provider prefix. The selected runtime is recorded against the session. Later turns never reclassify or reroute that session.
+Routing occurs after receiving the first user message but before building or sending the stable provider prefix. The selected full runtime/access path is recorded against the session and bound before client creation. Later turns never reclassify or reroute that session, and native 401/429 recovery may rotate only among secret members of the selected credential pool; a same-provider/model selection cannot retain or reload a different canonical pool.
 
-A manual model switch marks a manual override. Auto does not switch it back. A resumed session first reloads its original route. If that runtime has become impossible to execute, the adapter tries only the route's recorded fallback chain and then `safe_default`; it never reclassifies the session. Any model-changing fallback emits an explicit cache-degradation event rather than pretending the original provider cache remains valid.
+A manual model switch marks a manual override. Auto does not switch it back. A resumed session first reloads its original route. If that runtime has become impossible to execute, the adapter tries only the route's recorded fallback chain and then that decision's validated full-runtime safe-default snapshot; it never reclassifies or consults a newer authority revision. Any model-changing fallback emits an explicit cache-degradation event rather than pretending the original provider cache remains valid.
 
 ### 10.6 Delegation
 
 Each delegated task's goal and structured task metadata are assessed independently immediately before child construction. Batches may therefore contain different internal runtime decisions. The parent agent sees no new parameters and cannot nominate a provider/model through the tool schema.
 
-The adapter projects the chosen runtime, reasoning, credential pool, and fallbacks into the existing child construction path. Budgets, tool scope, session isolation, background execution, recovery, cost accounting, and lifecycle hooks remain Hermes responsibilities.
+The adapter projects the chosen runtime, reasoning, exact credential pool, and fallbacks into the existing child construction path before the child client exists. The first request and later credential recovery therefore use one access path. Budgets, tool scope, session isolation, background execution, recovery, cost accounting, and lifecycle hooks remain Hermes responsibilities.
 
 Before a durable/background child launch, the decision, adaptive revision, and canary assignment are committed against the operation ID and task index. Recovery reuses that exact record and never reclassifies or assigns a new experiment. If its target is unavailable, recovery may use only the recorded fallback chain.
 
@@ -564,9 +566,9 @@ Before a durable/background child launch, the decision, adaptive revision, and c
 
 For an Auto-routed scope, the selected profile's fallback chain replaces the semantic portion of Hermes's global fallback list. Existing global entries are not appended implicitly because an unvalidated entry could bypass eligibility, policy, or per-target reasoning. During setup, the advisor may offer to import eligible global fallback entries into profiles after full validation. When Auto is bypassed, normal Hermes fallback configuration remains untouched.
 
-Fallbacks known to be unavailable before the first provider call are skipped without cache impact. A provider failure after calls have begun does not trigger a new classification or profile score. A compatibility wrapper consumes the next recorded fallback tuple, validates it again, applies its provider/model/reasoning settings, and records a new cache epoch. This is an exceptional availability transition equivalent to an explicit model reset, so cache reuse from the prior runtime is not claimed.
+Fallbacks known to be unavailable before the first provider call are skipped without cache impact. A provider failure after calls have begun does not trigger a new classification or profile score. A compatibility wrapper consumes the next recorded fallback tuple, validates it again, applies its provider/model/reasoning/exact credential-pool settings, and records a new cache epoch. Credential recovery after that transition remains inside the fallback's recorded pool. If Hermes restores the semantic primary on a later turn, restoration rebinds the primary's exact original access path even when primary and fallback share a provider/model; subsequent credential recovery remains inside the primary pool. This is an exceptional availability transition equivalent to an explicit model reset, so cache reuse from the prior runtime is not claimed.
 
-If a supported Hermes revision cannot safely project per-fallback reasoning and prevent unvalidated global entries from leaking into the chain, post-call model-changing failover is disabled for Auto routes on that adapter. Pre-call fallback and `safe_default` remain available; the adapter must not silently delegate to incompatible fallback behavior.
+If a supported Hermes revision cannot safely project per-fallback reasoning and prevent unvalidated global entries from leaking into the chain, post-call model-changing failover is disabled for Auto routes on that adapter. Pre-call fallback and the recorded safe-default snapshot remain available; the adapter must not silently delegate to incompatible fallback behavior.
 
 ## 11. Executable inventory
 
@@ -577,7 +579,7 @@ Inventory uses explicit states:
 - **temporarily unavailable:** a previously verified runtime is in cooldown, exhausted, or unreachable; and
 - **ineligible:** capability, policy, installation, license, or access checks fail.
 
-Only `verified` runtimes can be recommended, routed, or entered into a canary. Configured-unverified entries appear only in `inventory`/`doctor` with an explanation and a way to verify them. Runtime resolution or the mere presence of credentials is not proof of subscription entitlement.
+Only `verified` runtimes can be recommended, routed, or entered into a canary. Configured-unverified entries appear only in `inventory`/`doctor` with an explanation and a way to verify them. Runtime resolution or the mere presence of credentials is not proof of subscription entitlement. Provider discovery preserves per-model provenance: a failed authenticated listing may still expose static/configured/stale rows to a picker, but those rows remain distinguishable from `authenticated_live` or a named reviewed entitlement contract and cannot prove routing eligibility. Live provenance is scoped to the exact endpoint/auth-path fingerprint and success timestamp; contract provenance names a reviewed contract and version. Missing details fail closed, and a cached listing from one credential pool cannot verify another pool for the same provider/model.
 
 Verification uses these ordered evidence sources:
 
@@ -586,7 +588,7 @@ Verification uses these ordered evidence sources:
 3. a successfully executed runtime identity within its verification TTL; and
 4. installed local backend/model inspection plus a compatibility probe.
 
-If a provider exposes no reliable model list, credentials and Hermes's general model catalog do not make every model eligible. Non-billable listing/health probes may run automatically. A paid completion probe requires `allow_paid_access_probes`, a conservative cost reservation, and available routing-overhead budget; otherwise explicit user approval is required.
+If a provider exposes no reliable model list, credentials and Hermes's general model catalog do not make every model eligible. Non-billable listing/health probes may run automatically. A paid or quota-consuming completion verification is never an advisor/routing/optimizer side effect: even when `allow_paid_access_probes` is enabled, the user must run the exact-runtime preview/apply command with an unchanged precondition hash and explicit billable acknowledgement after a conservative cost/quota reservation succeeds.
 
 Temporary conditions such as circuit-breaker cooldown, exhausted credentials, or unavailable local backend remove a runtime from current selection without deleting its historical evidence.
 
@@ -655,10 +657,13 @@ The planned CLI includes:
 - `hermes auto-routing setup`
 - `hermes auto-routing edit`
 - `hermes auto-routing inventory`
+- `hermes auto-routing verify-runtime`
 - `hermes auto-routing refresh-catalog`
 - `hermes auto-routing plan`
 - `hermes auto-routing validate`
 - `hermes auto-routing explain`
+- `hermes auto-routing feedback`
+- `hermes auto-routing report`
 - `hermes auto-routing status`
 - `hermes auto-routing history`
 - `hermes auto-routing freeze`
@@ -668,7 +673,7 @@ The planned CLI includes:
 - `hermes auto-routing export`
 - `hermes auto-routing import`
 
-Names and argument details are implementation-plan decisions. All mutating commands support a dry run, use locking and precondition hashes, preserve unrelated config, write atomically, and create recoverable backups.
+Names and argument details are implementation-plan decisions. Control-plane commands that change YAML authority, activation/adaptation mode, the active revision pointer, experiment controls, imported/restored state, or that initiate a billable/quota-consuming access verification support a dry run, use locking and precondition hashes, preserve unrelated config, write atomically, and create recoverable backups where state can be replaced. Append-only, content-free operational observations are an explicit exception: non-billable inventory/catalog refreshes, deduplicated outcome receipts, and finite-vocabulary user feedback may commit transactionally without a preview because they cannot change authority, activation, the active revision, or a route already projected. Command help and JSON output identify the write class (`read_only`, `append_only_observation`, or `guarded_control_plane`) so the exception cannot silently spread to a control-plane mutation.
 
 ## 14. Adaptive learning
 
@@ -719,7 +724,7 @@ stateDiagram-v2
     Rejected --> Canary: cooldown and new evidence
 ```
 
-Canary assignment is a small configured fraction of suitable future tasks and is deterministic from the decision ID. High-risk or policy-excluded tasks are not experiments. Promotion requires minimum samples, confidence, and compliance with the profile's explicit objectives. Policy validation failure, routing/experiment overhead-budget exhaustion, repeated failure, or configured observed regression causes immediate rollback and cooldown.
+Canary assignment is a small configured fraction of suitable future tasks and is deterministic from a stable profile-keyed HMAC of the canonical operation identity `(scope, operation_id, task_index, route_epoch)`, independent of random decision IDs. High-risk or policy-excluded tasks are not experiments. Promotion requires minimum samples, confidence, and compliance with the profile's explicit objectives. Policy validation failure, routing/experiment overhead-budget exhaustion, repeated failure, or configured observed regression causes immediate rollback and cooldown.
 
 Classifier challengers begin in shadow mode and cannot affect routing. They progress to limited routing only after meeting agreement, latency, cost, and downstream-outcome gates.
 
@@ -757,7 +762,7 @@ The following are explicit behavioral contracts:
 | Classifier timeout, denial, or malformed output | Use `safe_default` and record reason |
 | Catalog refresh failure | Use last valid snapshot with increased staleness penalty |
 | Target loses access/capability | Remove from current eligibility and try route fallbacks |
-| Runtime resolution failure | Try next route fallback, then `safe_default` |
+| Runtime resolution failure | Try next recorded route fallback, then the decision's safe-default snapshot |
 | SQLite write contention | Retry within a short bound; route from last complete read revision |
 | SQLite corruption/unavailable state | Use last verified read-only snapshot if possible; otherwise inherit |
 | Evaluator failure | Drop that evidence event; never invent a score |
@@ -824,7 +829,8 @@ Generate candidate inventories, profiles, evidence, and mutations and prove:
 - per-profile constraints cannot loosen global policy;
 - every selected reasoning effort is inside target bounds;
 - no canary exceeds its configured allocation or risk policy; and
-- rollback restores an exact complete revision.
+- rollback restores an exact complete revision; and
+- migration/restore/downgrade never replace a state database while another live PID/process-start-token lease can retain an open connection.
 
 ### 19.3 Hermes integration tests
 
@@ -832,6 +838,7 @@ Use a temporary `HERMES_HOME`, real Hermes imports, and fake provider endpoints 
 
 - plugin enable/load and trust configuration;
 - fresh-session selection before the first call;
+- exact auth/endpoint/API-mode/credential-pool/local-backend identity through first call, 401/429 rotation, delegated child construction, and recorded fallback;
 - byte-stable system prompt across later turns in one route epoch;
 - resumed-session route reuse;
 - manual model override precedence;
