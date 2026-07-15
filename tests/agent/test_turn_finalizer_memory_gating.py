@@ -38,6 +38,7 @@ class _FinalizerAgent:
         self.valid_tool_names = []
         self._turn_verification_status = verification_status
         self._memory_manager = MagicMock()
+        self._session_db = MagicMock()
         self.background_reviews = []
 
     def _save_trajectory(self, *_args, **_kwargs):
