@@ -1478,9 +1478,13 @@ def _render_candidate_list() -> str:
     # Load utility evidence once for all candidates
     utility_data: Dict[str, Dict[str, Any]] = {}
     try:
+        usage_records = skill_usage.load_usage()
+        if not isinstance(usage_records, dict):
+            usage_records = {}
         for r in rows:
             name = r["name"]
-            util = skill_usage.get_skill_utility(name)
+            rec = usage_records.get(name)
+            util = skill_usage.get_skill_utility(name, rec if isinstance(rec, dict) else {})
             if util.get("count", 0) > 0:
                 utility_data[name] = util
     except Exception:

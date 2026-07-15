@@ -1147,7 +1147,21 @@ def test_render_candidate_list_includes_utility_evidence(curator_env, monkeypatc
         "skill": "good-skill", "count": 10, "helped": 8, "hurt": 2,
         "neutral": 0, "cost_usd": 0.05, "eligible": True, "utility": 9/12,
     }
-    monkeypatch.setattr(su, "get_skill_utility", lambda name: mock_utility if name == "good-skill" else {"skill": name, "count": 0, "helped": 0, "hurt": 0, "neutral": 0, "cost_usd": 0.0, "eligible": False, "utility": None})
+    monkeypatch.setattr(su, "load_usage", lambda: {"good-skill": {"helped": 8}})
+    monkeypatch.setattr(
+        su,
+        "get_skill_utility",
+        lambda name, rec: mock_utility if name == "good-skill" else {
+            "skill": name,
+            "count": 0,
+            "helped": 0,
+            "hurt": 0,
+            "neutral": 0,
+            "cost_usd": 0.0,
+            "eligible": False,
+            "utility": None,
+        },
+    )
 
     result = curator_env._render_candidate_list()
     assert "good-skill" in result
