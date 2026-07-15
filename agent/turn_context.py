@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from agent.conversation_compression import conversation_history_after_compression
@@ -114,6 +114,10 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Per-turn token/cost baseline, captured at the prologue's turn-start
+    # boundary so ``build_turn_outcome_record`` can compute end-minus-start
+    # deltas instead of leaking the cumulative session totals.
+    token_cost_snapshot: Dict[str, Any] = field(default_factory=dict)
 
 
 def build_turn_context(
@@ -218,6 +222,35 @@ def build_turn_context(
     turn_id = f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
+
+    # Capture the per-turn token/cost baseline so ``build_turn_outcome_record``
+    # can compute end-minus-start deltas. Without this snapshot, every turn
+    # would report its cumulative-session totals as the per-turn cost —
+    # overstating spend and corrupting downstream learning analytics.
+    # Missing/invalid counters fall back to 0/0.0 so arithmetic stays clean.
+    def _snapshot_int(name: str) -> int:
+        try:
+            return int(getattr(agent, name, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _snapshot_float(name: str) -> float:
+        try:
+            return float(getattr(agent, name, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    token_cost_snapshot = {
+        "session_input_tokens": _snapshot_int("session_input_tokens"),
+        "session_output_tokens": _snapshot_int("session_output_tokens"),
+        "session_cache_read_tokens": _snapshot_int("session_cache_read_tokens"),
+        "session_estimated_cost_usd": _snapshot_float("session_estimated_cost_usd"),
+    }
+    # Stash on the agent so the existing
+    # ``build_turn_outcome_record`` fallback (``agent._turn_token_cost_snapshot``)
+    # works without threading ``turn_context`` everywhere; finalizers that DO
+    # receive the context still prefer ``turn_context.token_cost_snapshot``.
+    agent._turn_token_cost_snapshot = token_cost_snapshot
 
     # Reset retry counters and iteration budget at the start of each turn.
     agent._invalid_tool_retries = 0
@@ -622,4 +655,5 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        token_cost_snapshot=token_cost_snapshot,
     )

@@ -36,6 +36,50 @@ def _make_event(chat_id: str = "123", message_id: str = "456") -> MessageEvent:
     )
 
 
+@pytest.mark.asyncio
+async def test_inbound_reaction_publishes_feedback_after_auth():
+    adapter = _make_adapter()
+    adapter._is_callback_user_authorized = lambda *_args, **_kwargs: True
+    adapter.publish_feedback = AsyncMock(return_value=True)
+    reaction = SimpleNamespace(emoji="👎")
+    update = SimpleNamespace(
+        update_id=99,
+        message_reaction=SimpleNamespace(
+            user=SimpleNamespace(id=42, is_bot=False, username="user"),
+            chat=SimpleNamespace(id=123, type="private"),
+            message_id=456,
+            old_reaction=[],
+            new_reaction=[reaction],
+        ),
+    )
+
+    await adapter._handle_message_reaction(update, None)
+
+    adapter.publish_feedback.assert_called_once_with(
+        Platform.TELEGRAM, 123, 456, "42", "👎", 99
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbound_bot_reaction_is_ignored():
+    adapter = _make_adapter()
+    adapter.publish_feedback = AsyncMock(return_value=True)
+    update = SimpleNamespace(
+        update_id=99,
+        message_reaction=SimpleNamespace(
+            user=SimpleNamespace(id=42, is_bot=True),
+            chat=SimpleNamespace(id=123, type="private"),
+            message_id=456,
+            old_reaction=[],
+            new_reaction=[SimpleNamespace(emoji="👎")],
+        ),
+    )
+
+    await adapter._handle_message_reaction(update, None)
+
+    adapter.publish_feedback.assert_not_called()
+
+
 # ── _reactions_enabled ───────────────────────────────────────────────
 
 

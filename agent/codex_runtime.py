@@ -527,22 +527,74 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("external memory sync raised", exc_info=True)
 
-    # Background review fork — same cadence + signature as the default
-    # path (line ~15449). Only fires when a trigger actually tripped AND
-    # we have a verified final response.
-    if (
-        turn_outcome["outcome"] == "verified"
-        and turn.final_text
-        and not turn.interrupted
-        and (should_review_memory or should_review_skills)
-    ):
+    # Persist the per-turn outcome to the learning ledger. Mirrors the
+    # chat-completions path in ``finalize_turn``; safe-writer is best-effort.
+    # The sidecar bump runs in a SEPARATE try/except so a ledger-write
+    # failure cannot suppress utility-counter evidence.
+    _turn_outcome_record = None
+    try:
+        from agent.turn_ledger import persist_turn_outcome
+        # turn.turn_id is an opaque codex UUID, NOT an exit reason — store
+        # a stable fallback so downstream analytics can group codex turns
+        # alongside chat-completions turns without leaking UUIDs into the
+        # ledger's reason dimension.
+        if getattr(turn, "error", None):
+            codex_exit_reason = "codex_error"
+        elif getattr(turn, "interrupted", False):
+            codex_exit_reason = "codex_interrupted"
+        elif getattr(turn, "should_retire", False):
+            codex_exit_reason = "codex_retired"
+        elif not getattr(turn, "final_text", ""):
+            codex_exit_reason = "codex_no_response"
+        else:
+            codex_exit_reason = "codex_response"
+        _turn_outcome_record = persist_turn_outcome(
+            agent,
+            outcome=turn_outcome["outcome"],
+            outcome_reason=turn_outcome["reason"],
+            turn_exit_reason=codex_exit_reason,
+            api_calls=api_calls,
+            tool_iterations=turn.tool_iterations,
+            messages=messages,
+        )
+    except Exception as _ledger_err:
+        logger.debug("turn_outcome ledger write skipped: %s", _ledger_err)
+
+    # Background review fork — interval nudges remain a fallback, while
+    # failure/correction/tool-streak signals can review non-verified turns.
+    try:
+        from agent.reflection_triggers import (
+            _tool_results,
+            evaluate_reflection_triggers,
+            should_trigger_review,
+        )
+        reflection_trigger = evaluate_reflection_triggers(
+            turn_outcome,
+            original_user_message,
+            _tool_results(messages),
+        )
+        run_review = should_trigger_review({
+            "agent": agent,
+            "trigger": reflection_trigger,
+            "outcome": turn_outcome["outcome"],
+            "has_response": bool(turn.final_text),
+            "interrupted": turn.interrupted,
+            "interval_triggered": should_review_memory or should_review_skills,
+            "signal_enabled": getattr(agent, "_session_db", None) is not None,
+        })
+    except Exception:
+        reflection_trigger = None
+        run_review = False
+    if run_review:
         try:
+            agent._background_review_trigger = reflection_trigger
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=should_review_memory,
-                review_skills=should_review_skills,
+                review_skills=bool(should_review_skills or reflection_trigger),
             )
         except Exception:
+            agent._background_review_in_flight = False
             logger.debug("background review spawn raised", exc_info=True)
 
     return {

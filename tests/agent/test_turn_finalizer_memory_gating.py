@@ -38,6 +38,7 @@ class _FinalizerAgent:
         self.valid_tool_names = []
         self._turn_verification_status = verification_status
         self._memory_manager = MagicMock()
+        self._session_db = MagicMock()
         self.background_reviews = []
 
     def _save_trajectory(self, *_args, **_kwargs):
@@ -98,18 +99,18 @@ def _finalize(
 
 
 @pytest.mark.parametrize(
-    "outcome, verification_status, kwargs",
+    "outcome, verification_status, kwargs, reviews",
     [
-        ("partial", "passed", {"reason": "max_iterations_reached(90/90)"}),
-        ("blocked", "passed", {"reason": "approval_blocked"}),
-        ("failed", "passed", {"failed": True, "reason": "provider_failure"}),
-        ("interrupted", "passed", {"interrupted": True, "reason": "interrupted_by_user"}),
-        ("unresolved", "passed", {"reason": "tool_timeout"}),
-        ("cancelled", "passed", {"reason": "cancelled"}),
+        ("partial", "passed", {"reason": "max_iterations_reached(90/90)"}, 0),
+        ("blocked", "passed", {"reason": "approval_blocked"}, 1),
+        ("failed", "passed", {"failed": True, "reason": "provider_failure"}, 1),
+        ("interrupted", "passed", {"interrupted": True, "reason": "interrupted_by_user"}, 0),
+        ("unresolved", "passed", {"reason": "tool_timeout"}, 1),
+        ("cancelled", "passed", {"reason": "cancelled"}, 0),
     ],
 )
-def test_non_verified_outcomes_do_not_sync_or_spawn_review(
-    monkeypatch, outcome, verification_status, kwargs
+def test_non_verified_outcomes_do_not_sync_and_only_failure_signals_review(
+    monkeypatch, outcome, verification_status, kwargs, reviews
 ):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_k: [])
     agent = _FinalizerAgent(verification_status)
@@ -119,7 +120,7 @@ def test_non_verified_outcomes_do_not_sync_or_spawn_review(
     assert result["outcome"] == outcome
     agent._memory_manager.sync_all.assert_not_called()
     agent._memory_manager.queue_prefetch_all.assert_not_called()
-    assert agent.background_reviews == []
+    assert len(agent.background_reviews) == reviews
 
 
 def test_verified_turn_syncs_and_spawns_review(monkeypatch):

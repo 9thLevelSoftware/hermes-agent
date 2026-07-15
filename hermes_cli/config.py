@@ -2371,7 +2371,8 @@ DEFAULT_CONFIG = {
         # Timeout (seconds) for each !`cmd` snippet when inline_shell is on.
         "inline_shell_timeout": 10,
         # Run the keyword/pattern security scanner on skills the agent
-        # writes via skill_manage (create/edit/patch).  Off by default
+        # writes via skill_manage (create/edit/patch/write_file/delete/
+        # remove_file).  Off by default
         # because the agent can already execute the same code paths via
         # terminal() with no gate, so the scan adds friction (blocks
         # skills that mention risky keywords in prose) without meaningful
@@ -2393,6 +2394,17 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # Utility-based skill ranking for the system-prompt skill index.
+        # When enabled, eligible skills (those with enough attributed outcome
+        # samples) are reordered by measured utility rather than purely
+        # alphabetical.  Below-minimum-sample skills keep their existing order.
+        # Pinned, protected, and mandatory skills always stay present.
+        # Ranking is computed once at snapshot-build time and is session-stable.
+        "utility_ranking": {
+            "enabled": False,
+            "min_samples": 5,      # minimum helped+hurt samples before ranking
+            "utility_weight": 0.7, # blend: 0=lexical only, 1=utility only
+        },
     },
 
     # Curator — background skill maintenance.
