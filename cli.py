@@ -10548,7 +10548,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             db = SessionDB()
             engine = InsightsEngine(db)
-            report = engine.generate(days=days, source=source)
+            report = engine.generate(days=days, source=source, learning=learning)
             if learning:
                 print(engine.format_terminal_learning(report))
             else:

@@ -12875,7 +12875,11 @@ def cmd_insights(args):
 
         db = SessionDB()
         engine = InsightsEngine(db)
-        report = engine.generate(days=args.days, source=args.source)
+        report = engine.generate(
+            days=args.days,
+            source=args.source,
+            learning=getattr(args, "learning", False),
+        )
         if getattr(args, "learning", False):
             print(engine.format_terminal_learning(report))
         else:
