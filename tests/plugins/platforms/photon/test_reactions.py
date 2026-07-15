@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
+from unittest.mock import Mock
 
 import pytest
 
@@ -225,39 +226,38 @@ async def test_inbound_reaction_on_bot_message_routed(
 ) -> None:
     adapter = _make_adapter(monkeypatch)
     captured = _capture_handled(adapter, monkeypatch)
+    feedback = Mock(return_value=True)
+    monkeypatch.setattr(adapter, "publish_feedback", feedback)
 
     await adapter._dispatch_inbound(_reaction_event(emoji="❤️"))
 
-    assert len(captured) == 1
-    event = captured[0]
-    assert event.text == "reaction:added:❤️"
-    assert event.message_type == MessageType.TEXT
-    assert event.source.chat_id == "+15551234567"
-    # The tapback correlates to the bot message it reacted to, so the gateway
-    # can inject `[Replying to your previous message: "..."]` for context.
-    assert event.reply_to_message_id == "bot-msg-1"
-    assert event.reply_to_text == "the bot's earlier reply"
-    assert event.reply_to_is_own_message is True
-    assert event.metadata["feedback_already_annotated"] is True
+    assert captured == []
+    assert feedback.call_count == 1
+    args = feedback.call_args.args
+    assert args[0] == adapter.platform
+    assert args[1] == args[3]
+    assert args[2] == "bot-msg-1"
+    assert args[4:] == (
+        "❤️",
+        "reaction-evt-1",
+    )
 
 
 @pytest.mark.asyncio
 async def test_inbound_reaction_without_target_text_correlates_id_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A tapback on an attachment-only bot message (no text) still correlates the
-    id, but leaves reply_to_text unset — the gateway then skips the reply pointer
-    (it injects only when both id and text are present)."""
+    """An attachment-only target still records feedback by message ID."""
     adapter = _make_adapter(monkeypatch)
     captured = _capture_handled(adapter, monkeypatch)
+    feedback = Mock(return_value=True)
+    monkeypatch.setattr(adapter, "publish_feedback", feedback)
 
     await adapter._dispatch_inbound(_reaction_event(target_text=None))
 
-    assert len(captured) == 1
-    event = captured[0]
-    assert event.reply_to_message_id == "bot-msg-1"
-    assert event.reply_to_text is None
-    assert event.reply_to_is_own_message is True
+    assert captured == []
+    assert feedback.call_count == 1
+    assert feedback.call_args.args[2] == "bot-msg-1"
 
 
 @pytest.mark.asyncio
@@ -267,13 +267,16 @@ async def test_inbound_reaction_sent_ids_fallback(
     """No targetDirection from the provider — gate on our own sent-id cache."""
     adapter = _make_adapter(monkeypatch)
     captured = _capture_handled(adapter, monkeypatch)
+    feedback = Mock(return_value=True)
+    monkeypatch.setattr(adapter, "publish_feedback", feedback)
     adapter._record_sent_message("bot-msg-1")
 
     await adapter._dispatch_inbound(
         _reaction_event(target_id="bot-msg-1", target_direction=None)
     )
 
-    assert len(captured) == 1
+    assert captured == []
+    assert feedback.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -298,7 +301,10 @@ async def test_inbound_reaction_bypasses_require_mention(
     monkeypatch.setenv("PHOTON_REQUIRE_MENTION", "true")
     adapter = _make_adapter(monkeypatch)
     captured = _capture_handled(adapter, monkeypatch)
+    feedback = Mock(return_value=True)
+    monkeypatch.setattr(adapter, "publish_feedback", feedback)
 
     await adapter._dispatch_inbound(_reaction_event(space_type="group"))
 
-    assert len(captured) == 1
+    assert captured == []
+    assert feedback.call_count == 1

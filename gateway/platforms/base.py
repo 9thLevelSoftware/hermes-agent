@@ -2816,8 +2816,6 @@ class BasePlatformAdapter(ABC):
         event_id: str,
     ) -> bool:
         """Resolve the active session/latest turn and annotate feedback."""
-        if self._is_sender_authorized(actor_id, None, conversation_id) is False:
-            return False
         store = getattr(self, "_session_store", None)
         db = getattr(store, "_db", None)
         if store is None or db is None:
@@ -2831,20 +2829,16 @@ class BasePlatformAdapter(ABC):
         if not candidates:
             return False
         entry = max(candidates, key=lambda item: item.updated_at)
+        chat_type = getattr(entry.origin, "chat_type", None)
+        if self._is_sender_authorized(actor_id, chat_type, conversation_id) is False:
+            return False
         session_id = entry.session_id
         try:
-            row = db._execute_read(
-                lambda conn: conn.execute(
-                    "SELECT turn_id FROM turn_outcomes WHERE session_id = ? "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (session_id,),
-                ).fetchone()
-            )
+            turn_id = db.get_turn_id_for_platform_message(session_id, message_id)
         except Exception:
             return False
-        if row is None:
+        if not turn_id:
             return False
-        turn_id = row["turn_id"] if hasattr(row, "keys") else row[0]
         from agent.reflection_triggers import (
             evaluate_reflection_triggers,
             record_feedback_event,

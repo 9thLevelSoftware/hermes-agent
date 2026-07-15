@@ -494,6 +494,22 @@ class TestInsightsPopulated:
 
         assert report["empty"] is True
 
+    def test_learning_passes_requested_days_and_source_to_outcome_query(
+        self, populated_db, monkeypatch
+    ):
+        calls = []
+        monkeypatch.setattr(
+            populated_db,
+            "get_outcome_trends",
+            lambda **kwargs: calls.append(kwargs) or [],
+        )
+
+        InsightsEngine(populated_db).generate(
+            days=7, source="telegram", learning=True
+        )
+
+        assert calls == [{"days": 7, "source": "telegram"}]
+
     def test_days_filter_short(self, populated_db):
         engine = InsightsEngine(populated_db)
         report = engine.generate(days=3)

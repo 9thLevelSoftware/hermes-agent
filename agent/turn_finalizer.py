@@ -166,23 +166,17 @@ def finalize_turn(
     # skill-utility signal.
     _turn_outcome_record = None
     try:
-        from agent.turn_ledger import (
-            build_turn_outcome_record,
-            record_turn_outcome_safely,
-        )
+        from agent.turn_ledger import persist_turn_outcome
         # tool_iterations must reflect the actual tool-call count from the
         # turn's messages — NOT ``agent._iters_since_skill`` (a skill-nudge
         # cadence counter with no relation to model-issued tool calls).
-        # ``_turn_tool_count`` is already computed below in the diagnostic
-        # block; recompute it here so the ledger row is independent of
-        # diagnostic ordering and survives refactors of the trailing log.
         _turn_tool_count = sum(
             1 for m in messages
             if isinstance(m, dict)
             and m.get("role") == "assistant"
             and m.get("tool_calls")
         )
-        _turn_outcome_record = build_turn_outcome_record(
+        _turn_outcome_record = persist_turn_outcome(
             agent,
             outcome=_turn_outcome["outcome"],
             outcome_reason=_turn_outcome["reason"],
@@ -191,19 +185,8 @@ def finalize_turn(
             tool_iterations=_turn_tool_count,
             messages=messages,
         )
-        record_turn_outcome_safely(getattr(agent, "_session_db", None),
-                                   _turn_outcome_record)
     except Exception as _ledger_err:
         logger.debug("turn_outcome ledger write skipped: %s", _ledger_err)
-    # Best-effort sidecar bump — must run whether the DB write above
-    # succeeded or failed, so the curator's utility ranking still sees
-    # evidence for this turn. A sidecar failure never escapes this block.
-    if _turn_outcome_record is not None:
-        try:
-            from agent.turn_ledger import _bump_sidecar_for_skills
-            _bump_sidecar_for_skills(_turn_outcome_record)
-        except Exception as _bump_err:
-            logger.debug("skill sidecar bump skipped: %s", _bump_err)
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible

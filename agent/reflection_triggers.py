@@ -10,6 +10,15 @@ from typing import Any, Literal
 
 from agent.reactions import detect_user_correction
 
+_NEGATIVE_REACTIONS = {
+    "👎",
+    "thumbs_down",
+    "thumbsdown",
+    "no",
+    "dislike",
+    "-1",
+}
+
 ReflectionTriggerKind = Literal[
     "failure", "correction", "tool_failure_streak", "reaction"
 ]
@@ -62,6 +71,10 @@ def evaluate_reflection_triggers(
     if outcome_name in {"failed", "blocked", "unresolved"}:
         return ReflectionTrigger("failure", _stable_key("failure", outcome_name))
     if outcome_name == "reaction":
+        values = list(tool_results) if isinstance(tool_results, (list, tuple)) else [tool_results]
+        reaction = str(values[0] if values else "").strip().lower()
+        if reaction not in _NEGATIVE_REACTIONS:
+            return None
         return ReflectionTrigger("reaction", _stable_key("reaction", tool_results))
 
     text = user_text if isinstance(user_text, str) else ""
@@ -107,19 +120,13 @@ def should_trigger_review(context: object) -> bool:
     last_at = getattr(agent, "_background_review_last_at", {})
     if not isinstance(last_at, dict):
         last_at = {}
-    last = last_at.get(session_key)
+    trigger_kind = trigger.kind if isinstance(trigger, ReflectionTrigger) else "interval"
+    cooldown_key = f"{session_key}:{trigger_kind}"
+    last = last_at.get(cooldown_key)
     if last is not None and now - float(last) < cooldown:
         return False
 
-    if isinstance(trigger, ReflectionTrigger) and trigger.kind == "failure":
-        last_failure = float(
-            getattr(agent, "_background_review_last_failure_at", -cooldown)
-        )
-        if now - last_failure < cooldown:
-            return False
-        agent._background_review_last_failure_at = now
-
-    last_at[session_key] = now
+    last_at[cooldown_key] = now
     agent._background_review_last_at = last_at
     agent._background_review_in_flight = True
     return True

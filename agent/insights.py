@@ -153,7 +153,7 @@ class InsightsEngine:
                 "top_sessions": [],
             }
             if learning:
-                self._inject_learning_sections(report, cutoff, source)
+                self._inject_learning_sections(report, cutoff, source, days)
             return report
 
         # Compute insights
@@ -179,7 +179,7 @@ class InsightsEngine:
             "top_sessions": top_sessions,
         }
         if learning:
-            self._inject_learning_sections(report, cutoff, source)
+            self._inject_learning_sections(report, cutoff, source, days)
         return report
 
     # =========================================================================
@@ -195,21 +195,21 @@ class InsightsEngine:
         report: Dict[str, Any],
         cutoff: float,
         source: Optional[str],
+        days: int,
     ) -> None:
-        report["turn_outcomes"] = self._get_turn_outcomes(cutoff, source)
+        report["turn_outcomes"] = self._get_turn_outcomes(days, source)
         report["reflection_triggers"] = self._get_reflection_triggers(cutoff, source)
         report["skill_utility"] = self._get_skill_utility()
 
     def _get_turn_outcomes(
         self,
-        cutoff: float,
+        days: int,
         source: Optional[str],
     ) -> List[Dict[str, Any]]:
         """Per-outcome trend rows using the existing SessionDB query."""
         try:
-            if hasattr(self.db, "get_outcome_trends"):
-                rows = self.db.get_outcome_trends(days=int((time.time() - cutoff) // 86400) or 30)
-                return list(rows or [])
+            rows = self.db.get_outcome_trends(days=days, source=source)
+            return list(rows or [])
         except Exception:
             pass
         return []
@@ -217,6 +217,13 @@ class InsightsEngine:
     def _get_reflection_triggers(self, cutoff: float, source: Optional[str]) -> List[Dict[str, Any]]:
         """Reflection-trigger counters by kind. Stays hook-shaped for Task 3."""
         try:
+            params: list[Any] = [cutoff]
+            source_clause = ""
+            source_join = ""
+            if source:
+                source_join = " JOIN sessions s ON s.id = t.session_id"
+                source_clause = " AND s.source = ?"
+                params.append(source)
             cursor = self._conn.execute(
                 """
                 SELECT
@@ -225,12 +232,14 @@ class InsightsEngine:
                         ELSE outcome
                     END AS kind,
                     COUNT(*) AS count
-                FROM turn_outcomes
-                WHERE created_at >= ?
+                FROM turn_outcomes t
+                """ + source_join + """
+                WHERE t.created_at >= ?
+                """ + source_clause + """
                 GROUP BY kind
                 ORDER BY count DESC
                 """,
-                (cutoff,),
+                tuple(params),
             )
             return [dict(row) for row in cursor.fetchall()]
         except Exception:
@@ -249,7 +258,7 @@ class InsightsEngine:
             if not isinstance(raw, dict):
                 continue
             try:
-                util = _skill_usage.get_skill_utility(str(name))
+                util = _skill_usage.get_skill_utility(str(name), raw)
             except Exception:
                 continue
             # Preserve unknown sidecar fields so a future schema addition

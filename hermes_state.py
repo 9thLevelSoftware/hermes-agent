@@ -2419,6 +2419,7 @@ class SessionDB:
         *,
         session_id: Optional[str] = None,
         days: int = 30,
+        source: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Aggregate turn_outcomes over a recent window.
 
@@ -2432,41 +2433,90 @@ class SessionDB:
         assert conn is not None
         cutoff = time.time() - max(int(days), 0) * 86400
         params: List[Any] = [cutoff]
-        where = "WHERE created_at >= ?"
+        where = "WHERE t.created_at >= ?"
+        source_join = ""
         if session_id:
-            where += " AND session_id = ?"
+            where += " AND t.session_id = ?"
             params.append(session_id)
+        if source:
+            source_join = "JOIN sessions s ON s.id = t.session_id"
+            where += " AND s.source = ?"
+            params.append(source)
         select_session = (
-            "session_id AS session_id," if session_id else ""
+            "f.session_id AS session_id," if session_id else ""
         )
+        group_by = "f.outcome" + (", f.session_id" if session_id else "")
+        latest_scope = "latest.outcome = f.outcome"
+        if session_id:
+            latest_scope += " AND latest.session_id = f.session_id"
+
+        def latest(column: str) -> str:
+            return (
+                f"(SELECT latest.{column} FROM filtered latest "
+                f"WHERE {latest_scope} "
+                "ORDER BY latest.created_at DESC, latest.turn_id DESC LIMIT 1) "
+                f"AS {column}"
+            )
+
         cursor = conn.execute(
             f"""
+            WITH filtered AS (
+                SELECT t.*
+                FROM turn_outcomes t
+                {source_join}
+                {where}
+            )
             SELECT
-                outcome,
+                f.outcome,
                 {select_session}
                 COUNT(*) AS count,
-                MAX(created_at) AS latest_at,
-                MAX(model) AS model,
-                MAX(skills_loaded) AS skills_loaded,
-                MAX(feedback_kind) AS feedback_kind,
-                MAX(feedback_value) AS feedback_value,
-                MAX(feedback_source) AS feedback_source,
-                MAX(feedback_at) AS feedback_at,
-                MAX(guardrail_halt) AS guardrail_halt,
-                MAX(cost_usd_delta) AS cost_usd_delta,
-                MAX(input_tokens_delta) AS input_tokens_delta,
-                MAX(output_tokens_delta) AS output_tokens_delta,
-                MAX(cache_read_tokens_delta) AS cache_read_tokens_delta,
-                MAX(api_calls) AS api_calls,
-                MAX(tool_iterations) AS tool_iterations
-            FROM turn_outcomes
-            {where}
-            GROUP BY outcome
-            ORDER BY count DESC, outcome ASC
+                MAX(f.created_at) AS latest_at,
+                {latest("model")},
+                {latest("skills_loaded")},
+                {latest("feedback_kind")},
+                {latest("feedback_value")},
+                {latest("feedback_source")},
+                {latest("feedback_at")},
+                {latest("guardrail_halt")},
+                SUM(f.cost_usd_delta) AS cost_usd_delta,
+                SUM(f.input_tokens_delta) AS input_tokens_delta,
+                SUM(f.output_tokens_delta) AS output_tokens_delta,
+                SUM(f.cache_read_tokens_delta) AS cache_read_tokens_delta,
+                SUM(f.api_calls) AS api_calls,
+                SUM(f.tool_iterations) AS tool_iterations
+            FROM filtered f
+            GROUP BY {group_by}
+            ORDER BY count DESC, f.outcome ASC
             """,
             tuple(params),
         )
         return [dict(row) for row in cursor.fetchall()]
+
+    def get_turn_id_for_platform_message(
+        self,
+        session_id: str,
+        platform_message_id: str,
+    ) -> Optional[str]:
+        """Resolve an assistant platform message to its nearest ledger turn."""
+        self._require_open()
+        conn = self._conn
+        assert conn is not None
+        row = conn.execute(
+            """
+            SELECT t.turn_id
+            FROM messages m
+            JOIN turn_outcomes t ON t.session_id = m.session_id
+            WHERE m.session_id = ?
+              AND m.platform_message_id = ?
+              AND m.role = 'assistant'
+            ORDER BY ABS(t.created_at - m.timestamp), t.created_at DESC
+            LIMIT 1
+            """,
+            (session_id, platform_message_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["turn_id"] if hasattr(row, "keys") else row[0])
 
     def get_skill_outcome_counts(self, *, days: int = 30) -> List[Dict[str, Any]]:
         """Per-skill outcome breakdown over a recent window.

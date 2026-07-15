@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -86,6 +86,37 @@ def record_turn_outcome_safely(
             pass
         return None
     return None
+
+
+def persist_turn_outcome(
+    agent: Any,
+    *,
+    outcome: str,
+    outcome_reason: str,
+    turn_exit_reason: Optional[str],
+    api_calls: int,
+    tool_iterations: int,
+    messages: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> TurnOutcomeRecord:
+    """Build, persist, and attribute one turn outcome.
+
+    Ledger persistence and sidecar attribution are deliberately independent:
+    a database failure must not suppress the utility evidence for the turn.
+    """
+    record = build_turn_outcome_record(
+        agent,
+        outcome=outcome,
+        outcome_reason=outcome_reason,
+        turn_exit_reason=turn_exit_reason,
+        api_calls=api_calls,
+        tool_iterations=tool_iterations,
+        messages=messages,
+    )
+    try:
+        record_turn_outcome_safely(getattr(agent, "_session_db", None), record)
+    finally:
+        _bump_sidecar_for_skills(record)
+    return record
 
 
 def skills_loaded_from(agent: Any) -> tuple[str, ...]:
@@ -297,9 +328,10 @@ def _bump_sidecar_for_skills(record: "TurnOutcomeRecord") -> None:
         cost = float(getattr(record, "cost_usd_delta", 0.0) or 0.0)
     except (TypeError, ValueError):
         cost = 0.0
+    per_skill_cost = cost / len(skills)
     for skill in skills:
         try:
-            _bump(str(skill), outcome, cost)
+            _bump(str(skill), outcome, per_skill_cost)
         except Exception:
             # ponytail: per-skill swallow; one bad skill must not stop
             # the others. bump_outcome is already best-effort internally
@@ -313,7 +345,7 @@ __all__ = [
     "TurnOutcomeRecord",
     "build_turn_outcome_record",
     "record_turn_outcome_safely",
+    "persist_turn_outcome",
     "skills_loaded_from",
     "extract_loaded_skills",
-    "_bump_sidecar_for_skills",
 ]

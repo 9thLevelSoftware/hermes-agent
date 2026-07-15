@@ -1022,7 +1022,10 @@ def usage_report() -> List[Dict[str, Any]]:
 # Outcome utility — observability for the learning pipeline.
 # ---------------------------------------------------------------------------
 
-def get_skill_utility(skill_name: str) -> Dict[str, Any]:
+def get_skill_utility(
+    skill_name: str,
+    rec: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Return outcome-attribution evidence for *skill_name*.
 
     Shape::
@@ -1044,7 +1047,10 @@ def get_skill_utility(skill_name: str) -> Dict[str, Any]:
     ``forget()``; the curator has its own state-transition rules and we
     don't introduce a new one from this module.
     """
-    rec = get_record(skill_name)
+    if rec is None:
+        rec = get_record(skill_name)
+    elif not isinstance(rec, dict):
+        rec = {}
     helped = int(rec.get("helped") or 0)
     hurt = int(rec.get("hurt") or 0)
     neutral = int(rec.get("neutral") or 0)

@@ -343,6 +343,79 @@ def test_get_outcome_trends_groups_by_outcome_and_session_filter():
     assert by_outcome_all.get("verified") == 3
 
 
+def test_get_outcome_trends_sums_numeric_fields_and_uses_latest_text_fields():
+    import time
+
+    tmp, db = _tmp_db()
+    db.create_session("s1", source="cli")
+    db.create_session("s2", source="telegram")
+    db.record_turn_outcome(
+        _record(
+            session_id="s1",
+            turn_id="old",
+            outcome="verified",
+            created_at=time.time() - 2,
+            cost_usd_delta=0.50,
+            input_tokens_delta=100,
+            output_tokens_delta=10,
+            cache_read_tokens_delta=4,
+            api_calls=2,
+            tool_iterations=1,
+            skills_loaded=("old",),
+            model="old-model",
+        )
+    )
+    db.record_turn_outcome(
+        _record(
+            session_id="s1",
+            turn_id="new",
+            outcome="verified",
+            created_at=time.time() - 1,
+            cost_usd_delta=0.25,
+            input_tokens_delta=30,
+            output_tokens_delta=3,
+            cache_read_tokens_delta=1,
+            api_calls=1,
+            tool_iterations=2,
+            skills_loaded=("new",),
+            model="new-model",
+        )
+    )
+    db.record_turn_outcome(_record(session_id="s2", turn_id="other", outcome="verified"))
+
+    row = db.get_outcome_trends(source="cli", days=30)[0]
+    assert row["count"] == 2
+    assert row["cost_usd_delta"] == pytest.approx(0.75)
+    assert row["input_tokens_delta"] == 130
+    assert row["output_tokens_delta"] == 13
+    assert row["cache_read_tokens_delta"] == 5
+    assert row["api_calls"] == 3
+    assert row["tool_iterations"] == 3
+    assert row["model"] == "new-model"
+    assert json.loads(row["skills_loaded"]) == ["new"]
+
+
+def test_platform_message_resolves_to_nearest_assistant_turn():
+    import time
+
+    _, db = _tmp_db()
+    now = time.time()
+    db.create_session("s1", source="telegram")
+    db.record_turn_outcome(
+        _record(session_id="s1", turn_id="turn-1", created_at=now)
+    )
+    db.append_message(
+        "s1",
+        role="assistant",
+        content="answer",
+        platform_message_id="bot-message-1",
+        timestamp=now + 0.1,
+    )
+
+    assert db.get_turn_id_for_platform_message("s1", "bot-message-1") == "turn-1"
+    assert db.get_turn_id_for_platform_message("s1", "foreign") is None
+
+
 def test_get_skill_outcome_counts_summarises_skills_loaded():
     tmp, db = _tmp_db()
     db.record_turn_outcome(
@@ -1383,8 +1456,8 @@ def test_bump_outcome_called_for_each_skill_on_successful_attribution(monkeypatc
     # Helper under test: invoke the post-attribution sidecar.
     turn_ledger._bump_sidecar_for_skills(record)  # type: ignore[attr-defined]
 
-    assert ("plan", "verified", 0.42) in calls
-    assert ("web", "verified", 0.42) in calls
+    assert ("plan", "verified", 0.21) in calls
+    assert ("web", "verified", 0.21) in calls
     assert len(calls) == 2
 
 

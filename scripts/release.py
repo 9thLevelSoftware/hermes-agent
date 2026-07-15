@@ -48,7 +48,9 @@ AUTHOR_MAP = {
     "changhyun.min@gmail.com": "minchang",  # PR #42231 salvage (providers: add Upstage Solar)
     "agent@local": "9thLevelSoftware",  # local Hermes Agent commits in PR branches
     "hermes@local": "9thLevelSoftware",  # local Hermes commits in PR branches
+    "hermes@example.invalid": "9thLevelSoftware",  # generated local Hermes commits
     "dasblueeyeddevil@gmail.com": "9thLevelSoftware",  # PR #29 (code-mode tool orchestration)
+    "dasblueyeddevil@gmail.com": "9thLevelSoftware",  # local Hermes PR commit
     "neo@neodeMac-mini.local": "neo-claw-bot",  # PR #58465 salvage (moa: drop empty user turns from advisory view)
     "m.guttmann@journaway.com": "mguttmann",  # PR #63738 salvage (Anthropic setup-token pool auth normalization)
     "VrtxOmega@pm.me": "VrtxOmega",  # PR #43809 salvage (desktop: WSL folder-picker path bridge)

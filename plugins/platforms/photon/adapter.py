@@ -700,7 +700,8 @@ class PhotonAdapter(BasePlatformAdapter):
         ctype = content.get("type")
         if ctype == "reaction":
             # Route only tapbacks on messages WE sent — those are implicitly
-            # addressed to the bot (feishu precedent: synthetic text event).
+            # addressed to the bot. Record feedback directly; do not inject a
+            # synthetic user message into the live transcript.
             # Reactions on human↔human messages are not for us. Checked before
             # the mention gate: a tapback never carries a wake word.
             target_id = content.get("targetMessageId")
@@ -713,33 +714,15 @@ class PhotonAdapter(BasePlatformAdapter):
                 )
                 return
             emoji = content.get("emoji") or ""
-            source = self.build_source(
-                chat_id=space_id,
-                chat_name=space_id,
-                chat_type=chat_type,
-                user_id=sender_id,
-                user_name=sender_id or None,
-            )
-            # Correlate the tapback to the message it reacted to, so the agent
-            # sees WHAT was reacted to. `is_ours` above guarantees the target is
-            # one of the bot's own messages, so reply_to_is_own_message holds and
-            # the gateway injects `[Replying to your previous message: "..."]`.
-            # reply_to_text comes from the sidecar (hydrated reaction target);
-            # it's None for attachment/voice-only targets, and the gateway only
-            # injects the pointer when both id and text are present.
-            await self.handle_message(
-                MessageEvent(
-                    text=f"reaction:added:{emoji}",
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=event.get("messageId"),
-                    reply_to_message_id=target_id,
-                    reply_to_text=content.get("targetText") or None,
-                    reply_to_is_own_message=True,
-                    raw_message=event,
-                    metadata={"feedback_already_annotated": True},
-                    timestamp=timestamp,
-                )
+            if self._is_sender_authorized(sender_id, chat_type, space_id) is False:
+                return
+            self.publish_feedback(
+                self.platform,
+                space_id,
+                target_id,
+                sender_id,
+                emoji,
+                str(event.get("eventId") or event.get("messageId") or ""),
             )
             return
         # Anything past here is a real (reactable) message — remember it as

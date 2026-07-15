@@ -533,18 +533,22 @@ def run_codex_app_server_turn(
     # failure cannot suppress utility-counter evidence.
     _turn_outcome_record = None
     try:
-        from agent.turn_ledger import (
-            build_turn_outcome_record,
-            record_turn_outcome_safely,
-        )
+        from agent.turn_ledger import persist_turn_outcome
         # turn.turn_id is an opaque codex UUID, NOT an exit reason — store
         # a stable fallback so downstream analytics can group codex turns
         # alongside chat-completions turns without leaking UUIDs into the
         # ledger's reason dimension.
-        codex_exit_reason = (
-            "codex_error" if getattr(turn, "error", None) else "codex_response"
-        )
-        _turn_outcome_record = build_turn_outcome_record(
+        if getattr(turn, "error", None):
+            codex_exit_reason = "codex_error"
+        elif getattr(turn, "interrupted", False):
+            codex_exit_reason = "codex_interrupted"
+        elif getattr(turn, "should_retire", False):
+            codex_exit_reason = "codex_retired"
+        elif not getattr(turn, "final_text", ""):
+            codex_exit_reason = "codex_no_response"
+        else:
+            codex_exit_reason = "codex_response"
+        _turn_outcome_record = persist_turn_outcome(
             agent,
             outcome=turn_outcome["outcome"],
             outcome_reason=turn_outcome["reason"],
@@ -553,20 +557,8 @@ def run_codex_app_server_turn(
             tool_iterations=turn.tool_iterations,
             messages=messages,
         )
-        record_turn_outcome_safely(
-            getattr(agent, "_session_db", None),
-            _turn_outcome_record,
-        )
     except Exception as _ledger_err:
         logger.debug("turn_outcome ledger write skipped: %s", _ledger_err)
-    # Best-effort sidecar bump — must run whether the DB write above
-    # succeeded or failed. A sidecar failure never escapes this block.
-    if _turn_outcome_record is not None:
-        try:
-            from agent.turn_ledger import _bump_sidecar_for_skills
-            _bump_sidecar_for_skills(_turn_outcome_record)
-        except Exception as _bump_err:
-            logger.debug("skill sidecar bump skipped: %s", _bump_err)
 
     # Background review fork — interval nudges remain a fallback, while
     # failure/correction/tool-streak signals can review non-verified turns.

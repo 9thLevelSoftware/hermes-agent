@@ -1068,3 +1068,20 @@ def test_get_skill_utility_does_not_archive_or_delete(skills_home):
     # No archive state was applied as a side effect of poor utility.
     assert rec["state"] == "active"
     assert rec.get("archived_at") is None
+
+
+def test_get_skill_utility_uses_preloaded_record_without_disk_read(monkeypatch):
+    from tools import skill_usage as mod
+
+    monkeypatch.setattr(
+        mod,
+        "get_record",
+        lambda _name: (_ for _ in ()).throw(AssertionError("disk read")),
+    )
+    result = mod.get_skill_utility(
+        "plan",
+        {"helped": 5, "hurt": 1, "neutral": 0, "outcome_cost_usd": 0.25},
+    )
+    assert result["count"] == 6
+    assert result["cost_usd"] == pytest.approx(0.25)
+    assert result["eligible"] is True

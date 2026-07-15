@@ -122,6 +122,23 @@ def test_review_gate_allows_new_signal_after_completed_review(monkeypatch):
     assert should_trigger_review({"agent": agent, "trigger": reaction, "cooldown": 60}) is True
 
 
+def test_review_gate_does_not_share_cooldown_between_signal_kinds(monkeypatch):
+    clock = iter((100.0, 101.0))
+    monkeypatch.setattr("agent.reflection_triggers.time.monotonic", lambda: next(clock))
+    agent = SimpleNamespace(session_id="session-1")
+    failure = evaluate_reflection_triggers("failed", "", [])
+    correction = evaluate_reflection_triggers("verified", "I meant the other file", [])
+
+    assert should_trigger_review({"agent": agent, "trigger": failure, "cooldown": 60}) is True
+    agent._background_review_in_flight = False
+    assert should_trigger_review({"agent": agent, "trigger": correction, "cooldown": 60}) is True
+
+
+def test_positive_reaction_does_not_trigger_background_review():
+    assert evaluate_reflection_triggers("reaction", "", ["thumbs_up"]) is None
+    assert evaluate_reflection_triggers("reaction", "", ["👎"]).kind == "reaction"
+
+
 def test_review_gate_preserves_verified_interval_fallback():
     agent = SimpleNamespace(session_id="session-1")
 

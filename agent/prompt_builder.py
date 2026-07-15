@@ -1494,14 +1494,14 @@ def _load_skill_utility_records() -> dict[str, dict]:
     Reads the sidecar once per snapshot-build; callers cache the result.
     """
     try:
-        from tools.skill_usage import load_usage, get_skill_utility, MIN_UTILITY_SAMPLES
+        from tools.skill_usage import load_usage, get_skill_utility
         data = load_usage()
     except Exception:
         return {}
     records: dict[str, dict] = {}
-    for name in data:
+    for name, rec in data.items():
         try:
-            util = get_skill_utility(name)
+            util = get_skill_utility(name, rec)
             records[name] = util
         except Exception:
             continue
@@ -1530,13 +1530,13 @@ def _utility_sort_key(
     hurt = int(rec.get("hurt", 0))
     count = helped + hurt
     if count < min_samples:
-        return (0, 0.0, name)  # below configured threshold: keep alpha order
+        return (1, 0.0, name)  # below configured threshold: keep alpha order
     # ponytail: lexical_relevance is constant (no query context) — all skills
     # have the same lexical relevance when there's no search query. Use 1.0
     # so the formula reduces to utility_weight * utility + (1 - weight) * 1.0.
     utility = (helped + 1.0) / (helped + hurt + 2.0)
     score = utility_weight * utility + (1 - utility_weight) * 1.0
-    return (1, -score, name)  # eligible: sort first, higher score first
+    return (0, -score, name)  # eligible: sort first, higher score first
 
 
 def build_skills_system_prompt(

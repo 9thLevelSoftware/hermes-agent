@@ -1795,6 +1795,19 @@ class TestUtilityRankedSkillIndex:
             "Config min_samples=3 should make 3-sample skills eligible for ranking"
         )
 
+    def test_utility_ranking_puts_eligible_skills_before_sparse_skills(self):
+        from agent.prompt_builder import _utility_sort_key
+
+        records = {
+            "eligible": {"helped": 5, "hurt": 0},
+            "sparse": {"helped": 1, "hurt": 0},
+        }
+        ordered = sorted(
+            records,
+            key=lambda name: _utility_sort_key(name, records, 0.7, 5),
+        )
+        assert ordered == ["eligible", "sparse"]
+
     def test_skill_index_utility_order_is_snapshot_stable(self, monkeypatch, tmp_path):
         """Ordering is session-stable: calling again with different sidecar data
         returns the cached result until the snapshot is cleared."""

@@ -143,6 +143,43 @@ def test_codex_turn_exit_reason_is_not_turn_id():
     assert error_record.turn_exit_reason == "codex_error"
 
 
+def test_codex_turn_exit_reason_classifies_non_response_exits():
+    from agent.turn_ledger import TurnOutcomeRecord
+
+    for fields, expected in (
+        ({"interrupted": True, "final_text": "partial"}, "codex_interrupted"),
+        ({"should_retire": True, "final_text": "done"}, "codex_retired"),
+        ({"final_text": ""}, "codex_no_response"),
+    ):
+        captured = []
+        agent = _make_agent(session_db=None)
+        agent._session_db = _CapturingDB(captured)
+        turn_fields = {
+            "interrupted": False,
+            "error": None,
+            "thread_id": "thread-1",
+            "turn_id": "opaque-id",
+            "projected_messages": [],
+            "tool_iterations": 0,
+            "final_text": "ok",
+            "should_retire": False,
+        }
+        turn_fields.update(fields)
+        turn = SimpleNamespace(**turn_fields)
+        agent._codex_session.run_turn.return_value = turn
+
+        run_codex_app_server_turn(
+            agent,
+            user_message="hello",
+            original_user_message="hello",
+            messages=[{"role": "user", "content": "hello"}],
+            effective_task_id="task-1",
+        )
+
+        assert isinstance(captured[-1], TurnOutcomeRecord)
+        assert captured[-1].turn_exit_reason == expected
+
+
 class _CapturingDB:
     def __init__(self, sink):
         self._sink = sink
