@@ -101,6 +101,15 @@ def test_review_gate_enforces_single_flight_and_failure_cooldown(monkeypatch):
     assert should_trigger_review({"agent": agent, "trigger": failure, "cooldown": 60}) is True
 
 
+def test_review_gate_can_disable_signals_without_persistent_session():
+    agent = SimpleNamespace(session_id="session-1", _background_review_in_flight=False)
+    failure = evaluate_reflection_triggers("failed", "", [])
+
+    assert should_trigger_review(
+        {"agent": agent, "trigger": failure, "cooldown": 0, "signal_enabled": False}
+    ) is False
+
+
 def test_review_gate_allows_new_signal_after_completed_review(monkeypatch):
     clock = iter((100.0, 200.0))
     monkeypatch.setattr("agent.reflection_triggers.time.monotonic", lambda: next(clock))

@@ -588,6 +588,7 @@ def run_codex_app_server_turn(
             "has_response": bool(turn.final_text),
             "interrupted": turn.interrupted,
             "interval_triggered": should_review_memory or should_review_skills,
+            "signal_enabled": getattr(agent, "_session_db", None) is not None,
         })
     except Exception:
         reflection_trigger = None

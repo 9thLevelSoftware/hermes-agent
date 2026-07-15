@@ -83,6 +83,8 @@ def should_trigger_review(context: object) -> bool:
         return False
     agent = context.get("agent")
     trigger = context.get("trigger")
+    if trigger is not None and context.get("signal_enabled") is False:
+        return False
     if trigger is None:
         if not (
             context.get("interval_triggered")

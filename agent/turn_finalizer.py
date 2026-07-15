@@ -581,6 +581,7 @@ def finalize_turn(
             "has_response": bool(final_response),
             "interrupted": interrupted,
             "interval_triggered": _should_review_memory or _should_review_skills,
+            "signal_enabled": getattr(agent, "_session_db", None) is not None,
         })
     except Exception:
         _reflection_trigger = None
