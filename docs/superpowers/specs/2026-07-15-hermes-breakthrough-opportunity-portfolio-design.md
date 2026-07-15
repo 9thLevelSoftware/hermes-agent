@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-15
 
-**Status:** Approved design; implementation not authorized by this document
+**Status:** Approved design with user-review decisions recorded; implementation not authorized by this document
 
 **Target baseline:** `9thLevelSoftware/hermes-agent` `main` at `64a743e9decdc85daa803a9d22e1701f8a639e04`
 
@@ -159,7 +159,7 @@ The portfolio should not become twenty unrelated subsystems. Seven shared contra
 
 ```mermaid
 flowchart TB
-    U["User surfaces: CLI, TUI, Desktop, Dashboard, Channels"]
+    U["User surfaces: CLI/TUI primary, Dashboard secondary, Channels"]
     M["Mission contract: goals, events, checkpoints, review"]
     E["Effect contract: preview, commit, compensate, revise"]
     A["Authority contract: preferences, budgets, approvals, expiry"]
@@ -242,7 +242,7 @@ Each section distinguishes current Hermes substrate from the missing product. Th
 
 **Dependencies and failure conditions.** Production autonomy depends on #2 transactions, #6 authority, and #12 receipts. Checkpointing alone is not success: if tools lack idempotency or reconciliation, the system must not advertise exactly-once behavior.
 
-**Delivery:** Footprint Ladder rung 1—extend goals/workflows and expose CLI/Desktop/Dashboard surfaces at the edge.
+**Delivery:** Footprint Ladder rung 1—extend goals/workflows; expose CLI/TUI controls first and Dashboard monitoring second.
 
 ### 7.2 Reversible & Revisable Action Transactions
 
@@ -254,7 +254,7 @@ Each section distinguishes current Hermes substrate from the missing product. Th
 
 **Design.** Add optional transaction semantics to the existing registry and journal. An effect adapter declares whether an operation is read-only, reversible, compensatable, idempotent, externally reconcilable, or irreversible; it can implement preview, commit, reconcile, and compensate. A transaction graph stages outward effects, rechecks the current authority contract immediately before commit, persists receipts before reporting success, and rolls back only along valid dependency edges. Irreversible effects remain explicit boundaries requiring stronger approval—they are never marketed as undoable.
 
-**90-day proof.** Instrument three representative effect families: filesystem changes, outbound messages, and one browser/service action. Inject 100 plan revisions, stale approvals, crashes, duplicate deliveries, and partial failures. Require zero unauthorized irreversible commits, no duplicate instrumented effects, correct compensation ordering, explicit classification of every non-reversible operation, and less than 15% median overhead on eligible flows.
+**90-day proof.** Instrument three deliberately different adapter families: workspace/filesystem plus local disposable-worktree Git mutations; Hermes-owned versioned workflow/cron/config state; and a delayed outbound-message outbox whose network send is an explicit irreversible boundary. Remote Git push and browser/service writes remain excluded from commit in this first proof. Inject 100 plan revisions, stale approvals, crashes, duplicate deliveries, and partial failures. Require zero unauthorized irreversible commits, no duplicate instrumented effects, correct compensation ordering, explicit classification of every non-reversible operation, and less than 15% median overhead on eligible flows.
 
 **Dependencies and failure conditions.** #6 defines authority and #12 records proof. A provider without idempotency, queryable state, or compensation can be guarded and reconciled but cannot be made magically transactional.
 
@@ -268,13 +268,13 @@ Each section distinguishes current Hermes substrate from the missing product. Th
 
 **Hermes position.** Computer use already records/replays actions and media (`tools/computer_use/cua_backend.py:1940-1971`), the agent saves trajectories (`agent/trajectory.py:30-56`), workflows have validated typed specifications (`hermes_cli/workflows_spec.py:190-497`), cron has parameterized blueprints (`cron/blueprint_catalog.py:661-710`), and skill writes can be staged (`tools/skill_manager_tool.py:1259-1345`). There is no coherent user-facing path from demonstration through segmentation, secret/input abstraction, sandbox replay, evaluation, versioning, and promotion.
 
-**Design.** A Desktop-first recorder captures actions, observations, user corrections, and success evidence while redacting secrets. A compiler segments the trace into semantic steps, asks the user to label variable inputs and invariants, and produces a declarative action graph plus a human-readable skill/runbook. Verifier and backtracker paths replay it against altered fixtures and expected interruptions. The user reviews the inferred parameters, required permissions, unsafe boundaries, and test results before promotion. Published automations are versioned and can be rolled back. A promoted skill or command becomes globally discoverable only in a new conversation; the current conversation may invoke it only through the existing user-message skill-command path, never by rebuilding its cached prefix or tool schema.
+**Design.** A CLI/TUI-controlled teaching session captures terminal, browser, and computer-use actions, observations, user corrections, and success evidence while redacting secrets. Terminal commands start/stop recording, label variables and invariants, review the inferred plan/diff, run verification, and publish; GUI activity may be demonstrated, but control and authoring do not depend on the Desktop app. A compiler segments the trace into semantic steps and produces a declarative action graph plus a human-readable skill/runbook. Verifier and backtracker paths replay it against altered fixtures and expected interruptions. Published automations are versioned and can be rolled back. A promoted skill or command becomes globally discoverable only in a new conversation; the current conversation may invoke it only through the existing user-message skill-command path, never by rebuilding its cached prefix or tool schema.
 
-**90-day proof.** Record 20 demonstrations across five workflows involving web, desktop, and file tasks. Test each against changed values, reordered lists, one popup/interruption, and one negative fixture. Pass if at least 70% complete successfully without manual repair, no dangerous step executes silently, all secrets are parameterized or brokered rather than embedded, and failures stop with an actionable diagnosis.
+**90-day proof.** Record 20 demonstrations across five workflows involving web, native-GUI, and file tasks, all controlled and reviewed from CLI/TUI. Test each against changed values, reordered lists, one popup/interruption, and one negative fixture. Pass if at least 70% complete successfully without manual repair, no dangerous step executes silently, all secrets are parameterized or brokered rather than embedded, and failures stop with an actionable diagnosis.
 
 **Dependencies and failure conditions.** #5 improves action reliability, #8 supplies safe replay, #9 supplies later experience-based refinement, and #12 supplies success evidence. A trace that succeeds only on the recorded screen coordinates is not a learned automation.
 
-**Delivery:** Footprint Ladder rung 2—CLI + skill and Desktop authoring surface, reusing existing computer-use/workflow machinery.
+**Delivery:** Footprint Ladder rung 2—CLI command + skill with an Ink TUI review flow; Dashboard parity is secondary and Desktop is not a delivery dependency.
 
 ### 7.4 Sovereign Personal Knowledge & Evidence Timeline
 
@@ -284,13 +284,13 @@ Each section distinguishes current Hermes substrate from the missing product. Th
 
 **Hermes position.** Hermes has memory-provider and manager abstractions (`agent/memory_provider.py:43-315`, `agent/memory_manager.py:903-1034`), committed-memory gating and provenance metadata, FTS session/tool histories (`hermes_state.py:4338-4519`), turn outcomes (`agent/turn_ledger.py:28-118`), and web results with URL/title metadata. It lacks a temporal entity/fact/claim graph, claim-to-source evidence edges, validity intervals, confidence/freshness, contradiction workflows, multimodal indexing, and a complete inspect/edit/delete interface.
 
-**Design.** Store immutable evidence records separately from derived claims. Claims carry source edges, extraction method, time interval, confidence, visibility/consent scope, and supersession or contradiction links. Derived summaries, embeddings, graph edges, exports, and caches record their lineage so correction or deletion can cascade. User edits remain explicit higher-authority assertions rather than silently rewriting source history. A timeline UI shows why Hermes believes something, what disagrees, when it was last checked, and every downstream copy affected by deletion.
+**Design.** Store immutable evidence records separately from derived claims. Claims carry source edges, extraction method, time interval, confidence, visibility/consent scope, and supersession or contradiction links. Derived summaries, embeddings, graph edges, exports, and caches record their lineage so correction or deletion can cascade. User edits remain explicit higher-authority assertions rather than silently rewriting source history. CLI commands and an Ink TUI inspector are the primary timeline/query/edit/delete surface; the Dashboard may later add richer graph visualization. Both show why Hermes believes something, what disagrees, when it was last checked, and every downstream copy affected by deletion.
 
 **90-day proof.** Ingest two authorized cross-platform exports plus Hermes session memory, seed temporal changes, contradictions, and deletion canaries, then expose a timeline/editor. Freeze at least 100 ground-truthed temporal questions/claims with validity intervals and expected evidence before evaluation. Pass with at least a 10-percentage-point improvement in evidence-backed answer accuracy over current retrieval, at least 90% evidence precision and 80% evidence recall, no increase in stale-conflict answers, explicit origin for every displayed claim, and zero recovered canaries after erasure across raw memory, summaries, embeddings, graph indexes, caches, and exports controlled by Hermes.
 
 **Dependencies and failure conditions.** The graph engine should be a memory-provider plugin with only generic ABC widening in core. The system must distinguish “source says,” “Hermes inferred,” and “user confirmed”; provenance does not make an extracted claim correct.
 
-**Delivery:** Footprint Ladder rung 4 plus minimal rung-1 provider-contract extensions and edge UI.
+**Delivery:** Footprint Ladder rung 4 plus minimal rung-1 provider-contract extensions, CLI/TUI-first controls, and secondary Dashboard visualization.
 
 ### 7.5 Universal Action Fabric
 
@@ -322,7 +322,7 @@ Each section distinguishes current Hermes substrate from the missing product. Th
 
 **Dependencies and failure conditions.** #15 enforces data-flow rules and #2 revalidates immediately before commit. Inferred preference is never equivalent to authorization.
 
-**Delivery:** Footprint Ladder rung 1/2—config for stable preferences, durable runtime state for scoped authority/audit, plus CLI/Desktop/Dashboard controls; no new core tool schema.
+**Delivery:** Footprint Ladder rung 1/2—config for stable preferences, durable runtime state for scoped authority/audit, CLI/TUI-first controls, and secondary Dashboard controls; Desktop parity is not required and no new core tool schema is added.
 
 ### 7.7 Proactive Attention Broker
 
@@ -394,15 +394,15 @@ Each section distinguishes current Hermes substrate from the missing product. Th
 
 **Why now.** A2UI 0.9 provides an open declarative model for [agent-generated interfaces](https://developers.googleblog.com/en/a2ui-v0-9-generative-ui/), while [MCP Apps](https://modelcontextprotocol.io/extensions/apps/overview) and [AG-UI](https://docs.ag-ui.com/concepts/architecture) establish interoperable patterns for interactive agent surfaces. Research prototypes such as [Generative Interfaces](https://arxiv.org/abs/2508.19227), [DuetUI](https://arxiv.org/abs/2509.13444), and [Macaron-A2UI](https://arxiv.org/abs/2605.24830) report promising usability results, but the studies are small and do not justify arbitrary generated application code.
 
-**Hermes position.** Desktop already renders structured tool cards and artifacts (`apps/desktop/src/components/assistant-ui/thread/message-parts.tsx:20-30`, `apps/desktop/src/components/assistant-ui/tool/fallback.tsx:309-728`), the dashboard has plugin slots (`web/src/plugins/slots.ts:58-132`), and MCP results can carry structured blocks (`tools/mcp_tool.py:4110-4173`). Missing are a trusted declarative workspace protocol, bounded component registry, origin/sandbox rules, bidirectional action/approval events, persisted interactive state, and a consistent textual fallback.
+**Hermes position.** The Ink TUI and CLI are the selected primary surfaces. Desktop already renders structured tool cards and artifacts (`apps/desktop/src/components/assistant-ui/thread/message-parts.tsx:20-30`, `apps/desktop/src/components/assistant-ui/tool/fallback.tsx:309-728`), the dashboard has plugin slots (`web/src/plugins/slots.ts:58-132`), and MCP results can carry structured blocks (`tools/mcp_tool.py:4110-4173`), but none changes the terminal-first product decision. Missing are a trusted declarative workspace protocol, bounded component registry, origin/sandbox rules, bidirectional action/approval events, persisted interactive state, and a consistent semantic rendering contract.
 
-**Design.** Define a versioned `WorkspaceEnvelope` containing only audited components—forms, tables, comparisons, timelines, progress, evidence, artifacts, and approval controls—with stable action IDs bound to backend commands. Models select and populate components but cannot ship executable JavaScript. Desktop and dashboard render the same semantic envelope with surface-specific presentation; TUI/CLI receive an equivalent accessible text representation. All actions cross normal authority and transaction checks.
+**Design.** Define a versioned `WorkspaceEnvelope` containing only audited components—forms, tables, comparisons, timelines, progress, evidence, artifacts, and approval controls—with stable action IDs bound to backend commands. Models select and populate components but cannot ship executable JavaScript. CLI and Ink TUI are first-class renderers using tables, pagers, diffs, prompts, and keyboard-driven panels; the Dashboard may add richer secondary visualization over the same semantics. Desktop receives no parity commitment until a separate product/UX redesign. All actions cross normal authority and transaction checks.
 
 **90-day proof.** Implement five component families and pre-register 20 paired tasks involving plan review, multi-option comparison, mission monitoring, evidence inspection, and approval. Compare against chat-only using median time-to-correct-completion, incorrect committed actions, comprehension questions, and accessibility checks. Pass with at least 20% lower median completion time or 25% fewer errors without worsening the other metric, no comprehension regression, every action keyboard/screen-reader reachable, correct state resume, and no arbitrary-code or privilege-bypass path.
 
 **Dependencies and failure conditions.** #1, #6, and #12 supply the most valuable workspaces. Visual novelty without lower cognitive load is not success.
 
-**Delivery:** Footprint Ladder rung 1 at the UI edge for the shared first-party envelope, safe renderer bindings, and text fallback; rung 4/5 for optional component producers and MCP Apps; no new core model tool.
+**Delivery:** Footprint Ladder rung 1 at the terminal UI edge for the shared first-party envelope and CLI/TUI renderers; secondary Dashboard bindings and rung-4/5 optional producers/MCP Apps follow later; no new core model tool.
 
 ### 7.12 Verified Outcome & Artifact Receipts
 
@@ -418,7 +418,7 @@ Each section distinguishes current Hermes substrate from the missing product. Th
 
 **Dependencies and failure conditions.** This is a shared prerequisite for #1, #2, #9, #14, #19, and #20. A signature proves who produced an artifact, not that its claims are true.
 
-**Delivery:** Footprint Ladder rung 1—canonical SessionDB/artifact schema and edge viewers; optional signing is service-gated/plugin-backed.
+**Delivery:** Footprint Ladder rung 1—canonical SessionDB/artifact schema with CLI/TUI-first receipt viewers and secondary Dashboard inspection; optional signing is service-gated/plugin-backed.
 
 ### 7.13 Sovereign Personal Compute Mesh
 
@@ -608,6 +608,36 @@ A practical first portfolio is four parallel but contract-sharing proofs:
 
 The router can replay the same proof workloads in shadow mode, and the Attention Broker can collect labels without acting. This produces evidence for six additional items without widening the first production surface.
 
+### 8.5 Default benchmark corpus
+
+The user does not need to invent a benchmark taxonomy before work can start. Use a minimum of twelve real workflows—at least two from each archetype—operated through CLI/TUI and grounded in a real repository, current public sources, actual artifacts, or designated test accounts:
+
+| Archetype | Representative real workflow | Primary portfolio coverage |
+|---|---|---|
+| Software maintenance | Reproduce a real failing test or issue, patch it in a disposable worktree, run the relevant verification, and produce a receipt | #1–3, #9–10, #12, #14, #18 |
+| Sourced research | Research a current technical decision, maintain source/evidence lineage, update the report after a conflicting source, and verify citations/artifacts | #1, #4, #10, #12, #18 |
+| Data/artifact pipeline | Transform a real CSV/PDF/log set into a validated report or dataset with versioned intermediate artifacts | #1–2, #8, #11–12 |
+| Repeated web operation | Teach and rerun a workflow against a designated non-production account with changed inputs, layout variation, and one interruption | #2–3, #5, #8, #12 |
+| Personal-knowledge lifecycle | Import two user-authorized exports or representative owned datasets, resolve a temporal contradiction, correct a claim, and cascade-delete a canary | #4, #6, #12, #15, #18 |
+| Proactive/recovery mission | Monitor a real repository/feed, deduplicate events, create a digest, pause for approval, survive restart, and resume from the terminal | #1, #6–7, #10, #12, #15 |
+
+The initial real event sources are:
+
+1. cron/time;
+2. filesystem and local Git state;
+3. an inbound generic/GitHub-style webhook; and
+4. one already-configured gateway channel feeding the terminal attention inbox.
+
+Calendar, email, commerce, and always-on sensors are excluded from the first corpus unless the user separately opts in. Corpus tasks, expected end states, safety strata, cost accounting, and exclusions are versioned before evaluation. No private conversation/log mining is assumed.
+
+### 8.6 First transaction-adapter order
+
+1. **Workspace filesystem and disposable-worktree Git:** preview diffs; checkpoint write/patch/move/delete; stage/commit only on a local disposable branch; restore or revert; never push remotely in the first proof.
+2. **Hermes-owned versioned state:** workflow draft/publish/enable/disable, cron create/update/disable, and config change with validated diff and backup; compensation selects the prior immutable version or restores the prior value.
+3. **Delayed outbound-message outbox:** prepare and preview recipient/content, allow cancellation/revision, commit exactly once where the platform supports idempotency, and mark post-send state irreversible unless that adapter proves edit/delete compensation.
+
+Arbitrary shell commands, production database writes, account deletion, remote Git push, browser form submission, and purchases are not first-wave transaction adapters. Browser writes may participate in preview-only #8 experiments until #5 action continuity and #12 end-state receipts pass their gates.
+
 ## 9. Cross-portfolio acceptance gates
 
 Every proof and later implementation must satisfy the following where applicable:
@@ -744,14 +774,16 @@ The detailed sections cite the sources at the claims they support. This index gr
 - [Agentic Commerce Protocol](https://github.com/agentic-commerce-protocol/agentic-commerce-protocol) — evolving beta.
 - [Runtime verification for agentic payments](https://arxiv.org/abs/2602.06345) — February 2026 simulation/preprint.
 
-## 13. Design-review questions before implementation planning
+## 13. Resolved design-review decisions
 
-The portfolio design is internally coherent, but implementation planning should not begin until the user reviews these decisions:
+User review on 2026-07-15 resolved the design gate as follows:
 
-1. Is the recommended first 90-day portfolio the right balance between visible user value and shared trust infrastructure?
-2. Should Desktop be the primary authoring/control surface for Teach-Once, Knowledge Timeline, Autonomy, and Receipts, with Dashboard parity later?
-3. Which real user workflows and event sources should form the benchmark corpus, so proofs measure actual value rather than synthetic convenience?
-4. Which external actions are safe and useful enough to become the first transaction adapters?
-5. Is the proposed incubation posture for federation and commerce appropriately conservative?
+| Question | Decision |
+|---|---|
+| First 90-day balance | Approved: retain the visible-user-value proofs and their shared trust infrastructure. |
+| Primary surface | CLI and terminal/Ink TUI are primary. Dashboard parity is secondary. The current Desktop app is not a delivery dependency and receives no parity commitment without a separate UX redesign. |
+| Benchmark corpus | Adopt the real, CLI-operated workflow archetypes and initial event sources in §8.5; do not mine private user history or wait for the user to invent a taxonomy. |
+| First transaction adapters | Adopt the reversible/versioned progression in §8.6: workspace/worktree, Hermes-owned workflow/cron/config state, then a delayed message outbox with an explicit irreversible boundary. |
+| Federation and commerce | Federation remains plugin-only incubation after the trust foundations and must demonstrate at least three recurring workflows. Commerce remains protocol-watch and sandbox-only; no live payment work begins without #2, #6, #12, and #15 plus separate user authorization and threat/legal review. |
 
-No implementation plan or code change follows from this document until those product decisions are reviewed.
+The design-review gate is complete. This document still does not authorize implementation. If implementation is requested, the next step is a focused implementation plan for one approved vertical slice rather than a plan for all twenty items at once.
