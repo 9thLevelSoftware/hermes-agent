@@ -158,6 +158,36 @@ def finalize_turn(
     )
     completed = _turn_outcome["outcome"] in {"verified", "completed_unverified"}
 
+    # Persist the per-turn outcome to the learning ledger. Funneled through
+    # the safe writer so a DB outage cannot escape finalization; the
+    # user-visible response is already computed at this point. The sidecar
+    # bump runs in a SEPARATE try/except so a ledger-write failure cannot
+    # suppress utility-counter evidence — DB failure must not shadow the
+    # skill-utility signal.
+    _turn_outcome_record = None
+    try:
+        from agent.turn_ledger import persist_turn_outcome
+        # tool_iterations must reflect the actual tool-call count from the
+        # turn's messages — NOT ``agent._iters_since_skill`` (a skill-nudge
+        # cadence counter with no relation to model-issued tool calls).
+        _turn_tool_count = sum(
+            1 for m in messages
+            if isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and m.get("tool_calls")
+        )
+        _turn_outcome_record = persist_turn_outcome(
+            agent,
+            outcome=_turn_outcome["outcome"],
+            outcome_reason=_turn_outcome["reason"],
+            turn_exit_reason=_turn_exit_reason,
+            api_calls=api_call_count,
+            tool_iterations=_turn_tool_count,
+            messages=messages,
+        )
+    except Exception as _ledger_err:
+        logger.debug("turn_outcome ledger write skipped: %s", _ledger_err)
+
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
     # surfaces — file I/O / JSON serialization (_save_trajectory), remote
@@ -516,20 +546,39 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if (
-        _turn_outcome["outcome"] == "verified"
-        and final_response
-        and not interrupted
-        and (_should_review_memory or _should_review_skills)
-    ):
+    try:
+        from agent.reflection_triggers import (
+            _tool_results,
+            evaluate_reflection_triggers,
+            should_trigger_review,
+        )
+        _reflection_trigger = evaluate_reflection_triggers(
+            _turn_outcome,
+            original_user_message,
+            _tool_results(messages),
+        )
+        _run_review = should_trigger_review({
+            "agent": agent,
+            "trigger": _reflection_trigger,
+            "outcome": _turn_outcome["outcome"],
+            "has_response": bool(final_response),
+            "interrupted": interrupted,
+            "interval_triggered": _should_review_memory or _should_review_skills,
+            "signal_enabled": getattr(agent, "_session_db", None) is not None,
+        })
+    except Exception:
+        _reflection_trigger = None
+        _run_review = False
+    if _run_review:
         try:
+            agent._background_review_trigger = _reflection_trigger
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=_should_review_memory,
-                review_skills=_should_review_skills,
+                review_skills=bool(_should_review_skills or _reflection_trigger),
             )
         except Exception:
-            pass  # Background review is best-effort
+            agent._background_review_in_flight = False
 
     # Note: Memory provider on_session_end() + shutdown_all() are NOT
     # called here — run_conversation() is called once per user message in

@@ -131,7 +131,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -809,6 +809,39 @@ CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS turn_outcomes (
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    outcome TEXT NOT NULL,
+    outcome_reason TEXT,
+    turn_exit_reason TEXT,
+    api_calls INTEGER NOT NULL DEFAULT 0,
+    tool_iterations INTEGER NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    guardrail_halt TEXT,
+    cost_usd_delta REAL NOT NULL DEFAULT 0,
+    input_tokens_delta INTEGER NOT NULL DEFAULT 0,
+    output_tokens_delta INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens_delta INTEGER NOT NULL DEFAULT 0,
+    skills_loaded TEXT,
+    model TEXT,
+    feedback_kind TEXT,
+    feedback_value TEXT,
+    feedback_source TEXT,
+    feedback_at REAL,
+    feedback_event_id TEXT,
+    PRIMARY KEY (session_id, turn_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_outcomes_created_outcome
+    ON turn_outcomes(created_at, outcome);
+CREATE INDEX IF NOT EXISTS idx_turn_outcomes_session_created
+    ON turn_outcomes(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_turn_outcomes_feedback_event
+    ON turn_outcomes(feedback_event_id)
+    WHERE feedback_event_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',
@@ -2262,6 +2295,271 @@ class SessionDB:
                 (session_id,),
             )
         self._execute_write(_do)
+
+    # ── turn_outcomes ledger ──────────────────────────────────────────
+    # Per-turn outcome rows that back ``agent.turn_ledger``. Writes funnel
+    # through ``record_turn_outcome_safely`` so a DB outage never escapes
+    # the finalizer; reads are best-effort and may be called by insights /
+    # learning pipelines. The four methods below are the only public
+    # surface this module exposes for the table; everything else is
+    # private.
+
+    def record_turn_outcome(self, record) -> None:
+        """Upsert one ``turn_outcomes`` row from a ``TurnOutcomeRecord``.
+
+        ``(session_id, turn_id)`` is the primary key — re-recording the
+        same turn replaces the row, which makes idempotent retries safe.
+        ``skills_loaded`` (a tuple) is JSON-encoded; everything else is a
+        scalar that maps straight to its column.
+        """
+        import json as _json
+        skills_json = _json.dumps(list(record.skills_loaded or ()))
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO turn_outcomes (
+                    session_id, turn_id, created_at, outcome, outcome_reason,
+                    turn_exit_reason, api_calls, tool_iterations, retry_count,
+                    guardrail_halt, cost_usd_delta, input_tokens_delta,
+                    output_tokens_delta, cache_read_tokens_delta,
+                    skills_loaded, model
+                ) VALUES (
+                    :session_id, :turn_id, :created_at, :outcome, :outcome_reason,
+                    :turn_exit_reason, :api_calls, :tool_iterations, :retry_count,
+                    :guardrail_halt, :cost_usd_delta, :input_tokens_delta,
+                    :output_tokens_delta, :cache_read_tokens_delta,
+                    :skills_loaded, :model
+                )
+                ON CONFLICT(session_id, turn_id) DO UPDATE SET
+                    created_at = excluded.created_at,
+                    outcome = excluded.outcome,
+                    outcome_reason = excluded.outcome_reason,
+                    turn_exit_reason = excluded.turn_exit_reason,
+                    api_calls = excluded.api_calls,
+                    tool_iterations = excluded.tool_iterations,
+                    retry_count = excluded.retry_count,
+                    guardrail_halt = excluded.guardrail_halt,
+                    cost_usd_delta = excluded.cost_usd_delta,
+                    input_tokens_delta = excluded.input_tokens_delta,
+                    output_tokens_delta = excluded.output_tokens_delta,
+                    cache_read_tokens_delta = excluded.cache_read_tokens_delta,
+                    skills_loaded = excluded.skills_loaded,
+                    model = excluded.model
+                """,
+                {
+                    "session_id": record.session_id,
+                    "turn_id": record.turn_id,
+                    "created_at": float(record.created_at),
+                    "outcome": record.outcome,
+                    "outcome_reason": record.outcome_reason,
+                    "turn_exit_reason": record.turn_exit_reason,
+                    "api_calls": int(record.api_calls),
+                    "tool_iterations": int(record.tool_iterations),
+                    "retry_count": int(record.retry_count),
+                    "guardrail_halt": record.guardrail_halt,
+                    "cost_usd_delta": float(record.cost_usd_delta),
+                    "input_tokens_delta": int(record.input_tokens_delta),
+                    "output_tokens_delta": int(record.output_tokens_delta),
+                    "cache_read_tokens_delta": int(record.cache_read_tokens_delta),
+                    "skills_loaded": skills_json,
+                    "model": record.model,
+                },
+            )
+        self._execute_write(_do)
+
+    def annotate_turn_feedback(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        kind: Optional[str],
+        value: Optional[str],
+        source: Optional[str],
+        event_id: Optional[str],
+    ) -> bool:
+        """Record a feedback annotation on an existing turn_outcomes row.
+
+        Returns True on a fresh annotation (new event_id, row exists),
+        False on dedupe (same event_id) or missing turn (no row to update).
+        Latest feedback wins for the scalar columns (kind/value/source/at).
+        """
+        import time as _time
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT feedback_event_id FROM turn_outcomes "
+                "WHERE session_id = ? AND turn_id = ?",
+                (session_id, turn_id),
+            ).fetchone()
+            if row is None:
+                return ("missing", None)
+            existing_event = row[0] if not isinstance(row, sqlite3.Row) else row["feedback_event_id"]
+            if event_id and existing_event == event_id:
+                return ("duplicate", None)
+            conn.execute(
+                """
+                UPDATE turn_outcomes SET
+                    feedback_kind = ?,
+                    feedback_value = ?,
+                    feedback_source = ?,
+                    feedback_at = ?,
+                    feedback_event_id = ?
+                WHERE session_id = ? AND turn_id = ?
+                """,
+                (kind, value, source, _time.time(), event_id, session_id, turn_id),
+            )
+            return ("ok", None)
+
+        outcome, _ = self._execute_write(_do)
+        return outcome == "ok"
+
+    def get_outcome_trends(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        days: int = 30,
+        source: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Aggregate turn_outcomes over a recent window.
+
+        When ``session_id`` is provided, rows are grouped by outcome for
+        that one session and ``session_id`` is included on every
+        returned row for traceability. When omitted, rows are grouped
+        by outcome across all sessions.
+        """
+        self._require_open()
+        conn = self._conn
+        assert conn is not None
+        cutoff = time.time() - max(int(days), 0) * 86400
+        params: List[Any] = [cutoff]
+        where = "WHERE t.created_at >= ?"
+        source_join = ""
+        if session_id:
+            where += " AND t.session_id = ?"
+            params.append(session_id)
+        if source:
+            source_join = "JOIN sessions s ON s.id = t.session_id"
+            where += " AND s.source = ?"
+            params.append(source)
+        select_session = (
+            "f.session_id AS session_id," if session_id else ""
+        )
+        group_by = "f.outcome" + (", f.session_id" if session_id else "")
+        latest_scope = "latest.outcome = f.outcome"
+        if session_id:
+            latest_scope += " AND latest.session_id = f.session_id"
+
+        def latest(column: str) -> str:
+            return (
+                f"(SELECT latest.{column} FROM filtered latest "
+                f"WHERE {latest_scope} "
+                "ORDER BY latest.created_at DESC, latest.turn_id DESC LIMIT 1) "
+                f"AS {column}"
+            )
+
+        cursor = conn.execute(
+            f"""
+            WITH filtered AS (
+                SELECT t.*
+                FROM turn_outcomes t
+                {source_join}
+                {where}
+            )
+            SELECT
+                f.outcome,
+                {select_session}
+                COUNT(*) AS count,
+                MAX(f.created_at) AS latest_at,
+                {latest("model")},
+                {latest("skills_loaded")},
+                {latest("feedback_kind")},
+                {latest("feedback_value")},
+                {latest("feedback_source")},
+                {latest("feedback_at")},
+                {latest("guardrail_halt")},
+                SUM(f.cost_usd_delta) AS cost_usd_delta,
+                SUM(f.input_tokens_delta) AS input_tokens_delta,
+                SUM(f.output_tokens_delta) AS output_tokens_delta,
+                SUM(f.cache_read_tokens_delta) AS cache_read_tokens_delta,
+                SUM(f.api_calls) AS api_calls,
+                SUM(f.tool_iterations) AS tool_iterations
+            FROM filtered f
+            GROUP BY {group_by}
+            ORDER BY count DESC, f.outcome ASC
+            """,
+            tuple(params),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_turn_id_for_platform_message(
+        self,
+        session_id: str,
+        platform_message_id: str,
+    ) -> Optional[str]:
+        """Resolve an assistant platform message to its nearest ledger turn."""
+        self._require_open()
+        conn = self._conn
+        assert conn is not None
+        row = conn.execute(
+            """
+            SELECT t.turn_id
+            FROM messages m
+            JOIN turn_outcomes t ON t.session_id = m.session_id
+            WHERE m.session_id = ?
+              AND m.platform_message_id = ?
+              AND m.role = 'assistant'
+            ORDER BY ABS(t.created_at - m.timestamp), t.created_at DESC
+            LIMIT 1
+            """,
+            (session_id, platform_message_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["turn_id"] if hasattr(row, "keys") else row[0])
+
+    def get_skill_outcome_counts(self, *, days: int = 30) -> List[Dict[str, Any]]:
+        """Per-skill outcome breakdown over a recent window.
+
+        Each row carries the skill name, total turns, and a per-outcome
+        count column (``verified``, ``failed``, ``partial``, etc.) so
+        learning pipelines can score skill effectiveness without a JOIN.
+        Skills with zero rows are simply absent from the result set.
+        """
+        self._require_open()
+        conn = self._conn
+        assert conn is not None
+        cutoff = time.time() - max(int(days), 0) * 86400
+
+        # Two-pass aggregation is the cheapest correct shape: SQLite's
+        # json_each() gives us one row per skill per turn, and the outer
+        # GROUP BY rolls them up by (skill, outcome).
+        cursor = conn.execute(
+            """
+            SELECT
+                je.value AS skill,
+                o.outcome AS outcome,
+                COUNT(*) AS count
+            FROM turn_outcomes o,
+                 json_each(o.skills_loaded) je
+            WHERE o.created_at >= ?
+              AND o.skills_loaded IS NOT NULL
+            GROUP BY je.value, o.outcome
+            ORDER BY je.value ASC, o.outcome ASC
+            """,
+            (cutoff,),
+        )
+        skill_rows: Dict[str, Dict[str, Any]] = {}
+        for row in cursor.fetchall():
+            row_d = dict(row)
+            skill = row_d["skill"]
+            bucket = skill_rows.setdefault(
+                skill,
+                {"skill": skill, "total": 0},
+            )
+            bucket[row_d["outcome"]] = int(row_d["count"])
+            bucket["total"] += int(row_d["count"])
+        return list(skill_rows.values())
 
     def get_compression_fallback_streak(self, session_id: str) -> int:
         """Return the persisted deterministic-fallback streak."""

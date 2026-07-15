@@ -10520,6 +10520,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         parts = command.split()
         days = 30
         source = None
+        learning = False
         i = 1
         while i < len(parts):
             if parts[i] == "--days" and i + 1 < len(parts):
@@ -10532,6 +10533,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             elif parts[i] == "--source" and i + 1 < len(parts):
                 source = parts[i + 1]
                 i += 2
+            elif parts[i] == "--learning":
+                learning = True
+                i += 1
             elif parts[i].isdigit():
                 days = int(parts[i])
                 i += 1
@@ -10544,8 +10548,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             db = SessionDB()
             engine = InsightsEngine(db)
-            report = engine.generate(days=days, source=source)
-            print(engine.format_terminal(report))
+            report = engine.generate(days=days, source=source, learning=learning)
+            if learning:
+                print(engine.format_terminal_learning(report))
+            else:
+                print(engine.format_terminal(report))
             db.close()
         except Exception as e:
             print(f"  Error generating insights: {e}")

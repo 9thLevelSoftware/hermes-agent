@@ -85,6 +85,43 @@ def _make_event(message_id: str, raw_message) -> MessageEvent:
 
 
 @pytest.mark.asyncio
+async def test_inbound_user_reaction_publishes_feedback_after_auth(adapter):
+    adapter._allowed_user_ids = {"42"}
+    adapter._allowed_role_ids = set()
+    adapter._client.get_guild = lambda _id: None
+    adapter.publish_feedback = MagicMock(return_value=True)
+    payload = SimpleNamespace(
+        user_id=42,
+        channel_id=123,
+        message_id=456,
+        guild_id=None,
+        member=SimpleNamespace(bot=False),
+        emoji="👎",
+    )
+
+    await adapter._handle_raw_reaction_add(payload)
+
+    adapter.publish_feedback.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_inbound_bot_reaction_is_ignored(adapter):
+    adapter.publish_feedback = MagicMock(return_value=True)
+    payload = SimpleNamespace(
+        user_id=42,
+        channel_id=123,
+        message_id=456,
+        guild_id=None,
+        member=SimpleNamespace(bot=True),
+        emoji="👎",
+    )
+
+    await adapter._handle_raw_reaction_add(payload)
+
+    adapter.publish_feedback.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_process_message_background_adds_and_swaps_reactions(adapter):
     raw_message = SimpleNamespace(
         add_reaction=AsyncMock(),
