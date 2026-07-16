@@ -38,6 +38,10 @@
 
 **90-day proof:** Run at least two real authorized sources in no-action shadow mode for at least ten preregistered active eight-hour windows. Cover at least 500 normalized events and 100 surfaced candidates; label every surfaced candidate `useful`, `premature`, or `not_useful`; audit at least 100 stratified non-duplicate suppressed events for high-value misses. Pass only with usefulness precision `useful / (useful + premature + not_useful) >= 0.85`, fewer than one premature would-interrupt per active window, high-value misses `<= 0.05`, reliable exact and cross-channel dedupe, zero action outside current authority, and a complete review trail.
 
+**Dependencies and failure conditions:** Items #1, #2, #6, and #12 own mission state, effect certainty, authority/budgets, and receipt truth. Stop or roll back on an unauthorized action or interruption, a high-value miss above the frozen floor, duplicate delivery/action, unverifiable decision history, cross-profile data, prompt/tool-schema drift, or any ambiguous outward effect that is retried instead of remaining `unknown_effect`.
+
+**Delivery:** Footprint Ladder rung 1/2—extend existing event, mission, transaction, gateway, CLI, and Ink seams and add an operator skill; optional source adapters remain service-gated plugins. No new model-visible core tool, scheduler, workflow engine, approval manager, receipt store, or Desktop dependency is introduced.
+
 **Post-proof rollout:** Advance from `shadow` to `notify_only` only by explicit guarded config apply. `notify_only` may populate review/digests and deliver authority/budget-approved interrupts but cannot update missions or execute actions. Advance to `reversible_actions` only after a second explicit apply; this mode permits mission updates and item #2 transactions whose exact live eligibility is reversible. Any irreversible/unknown action remains review-only.
 
 ## Current-Code Audit and File Map

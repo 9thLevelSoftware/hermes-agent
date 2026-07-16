@@ -35,6 +35,8 @@
 
 **Layman outcome:** Hermes can create the right safe visual workspace for a task—plans, forms, comparisons, timelines, inspectors, or approval panels—instead of forcing everything through prose chat.
 
+**Design boundary:** A workspace is a declarative, host-rendered view over canonical mission, transaction, authority, and receipt state. Producers may propose structured documents and action references, but only host-registered actions can cross the existing authority/approval/transaction boundary; the workspace does not own chat, model sessions, arbitrary code, effect truth, or a second Dashboard composer/transcript.
+
 **90-day proof:** Pre-register exactly 20 paired tasks: four plan-review tasks, four multi-option comparisons, four mission-monitoring tasks, four evidence inspections, and four approvals. Run each task once through current chat-only Hermes and once through the candidate workspace with order counterbalanced. Pass only with at least 20% lower median time-to-correct-completion or at least 25% fewer incorrect committed actions, without worsening the other metric; no comprehension regression; every action reachable by keyboard and screen-reader semantic output; correct state resume after restart; and zero arbitrary-code, stale-action, cross-origin, or privilege-bypass paths.
 
 **Dependencies and failure conditions:** Items #1 Missions, #2 Transactions, #6 Preferences & Autonomy, and #12 Receipts provide durable work, effects, authority, evidence, and truthful outcomes. Visual novelty, denser screens, more actions, or higher rendering complexity without lower cognitive load is failure. A workspace action that bypasses current authority, exact approval, transaction, origin, or receipt semantics is a release blocker.
