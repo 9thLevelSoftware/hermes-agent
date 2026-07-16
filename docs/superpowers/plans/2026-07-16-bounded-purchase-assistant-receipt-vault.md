@@ -670,7 +670,7 @@ Expected: FAIL importing `agent.commerce`.
 
 Implement the exact public fields in `Canonical Public Interfaces`. Reject booleans/floats as amounts, negative arithmetic, line totals that do not multiply, cart totals that do not sum, invalid currency/country/origin/timestamp, duplicate lines/categories/attributes, unconstrained shipping/data scopes, expiry before issue, recurring maximum below one purchase maximum, `mode=live` without `present_user_each_live_payment`, malformed full digests, and any plaintext credential-shaped value.
 
-`SpendMandate.content_hash` excludes `signature`, `content_hash`, and display-only fields but includes every authority, approval, scope, expiry, key, and nonce fact. `cart_hash` excludes provider display labels but includes every commit-relevant field listed in Global Constraints. Derive `idempotency_key = "pay_" + sha256("hermes-commerce-idempotency-v1\0" + purchase_id + mandate_id + cart_hash).hexdigest()` and never accept caller-selected keys.
+`SpendMandate.content_hash` excludes `signature`, `content_hash`, and display-only fields but includes every authority, approval, scope, expiry, key, and nonce fact. `cart_hash` excludes provider display labels but includes every commit-relevant field listed in Global Constraints. Derive `idempotency_key = "pay_" + hashlib.sha256(("hermes-commerce-idempotency-v1\0" + purchase_id + mandate_id + cart_hash).encode("utf-8")).hexdigest()` and never accept caller-selected keys.
 
 - [ ] **Step 4: Implement Ed25519 envelopes**
 

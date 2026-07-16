@@ -340,7 +340,7 @@ git commit -m "test: preregister information flow proof"
 - Create: `tests/agent/information_flow/test_lattice.py`
 
 **Interfaces:**
-- Produces all canonical types shown in “Canonical Contract and Ownership”, `FLOW_SCHEMA_VERSION = "hermes.information-flow.v1"`, `canonical_json()`, `content_digest()`, `context_hash()`, `decision_hash()`, `join_labels()`, and `derive_label()`.
+- Produces all canonical types shown in “Canonical Contract and Ownership”, `FLOW_SCHEMA_VERSION = "hermes.information-flow.v1"`, `canonical_json()`, `content_digest()`, `context_hash()`, `decision_hash()`, `join_labels()`, `validate_retained_label(original, retained, *, removed_fingerprint_ids)`, and `derive_label()`.
 - Consumes only standard-library types and cryptography primitives already available in the repository; adds no dependency.
 
 - [ ] **Step 1: Write RED validation and lattice tests**
@@ -363,7 +363,7 @@ def test_remote_identity_cannot_claim_another_profile():
         FlowContext.fixture(profile_id="work", sink=remote_sink(profile_id="personal"))
 ```
 
-Also test NFC strings, duplicate/unsorted selectors, invalid purpose IDs, empty provenance parents, cycles, unknown enum values, negative timestamps/uses, grant label widening, authority hash shape, and stable hashes over reordered mappings.
+Also test NFC strings, duplicate/unsorted selectors, invalid purpose IDs, empty provenance parents, cycles, unknown enum values, negative timestamps/uses, grant label widening, authority hash shape, and stable hashes over reordered mappings. Retained-label tests reject raised integrity, added compartments/origins, and any confidentiality/compartment/origin reduction without at least one bound removed fingerprint.
 
 - [ ] **Step 2: Run RED**
 
@@ -376,6 +376,43 @@ Expected: FAIL importing `agent.information_flow`.
 Use frozen dataclasses, tuples, integer timestamps, strict normalized dotted IDs, lower-case boundary kinds, and explicit constructors that reject floats/NaN, empty identity, path-like traversal in IDs, label lowering without proof, and `from_label == to_label` grants. `content_digest()` hashes bytes, never stores content. `join_labels()` treats unknown confidentiality as most restrictive for policy comparison while preserving the `unknown` token in returned metadata.
 
 ```python
+_CONFIDENTIALITY_RANK = {
+    name: rank
+    for rank, name in enumerate(
+        ("public", "internal", "personal", "confidential", "credential", "unknown")
+    )
+}
+_INTEGRITY_RANK = {
+    name: rank
+    for rank, name in enumerate(
+        ("trusted", "authenticated", "untrusted", "hostile", "unknown")
+    )
+}
+
+
+def validate_retained_label(
+    original: FlowLabel,
+    retained: FlowLabel,
+    *,
+    removed_fingerprint_ids: tuple[str, ...],
+) -> FlowLabel:
+    if _INTEGRITY_RANK[retained.integrity] < _INTEGRITY_RANK[original.integrity]:
+        raise InvalidSanitizationProof("sanitizer cannot raise integrity")
+    if not set(retained.compartments).issubset(original.compartments):
+        raise InvalidSanitizationProof("sanitizer cannot add compartments")
+    if not set(retained.origin_kinds).issubset(original.origin_kinds):
+        raise InvalidSanitizationProof("sanitizer cannot add origins")
+    lowered = (
+        _CONFIDENTIALITY_RANK[retained.confidentiality]
+        < _CONFIDENTIALITY_RANK[original.confidentiality]
+        or retained.compartments != original.compartments
+        or retained.origin_kinds != original.origin_kinds
+    )
+    if lowered and not removed_fingerprint_ids:
+        raise InvalidSanitizationProof("lowered label requires removed fingerprints")
+    return retained
+
+
 def derive_label(kind: DerivationKind, parents: tuple[ProvenanceNode, ...],
                  proof: SanitizationProof | None = None) -> FlowLabel:
     combined = join_labels(parent.label for parent in parents)
@@ -383,7 +420,11 @@ def derive_label(kind: DerivationKind, parents: tuple[ProvenanceNode, ...],
         return combined
     if proof is None or proof.input_digest not in {p.content_digest for p in parents}:
         raise InvalidSanitizationProof("proof does not bind input")
-    return validate_retained_label(combined, proof.retained_label)
+    return validate_retained_label(
+        combined,
+        proof.retained_label,
+        removed_fingerprint_ids=proof.removed_fingerprint_ids,
+    )
 ```
 
 - [ ] **Step 4: Run GREEN**

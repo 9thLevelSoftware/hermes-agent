@@ -507,10 +507,10 @@ quality_utility    = quality_mean
 reliability_utility = reliability_mean
 latency_utility    = 1 - min(latency_mean / max_estimated_latency_seconds, 1)
 cost_utility       = 1 - min(cost_mean / max_estimated_task_cost_usd, 1)
-utility_mean       = wq*quality + wr*reliability + wl*latency + wc*cost
+utility_mean       = wq*quality_utility + wr*reliability_utility + wl*latency_utility + wc*cost_utility
 utility_variance   = wq^2*quality_variance + wr^2*reliability_variance
-                   + wl^2*(latency_sample_variance / max(weight_sum, 1)) / latency_cap^2
-                   + wc^2*(cost_sample_variance / max(weight_sum, 1)) / cost_cap^2
+                   + wl^2*(latency_sample_variance / max(weight_sum, 1)) / max_estimated_latency_seconds^2
+                   + wc^2*(cost_sample_variance / max(weight_sum, 1)) / max_estimated_task_cost_usd^2
 utility_lcb        = utility_mean - NormalDist().inv_cdf(0.95) * sqrt(utility_variance)
 ```
 
