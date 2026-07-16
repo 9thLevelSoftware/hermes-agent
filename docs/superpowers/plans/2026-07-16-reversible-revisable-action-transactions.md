@@ -119,7 +119,7 @@ EligibilityCode = Literal[
 - `agent/effects/store.py` — typed `SessionDB` access, CAS transitions, immutable revisions/events/approvals/outbox/receipt queries.
 - `agent/effects/registry.py` — adapter registration/discovery and capability-contract validation.
 - `agent/effects/graph.py` — DAG validation, revision diff rules, frontier, topological commit, and reverse-cascade selection.
-- `agent/effects/authority.py` — authority snapshots, resource/destination matching, commit-time recheck, exact approval binding.
+- `agent/effects/authority.py` — maps prepared effects into item #6's canonical `ActionContext`, reloads the canonical `AuthorityProvider`, and owns only exact transaction approval binding.
 - `agent/effects/coordinator.py` — prepare/preview/commit/revise/reconcile/compensate orchestration around `OperationJournal`.
 - `agent/effects/recovery.py` — bounded owner-fenced startup reconciliation shared by CLI, TUI, and gateway.
 - `agent/effects/eligibility.py` — dynamic exact-undo/semantic-compensation eligibility and human explanations.
@@ -654,18 +654,20 @@ git commit -m "feat: add revisable transaction dags"
 - Modify: `tests/tools/test_approval.py`
 
 **Interfaces:**
-- Produces `AuthorityProvider`, `StoredAuthorityProvider`, `authorize_effect()`, `request_bound_approval()`, and `consume_bound_approval()`.
-- Consumes `tools.approval.request_tool_approval()` and its immutable identity/hash/expiry semantics, but persists transaction-specific bindings in `state.db` so restart never broadens consent.
+- Consumes item #6's canonical `AuthorityProvider`, `StoredAuthorityProvider`, `AutonomyContract`, `ActionContext`, `AuthorityDecision`, and `authorize_effect()`, plus `tools.approval.request_tool_approval()` and its immutable identity/hash/expiry semantics.
+- Produces `build_action_context()`, `request_bound_approval()`, and `consume_bound_approval()`; it persists only transaction-specific approval bindings in `state.db` so restart never broadens consent.
 
 - [ ] **Step 1: Write RED tests for expiry, drift, and approval replay**
 
 ```python
 def test_authority_is_reloaded_immediately_before_commit(store, clock):
-    provider = StoredAuthorityProvider(store, clock=clock)
-    decision = authorize_effect(provider, prepared_effect(), stage="preview")
+    provider = StoredAuthorityProvider.open_current(clock=clock)
+    context = build_action_context(prepared_effect(), operation_key="tx-1:config")
+    decision = authorize_effect(provider, context, stage="preview", consume=False)
     assert decision.allowed
-    store.replace_authority("tx-1", expected_version=1, authority=authority_without("config.set"))
-    decision = authorize_effect(provider, prepared_effect(), stage="commit")
+    autonomy_service().apply_rule_change(deny_rule("config.set"), expected_version=1)
+    context = build_action_context(prepared_effect(), operation_key="tx-1:config")
+    decision = authorize_effect(provider, context, stage="commit", consume=True)
     assert not decision.allowed
     assert decision.code == "authority_changed"
 
@@ -690,31 +692,35 @@ Run: `scripts/run_tests.sh tests/agent/effects/test_authority.py tests/tools/tes
 
 Expected: FAIL importing `agent.effects.authority`.
 
-- [ ] **Step 3: Add typed authority and decision models**
+- [ ] **Step 3: Integrate the canonical autonomy contract without duplicating it**
 
 ```python
-@dataclass(frozen=True)
-class AuthoritySnapshot:
-    version: int
-    allowed_adapters: frozenset[str]
-    allowed_actions: frozenset[str]
-    resource_prefixes: tuple[str, ...]
-    message_targets: frozenset[str]
-    allow_compensation: bool
-    irreversible: Literal["deny", "ask"]
-    expires_at_ms: int
+from agent.autonomy import (
+    ActionContext,
+    AuthorityDecision,
+    AuthorityProvider,
+    StoredAuthorityProvider,
+    authorize_effect,
+)
 
 
-@dataclass(frozen=True)
-class AuthorityDecision:
-    allowed: bool
-    code: str
-    reason: str
-    authority_version: int
-    requires_approval: bool
+def build_action_context(prepared: PreparedEffect, *, operation_key: str) -> ActionContext:
+    return ActionContext(
+        operation_key=operation_key,
+        stage="preview",
+        action_class=prepared.action,
+        resources=prepared.resources,
+        recipient_classes=prepared.recipient_classes,
+        recipient_hashes=prepared.recipient_hashes,
+        data_classes=prepared.data_classes,
+        cost_usd_micros=prepared.cost_usd_micros,
+        reversibility=prepared.semantics.fidelity,
+        uncertainty_ppm=prepared.uncertainty_ppm,
+        required_evidence=prepared.required_evidence,
+    )
 ```
 
-Reject unknown keys and non-positive expiry at transaction creation. Resource matching uses adapter-normalized canonical resource keys, not caller text. Path resources are resolved before prefix comparison; destination resources use `DeliveryTarget.to_string()`.
+Item #6 owns rule parsing, expiry/consumption, conflict resolution, budgets, and allow/ask/deny. This adapter supplies only trusted adapter-normalized facts: stable operation key, resolved path resources, recipient classes and hashed recipient identities, declared data classes, integer USD micros, reversibility, uncertainty ppm, and evidence. `build_action_context()` initializes the immutable record at `stage="preview"`; only item #6's `authorize_effect(..., stage=...)` may replace the decision stage. Unknown or missing high-risk facts fail closed in the canonical evaluator. At transaction creation persist the autonomy contract version/hash used for preview; immediately before commit or compensation reload `StoredAuthorityProvider.open_current()` and call `authorize_effect(..., stage="commit" | "compensate", consume=True)`.
 
 - [ ] **Step 4: Persist exact approval bindings**
 

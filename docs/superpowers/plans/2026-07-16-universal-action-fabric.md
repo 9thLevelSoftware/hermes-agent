@@ -17,7 +17,7 @@
 - Preserve strict message-role alternation. CLI/TUI control results are control-plane output, not synthetic user messages inserted into an active agent loop.
 - Profiles remain independent islands. Resolve durable state through `get_hermes_home()` and user-visible paths through `display_hermes_home()`. An intent, capability, auth binding, action attempt, transaction, or receipt may not cross `HERMES_HOME`.
 - Stable non-secret settings live under `action_fabric:` in `config.yaml`. Credentials remain in existing MCP OAuth, browser-provider, platform, OS, or secret-store ownership. Persist only opaque auth-binding fingerprints; never persist cookies, bearer tokens, form secrets, typed secrets, or screenshots containing secrets.
-- Consume item #2's `EffectAdapter`, `TransactionCoordinator`, `TransactionStore`, `AuthorityProvider`, exact approval binding, operation certainty, and `unknown_effect` semantics. Do not create a second commit boundary, approval store, effect table, transaction state machine, or compensation vocabulary.
+- Consume item #2's `EffectAdapter`, `TransactionCoordinator`, `TransactionStore`, exact approval binding, operation certainty, and `unknown_effect` semantics, and item #6's canonical `AuthorityProvider`/`ActionContext` decision contract. Do not create a second authority model, commit boundary, approval store, effect table, transaction state machine, or compensation vocabulary.
 - Consume item #12's immutable `ReceiptStore`, `ReceiptStatus`, claims, observations, artifact digests, and scorer-only verified decision. Do not create an Action Fabric receipt table or let a path adapter choose `verified`.
 - Consume item #15's deterministic `InformationFlowGuard` and `FlowContext`. A fallback retains exactly the same source labels, sink/resource identity, purpose, profile, authority version, and declassification record. Missing flow context fails closed for mutating or cross-boundary paths.
 - Action Fabric owns selection among already-authorized capabilities. Item #17 owns acquisition, signature/provenance verification, grants, isolation, updates, and removal. Discovery here never installs, enables, grants, or broadens a capability.
@@ -821,7 +821,7 @@ git commit -m "feat: rank authorized action paths"
 
 **Interfaces:**
 - Produces `ContinuityGuard.verify_handoff()`, `ActionResolver.prepare()`, `ActionResolver.commit()`, `ActionResolver.reconcile()`, `ActionResolver.compensate()`, and `PreparedResolution`.
-- Consumes item #2 `EffectAdapter`/`CommitRequest`/`TransactionCoordinator`, item #2 authority/approval, item #15 IFC, registry/ranking/store, and per-path adapters.
+- Consumes item #2 `EffectAdapter`/`CommitRequest`/`TransactionCoordinator` and exact transaction approval, item #6 `AuthorityProvider`/`ActionContext`, item #15 IFC, registry/ranking/store, and per-path adapters.
 
 - [ ] **Step 1: Write RED fallback truth-table tests**
 
