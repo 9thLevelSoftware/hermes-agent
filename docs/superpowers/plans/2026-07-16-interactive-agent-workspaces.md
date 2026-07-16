@@ -18,7 +18,7 @@
 - Stable action IDs are display references, never commands. A trusted backend creates a separate `WorkspaceActionBinding`; an envelope, model, artifact, or MCP server cannot supply a handler, authority grant, transaction ID, receipt status, or trusted data label.
 - Reuse item #6 `agent.autonomy.AuthorityProvider`, `StoredAuthorityProvider`, `ActionContext`, `AuthorityDecision`, and `authorize_effect()`. Do not create a workspace permission store, evaluator, rule type, or approval protocol.
 - Reuse item #2 `agent.effects.TransactionCoordinator`, `TransactionStore`, `TransactionRevision`, `RevisionNode`, `EffectAdapter`, and the existing `OperationJournal` for mutating action effects. Workspace invocation rows are an audited UI projection, not another effect state machine.
-- Reuse item #12's canonical `Receipt`, `ArtifactEvidence`, `ReceiptStatus`, evidence freshness, and statuses `verified`, `completed_unverified`, `failed`, `blocked`, and `unknown_effect`. Until the standalone #12 plan lands, consume the canonical `agent.receipts` contract established by item #1; do not define a local receipt schema.
+- Reuse item #12's canonical `Receipt`, `ArtifactDigest`, `ReceiptStatus`, evidence freshness, and statuses `verified`, `completed_unverified`, `failed`, `blocked`, and `unknown_effect`. Until the standalone #12 plan lands, consume the canonical `agent.receipts` contract established by item #1; do not define a local receipt schema.
 - Persist immutable envelopes, resumable instance state, trusted action bindings, append-only events, and invocation projections in profile-local `state.db` resolved through `get_hermes_home()`. Profiles remain independent islands.
 - Non-secret settings live under `workspaces:` in `config.yaml`. Credentials and secret values are not valid workspace fields and never enter envelope/state/audit JSON.
 - The system prompt, cached prefix, effective tool definitions, provider, and model remain byte-stable for a conversation. Workspace state changes never rewrite history, rebuild prompts, reload tools, inject a synthetic user message, or change role alternation.
@@ -151,7 +151,7 @@ class WorkspaceService:
     def close(self, instance_id: str, *, expected_revision: int) -> WorkspaceView: ...
 ```
 
-Mutating bindings call item #6 exactly as `authorize_effect(provider, action_context, stage="execute", consume=True)`. If allowed, effectful bindings create or load an item #2 `ActionTransaction`/`TransactionRevision`, call `TransactionCoordinator.preview()`, and commit only through `TransactionCoordinator.commit()` with the exact current revision, preview, approval, and authority identities; they never invoke a handler directly. Results reference item #12 `Receipt` and `ArtifactEvidence`; only the canonical receipt scorer may return `verified`.
+Mutating bindings call item #6 exactly as `authorize_effect(provider, action_context, stage="execute", consume=True)`. If allowed, effectful bindings create or load an item #2 `ActionTransaction`/`TransactionRevision`, call `TransactionCoordinator.preview()`, and commit only through `TransactionCoordinator.commit()` with the exact current revision, preview, approval, and authority identities; they never invoke a handler directly. Results reference item #12 `Receipt` and `ArtifactDigest`; only the canonical receipt scorer may return `verified`.
 
 ---
 
@@ -475,7 +475,7 @@ git commit -m "feat: persist resumable workspace state"
 
 **Interfaces:**
 - Produces: `WorkspaceIntake`, `origin_for_mission()`, `origin_for_receipt()`, `origin_for_artifact()`, `origin_for_mcp()`, `project_mission_workspace()`, `project_receipt_workspace()`, and `ingest_mcp_workspace()`.
-- Consumes: Tasks 2–3 validation/store, item #1 mission records, item #12 `Receipt`/`ArtifactEvidence`, existing artifact paths, and the current MCP `structuredContent` result.
+- Consumes: Tasks 2–3 validation/store, item #1 mission records, item #12 `Receipt`/`ArtifactDigest`, existing artifact paths, and the current MCP `structuredContent` result.
 
 - [ ] **Step 1: Write RED origin, artifact, and MCP boundary tests**
 
@@ -1224,7 +1224,7 @@ git commit -m "docs: gate interactive workspace rollout"
 | Exactly five audited families | Closed immutable registry and invariant test; producers cannot register renderers |
 | Stable backend-bound action IDs | Separate immutable binding, envelope/origin/args hash, revision/expiry/requester/channel checks |
 | Canonical authority | Item #6 `AuthorityProvider`/`ActionContext`/`authorize_effect`, commit-time reload, existing approval transport |
-| Canonical effects and receipts | Item #2 coordinator/journal and item #12 `Receipt`/`ArtifactEvidence`/statuses; no local substitutes |
+| Canonical effects and receipts | Item #2 coordinator/journal and item #12 `Receipt`/`ArtifactDigest`/statuses; no local substitutes |
 | Durable/resumable state | `state.db` CAS revisions, events, replay identity, reopen/fresh-process tests |
 | CLI and native Ink primary | Shared parser/semantic projection, native mutating RPC/route, all-family renderer tests |
 | Dashboard secondary | Complementary sidebar panel, same service/semantics, terminal remains primary, ask returns to primary approval |
