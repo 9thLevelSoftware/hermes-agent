@@ -394,6 +394,7 @@ async function listBaseBranches(repoPath, gitBin) {
       ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'],
       resolved
     )
+
     const localDefault = await defaultBranch(gitBin, resolved)
 
     return out

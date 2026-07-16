@@ -3257,6 +3257,7 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("approval", "Approval", "smart command approval"),
     ("mcp", "MCP", "MCP tool reasoning"),
     ("title_generation", "Title generation", "session titles"),
+    ("memory_query_rewrite", "Memory query rewrite", "memory retrieval queries"),
     ("tts_audio_tags", "TTS audio tags", "Gemini TTS tag insertion"),
     ("skills_hub", "Skills hub", "skills search/install"),
     ("triage_specifier", "Triage specifier", "kanban spec fleshing"),
@@ -12278,6 +12279,7 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
 
     try:
         from hermes_cli.config import load_config, save_config
+        from hermes_cli.plugins_cmd import ensure_basic_auth_plugin_enabled_in_config
 
         cfg = load_config()
         dash = cfg.setdefault("dashboard", {})
@@ -12288,6 +12290,16 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
         basic["password"] = ""
         if not str(basic.get("secret", "") or "").strip():
             basic["secret"] = secret
+        # The bundled basic provider is a backend plugin that still honours
+        # plugins.disabled. Unblock it when we just wrote basic_auth so the
+        # discover_plugins(force=True) call below can register the provider
+        # (#54489). Surface the mutation so an operator who deliberately
+        # disabled it isn't surprised.
+        if ensure_basic_auth_plugin_enabled_in_config(cfg):
+            print(
+                "  ✓ Re-enabled the bundled 'basic' auth plugin "
+                "(was in plugins.disabled)"
+            )
         save_config(cfg)
     except Exception as exc:
         print(f"  ✗ Failed to write config.yaml: {exc}")
