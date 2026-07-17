@@ -45,6 +45,7 @@ class TestConfigParsing:
         cfg = ToolSearchConfig.from_raw(None)
         assert cfg.enabled == "auto"
         assert cfg.threshold_pct == 10.0
+        assert cfg.absolute_threshold_tokens == 20_000
 
     def test_bool_true_maps_to_auto(self):
         from tools.tool_search import ToolSearchConfig
@@ -72,6 +73,15 @@ class TestConfigParsing:
         assert cfg.threshold_pct == 100.0
         cfg = ToolSearchConfig.from_raw({"threshold_pct": -5})
         assert cfg.threshold_pct == 0.0
+
+    def test_absolute_threshold_clamped(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw({"absolute_threshold_tokens": 999})
+        assert cfg.absolute_threshold_tokens == 1_000
+        cfg = ToolSearchConfig.from_raw({"absolute_threshold_tokens": 999_999})
+        assert cfg.absolute_threshold_tokens == 100_000
+        cfg = ToolSearchConfig.from_raw({"absolute_threshold_tokens": "invalid"})
+        assert cfg.absolute_threshold_tokens == 20_000
 
     def test_search_limits_clamped(self):
         from tools.tool_search import ToolSearchConfig
@@ -161,12 +171,27 @@ class TestThresholdGate:
         assert should_activate(cfg, deferrable_tokens=20_000, context_length=200_000)
         assert should_activate(cfg, deferrable_tokens=50_000, context_length=200_000)
 
+    def test_auto_uses_absolute_ceiling_for_large_context(self):
+        from tools.tool_search import ToolSearchConfig, should_activate
+        cfg = ToolSearchConfig.from_raw({"enabled": "auto", "threshold_pct": 10})
+        assert not should_activate(cfg, deferrable_tokens=19_999, context_length=1_000_000)
+        assert should_activate(cfg, deferrable_tokens=20_000, context_length=1_000_000)
+
+    def test_auto_uses_percentage_for_smaller_context(self):
+        from tools.tool_search import ToolSearchConfig, should_activate
+        cfg = ToolSearchConfig.from_raw({"enabled": "auto", "threshold_pct": 10})
+        assert not should_activate(cfg, deferrable_tokens=9_999, context_length=100_000)
+        assert should_activate(cfg, deferrable_tokens=10_000, context_length=100_000)
+
     def test_auto_without_context_length_uses_20k_cutoff(self):
         """Fallback cutoff used when the active model is unknown."""
         from tools.tool_search import ToolSearchConfig, should_activate
-        cfg = ToolSearchConfig.from_raw({"enabled": "auto"})
-        assert not should_activate(cfg, deferrable_tokens=10_000, context_length=0)
-        assert should_activate(cfg, deferrable_tokens=25_000, context_length=0)
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "auto",
+            "absolute_threshold_tokens": 30_000,
+        })
+        assert not should_activate(cfg, deferrable_tokens=29_999, context_length=0)
+        assert should_activate(cfg, deferrable_tokens=30_000, context_length=-1)
 
     def test_token_estimate_proportional_to_schema_size(self):
         from tools.tool_search import estimate_tokens_from_schemas
@@ -277,6 +302,47 @@ class TestAssembly:
         # The pre-existing tool_search was stripped (it would be re-injected if
         # activation happened; here it didn't).
         assert "tool_search" not in names
+
+    def test_activation_keeps_core_adds_bridges_and_off_is_passthrough(self, monkeypatch):
+        import tools.registry as registry_module
+        from tools.registry import ToolRegistry
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            ToolSearchConfig,
+            assemble_tool_defs,
+        )
+
+        def _handler(args, **kwargs):
+            return "ok"
+
+        registry = ToolRegistry()
+        registry.register(
+            name="assembly_plugin_tool",
+            toolset="mcp-assembly-test",
+            schema={"name": "assembly_plugin_tool", "description": "test", "parameters": {}},
+            handler=_handler,
+        )
+        monkeypatch.setattr(registry_module, "registry", registry)
+        defs = [_td("terminal", "Run shell"), _td("assembly_plugin_tool", "test")]
+
+        active = assemble_tool_defs(
+            defs,
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+        active_names = {t["function"]["name"] for t in active.tool_defs}
+        assert "terminal" in active_names
+        assert BRIDGE_TOOL_NAMES <= active_names
+        assert "assembly_plugin_tool" not in active_names
+
+        disabled = assemble_tool_defs(
+            defs,
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "off"}),
+        )
+        disabled_names = {t["function"]["name"] for t in disabled.tool_defs}
+        assert {"terminal", "assembly_plugin_tool"} <= disabled_names
+        assert not BRIDGE_TOOL_NAMES.intersection(disabled_names)
 
 
 # ---------------------------------------------------------------------------

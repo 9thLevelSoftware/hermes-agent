@@ -2354,6 +2354,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
         return result
 
+    registry_passthrough = False
     if function_name == "todo":
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool
@@ -2441,6 +2442,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
     else:
+        registry_passthrough = True
+
         def _execute(next_args: dict) -> Any:
             return _ra().handle_function_call(
                 function_name, next_args, effective_task_id,
@@ -2456,13 +2459,27 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
 
-    from hermes_cli.middleware import run_tool_execution_middleware
+    if registry_passthrough:
+        # handle_function_call owns the registry tool's execution middleware;
+        # wrapping it here would emit the same operation key twice.
+        return _execute(function_args)
 
+    from hermes_cli.middleware import run_tool_execution_middleware
+    from model_tools import registry
+
+    operation_metadata = registry.get_operation_metadata(function_name)
     return run_tool_execution_middleware(
         function_name,
         function_args,
         lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
         original_args=function_args,
+        operation_metadata=operation_metadata,
+        operation_key_factory=lambda: registry.operation_key(
+            function_name,
+            function_args,
+            task_id=effective_task_id or "",
+            tool_call_id=tool_call_id or "",
+        ),
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",
         tool_call_id=tool_call_id or "",

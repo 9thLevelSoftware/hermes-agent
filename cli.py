@@ -46,6 +46,18 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+
+class _AsyncSynth(str):
+    """Synthetic input carrying the one durable row it is allowed to ack."""
+
+    delegation_id: str
+
+    def __new__(cls, value: str, delegation_id: str):
+        item = super().__new__(cls, value)
+        item.delegation_id = delegation_id
+        return item
+
+
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
@@ -4064,6 +4076,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        self._pending_delegation_acks: "deque[str]" = deque()
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
         # don't auto-queue another continuation on top of a user-cancelled
@@ -8729,6 +8742,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_curator_command(cmd_original)
         elif canonical == "kanban":
             self._handle_kanban_command(cmd_original)
+        elif canonical == "workflow":
+            self._handle_workflow_command(cmd_original)
         elif canonical == "skills":
             with self._busy_command(self._slow_command_status(cmd_original)):
                 self._handle_skills_command(cmd_original)
@@ -10596,6 +10611,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         parts = command.split()
         days = 30
         source = None
+        learning = False
         i = 1
         while i < len(parts):
             if parts[i] == "--days" and i + 1 < len(parts):
@@ -10608,6 +10624,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             elif parts[i] == "--source" and i + 1 < len(parts):
                 source = parts[i + 1]
                 i += 2
+            elif parts[i] == "--learning":
+                learning = True
+                i += 1
             elif parts[i].isdigit():
                 days = int(parts[i])
                 i += 1
@@ -10620,8 +10639,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             db = SessionDB()
             engine = InsightsEngine(db)
-            report = engine.generate(days=days, source=source)
-            print(engine.format_terminal(report))
+            report = engine.generate(days=days, source=source, learning=learning)
+            if learning:
+                print(engine.format_terminal_learning(report))
+            else:
+                print(engine.format_terminal(report))
             db.close()
         except Exception as e:
             print(f"  Error generating insights: {e}")
@@ -13375,6 +13397,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             ] if item is not None
         ]
 
+    def _drain_idle_async_delegations(self) -> int:
+        """Queue notifications while deferring durable acknowledgement to consumption."""
+        from tools.process_registry import process_registry
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key(default="")
+        staged = 0
+        for event, synth in process_registry.drain_notifications(session_key=session_key):
+            delegation_id = event.get("delegation_id", "") if event.get("type") == "async_delegation" else ""
+            self._pending_input.put(_AsyncSynth(synth, delegation_id) if delegation_id else synth)
+            if delegation_id:
+                self._pending_delegation_acks.append(delegation_id)
+            staged += 1
+        return staged
+
+    def _ack_pending_async_delegations(self, delegation_id: Optional[str] = None) -> None:
+        """Acknowledge only the durable row for the async synth being consumed."""
+        if not delegation_id or not self._pending_delegation_acks:
+            return
+        try:
+            self._pending_delegation_acks.remove(delegation_id)
+        except ValueError:
+            return
+        from tools.async_delegation import acknowledge_async_delegation
+
+        try:
+            acknowledge_async_delegation(delegation_id)
+        except Exception:
+            logger.debug("Unable to acknowledge async delegation %s", delegation_id, exc_info=True)
+
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
         if not self._claim_active_session("cli"):
@@ -13530,6 +13582,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()     # For normal input (commands + new queries)
         self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
+        self._pending_delegation_acks: "deque[str]" = deque()
         # See constructor note. Mirrored here for the run() path that skips
         # the earlier __init__ branch.
         self._last_turn_interrupted = False
@@ -15408,6 +15461,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         spinner_thread = threading.Thread(target=spinner_loop, daemon=True)
         spinner_thread.start()
         
+        try:
+            from agent.operation_journal import OperationJournal
+            from tools.async_delegation import restore_unacknowledged_delegations
+            from tools.process_registry import process_registry as _pr_cli
+
+            _session_db = getattr(self, "_session_db", None)
+            if _session_db is None:
+                raise RuntimeError("CLI session database is unavailable")
+            _op_journal = OperationJournal(_session_db)
+            _moved = _op_journal.reconcile_after_restart(owner_fenced=True)
+            _restored = restore_unacknowledged_delegations(
+                _pr_cli.completion_queue, _pr_cli.completion_queue.put,
+            )
+            if _moved or _restored:
+                logger.info(
+                    "Async delegation durable journal: reconciled %d in-flight, restored %d unacknowledged terminal rows",
+                    _moved, _restored,
+                )
+        except Exception:
+            logger.debug("Async delegation durable journal startup skipped", exc_info=True)
+
         # Background thread to process inputs and run agent
         def process_loop():
             while not self._should_exit:
@@ -15429,6 +15503,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     
                     if not user_input:
                         continue
+
+                    _async_delegation_id = (
+                        user_input.delegation_id
+                        if isinstance(user_input, _AsyncSynth)
+                        else None
+                    )
+                    self._ack_pending_async_delegations(_async_delegation_id)
 
                     # The user has typed and submitted something, so any
                     # post-resize transient suppression should end here.

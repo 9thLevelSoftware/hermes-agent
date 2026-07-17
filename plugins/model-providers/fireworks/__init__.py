@@ -24,12 +24,12 @@ fireworks = ProviderProfile(
     auth_type="api_key",
     # Auxiliary model for cheap tasks (compaction, title generation, vision).
     # A standard pay-as-you-go catalog ``/models/`` ID.
-    default_aux_model="accounts/fireworks/models/glm-5p2",
+    default_aux_model="accounts/fireworks/models/glm-4p6",
     # Curated safety net shown in the picker when the live catalog fetch fails.
     fallback_models=(
-        "accounts/fireworks/models/kimi-k2p6",
-        "accounts/fireworks/models/glm-5p2",
-        "accounts/fireworks/models/kimi-k2p7-code",
+        "accounts/fireworks/models/kimi-k2-instruct-0905",
+        "accounts/fireworks/models/glm-4p6",
+        "accounts/fireworks/models/kimi-k2-instruct",
     ),
 )
 

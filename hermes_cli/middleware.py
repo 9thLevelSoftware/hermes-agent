@@ -199,6 +199,9 @@ def run_tool_execution_middleware(
     callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
     if not callbacks:
         return next_call(args)
+    operation_key_factory = context.pop("operation_key_factory", None)
+    if callable(operation_key_factory):
+        context["operation_key"] = operation_key_factory()
     return _run_execution_chain(
         TOOL_EXECUTION_MIDDLEWARE,
         callbacks,

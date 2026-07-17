@@ -2,9 +2,11 @@
 
 import json
 import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
+from agent.runtime_health import RuntimeHealthRegistry
 from tools.registry import ToolRegistry, _module_registers_tools, discover_builtin_tools
 
 
@@ -31,6 +33,66 @@ class TestRegisterAndDispatch:
         )
         result = json.loads(reg.dispatch("alpha", {}))
         assert result == {"ok": True}
+
+    def test_operation_metadata_defaults_conservative_and_stays_internal(self):
+        reg = ToolRegistry()
+        schema = _make_schema("alpha")
+        reg.register(
+            name="alpha",
+            toolset="core",
+            schema=schema,
+            handler=_dummy_handler,
+        )
+
+        assert reg.get_operation_metadata("alpha") == {
+            "read_only": False,
+            "destructive": True,
+            "idempotent": False,
+        }
+        assert "read_only" not in schema
+        assert "destructive" not in schema
+        assert "idempotent" not in schema
+
+    def test_operation_key_is_stable_for_canonical_arguments(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="lookup",
+            toolset="core",
+            schema=_make_schema("lookup"),
+            handler=_dummy_handler,
+            read_only=True,
+            idempotent=True,
+        )
+
+        first = reg.operation_key(
+            "lookup", {"b": 2, "a": 1}, task_id="task", tool_call_id="call"
+        )
+        second = reg.operation_key(
+            "lookup", {"a": 1, "b": 2}, task_id="task", tool_call_id="call"
+        )
+
+        assert first == second
+        assert reg.operation_key(
+            "lookup", {"path": "bad\udcffname"}, task_id="task", tool_call_id="call"
+        )
+        assert reg.get_operation_metadata("lookup") == {
+            "read_only": True,
+            "destructive": False,
+            "idempotent": True,
+        }
+
+    def test_positional_override_slot_remains_backward_compatible(self):
+        reg = ToolRegistry()
+        reg.register("same", "built-in", _make_schema("same"), _dummy_handler)
+        replacement = lambda args, **kwargs: json.dumps({"replacement": True})
+
+        reg.register(
+            "same", "plugin", _make_schema("same"), replacement,
+            None, None, False, "", "", None, None, True,
+        )
+
+        assert reg.get_entry("same").handler is replacement
+        assert reg.get_operation_metadata("same")["read_only"] is False
 
     def test_dispatch_passes_args(self):
         reg = ToolRegistry()
@@ -794,3 +856,197 @@ class TestDeregisterAuthorization:
             evil_handler = eval("lambda *a, **k: 'hijacked'", {"__name__": "hermes_plugins.evil"})
             reg.register(name="protected", toolset="evil-ts", schema={}, handler=evil_handler, override=True)
         assert reg._tools["protected"].handler({}) == "built-in"
+
+
+class TestHealthAwareDispatch:
+    """Tool dispatch becomes fail-fast once a toolset's RuntimeHealthRegistry
+    trips into open_circuit. Keeps the agent from burning turns calling a
+    known-broken capability (e.g. a Telegram backend that just 502'd)."""
+
+    @staticmethod
+    def _loads(result):
+        """dispatch() returns either a JSON string or a dict (multimodal
+        envelope). Coerce to a dict for assertions."""
+        if isinstance(result, dict):
+            return result
+        return json.loads(result)
+
+    def test_get_runtime_health_returns_empty_dict_when_no_dispatch(self):
+        # Use a private RuntimeHealthRegistry — the module-level shared one
+        # accumulates state from earlier tests in this file's run order.
+        reg = ToolRegistry(runtime_health=RuntimeHealthRegistry())
+        assert reg.get_runtime_health() == {}
+
+    def test_dispatch_open_circuit_returns_structured_error_without_calling_handler(self):
+        """Two record_failures in the same toolset open the circuit. The
+        handler must NOT be invoked again until the cooldown expires."""
+        health = RuntimeHealthRegistry()
+        reg = ToolRegistry(runtime_health=health)
+
+        handler_calls = {"count": 0}
+
+        def boom(args, **kw):
+            handler_calls["count"] += 1
+            raise RuntimeError("transient backend blip")
+
+        reg.register(
+            name="send_msg",
+            toolset="telegram",
+            schema={"name": "send_msg", "description": "", "parameters": {"type": "object", "properties": {}}},
+            handler=boom,
+        )
+
+        # First failure: degraded, circuit still probing. The handler
+        # actually ran and surfaced its regular error path.
+        first = self._loads(reg.dispatch("send_msg", {}))
+        assert "error" in first  # sanitized error from the handler
+        assert first.get("error_type") != "open_circuit"
+        assert handler_calls["count"] == 1
+
+        # Second failure: transitions to open_circuit. The handler was
+        # still called — open_circuit only kicks in for *future* calls.
+        second = self._loads(reg.dispatch("send_msg", {}))
+        assert "error" in second  # handler ran, regular error path
+        assert second.get("error_type") != "open_circuit"
+        assert handler_calls["count"] == 2
+
+        # Third dispatch: open_circuit + should_probe False → handler
+        # is NOT invoked, structured error is returned.
+        third = self._loads(reg.dispatch("send_msg", {}))
+        assert third["error"] == "Capability temporarily unavailable"
+        assert third["error_type"] == "open_circuit"
+        assert third["retry_after_seconds"] >= 1
+        assert handler_calls["count"] == 2
+
+        # Fourth dispatch during cooldown is also short-circuited.
+        fourth = self._loads(reg.dispatch("send_msg", {}))
+        assert fourth["error_type"] == "open_circuit"
+        assert handler_calls["count"] == 2
+
+    def test_dispatch_success_records_healthy_state(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="ping",
+            toolset="ok",
+            schema={"name": "ping", "description": "", "parameters": {"type": "object", "properties": {}}},
+            handler=lambda args, **kw: json.dumps({"pong": True}),
+        )
+        self._loads(reg.dispatch("ping", {}))
+
+        health = reg.get_runtime_health()
+        assert health["toolset:ok"]["state"] == "healthy"
+        assert health["toolset:ok"]["suppressed_failures"] == 0
+
+    def test_dispatch_records_failure_per_toolset(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="boom",
+            toolset="flaky",
+            schema={"name": "boom", "description": "", "parameters": {"type": "object", "properties": {}}},
+            handler=lambda args, **kw: (_ for _ in ()).throw(ConnectionError("econnreset")),
+        )
+        self._loads(reg.dispatch("boom", {}))
+
+        health = reg.get_runtime_health()
+        assert health["toolset:flaky"]["state"] == "degraded"
+        assert health["toolset:flaky"]["suppressed_failures"] == 0
+
+    def test_unrelated_toolset_dispatch_is_not_suppressed_by_open_circuit(self):
+        health = RuntimeHealthRegistry()
+        reg = ToolRegistry(runtime_health=health)
+        reg.register(
+            name="tg_send",
+            toolset="telegram",
+            schema={"name": "tg_send", "description": "", "parameters": {"type": "object", "properties": {}}},
+            handler=lambda args, **kw: (_ for _ in ()).throw(RuntimeError("tg down")),
+        )
+        reg.register(
+            name="discord_send",
+            toolset="discord",
+            schema={"name": "discord_send", "description": "", "parameters": {"type": "object", "properties": {}}},
+            handler=lambda args, **kw: json.dumps({"ok": True}),
+        )
+
+        # Trip telegram.
+        self._loads(reg.dispatch("tg_send", {}))
+        self._loads(reg.dispatch("tg_send", {}))
+        # Force the circuit open with a third call (should short-circuit).
+        self._loads(reg.dispatch("tg_send", {}))
+
+        # Discord must NOT be affected.
+        result = self._loads(reg.dispatch("discord_send", {}))
+        assert result == {"ok": True}
+
+    def test_agent_tools_snapshot_unaffected_by_health_failure(self):
+        """Regression guard: the prompt-cache key for `agent.tools` must not
+        change when runtime_health state changes. agent.tools is computed
+        from get_tool_definitions; that snapshot must be stable across
+        health updates so the agent's prompt-cache key stays valid even
+        after transient backend failures are recorded.
+
+        We pin the behavior at the registry layer: registry.get_definitions
+        must not differ between the healthy baseline and the post-failure
+        state, i.e. runtime_health is strictly orthogonal to tool exposure.
+        """
+        reg = ToolRegistry()
+        reg.register(
+            name="flaky",
+            toolset="telegram",
+            schema={"name": "flaky", "description": "", "parameters": {"type": "object", "properties": {}}},
+            handler=lambda args, **kw: (_ for _ in ()).throw(RuntimeError("blip")),
+        )
+        before = reg.get_definitions({"flaky"})
+        self._loads(reg.dispatch("flaky", {}))  # record_failure
+        self._loads(reg.dispatch("flaky", {}))  # open_circuit
+        self._loads(reg.dispatch("flaky", {}))  # short-circuit
+        after = reg.get_definitions({"flaky"})
+
+        # Tool exposure did not change because of health state.
+        assert [d["function"]["name"] for d in before] == [d["function"]["name"] for d in after]
+        # And the schema bodies are byte-identical (no keys added/removed).
+        assert before == after
+
+    def test_no_runtime_health_wired_in_dispatch_still_works(self):
+        """Monkeypatching _runtime_health to None must keep dispatch functional
+        (regression guard for the optional health wire-up)."""
+        reg = ToolRegistry()
+        reg._runtime_health = None
+        reg.register(
+            name="echo",
+            toolset="x",
+            schema={"name": "echo", "description": "", "parameters": {"type": "object", "properties": {}}},
+            handler=lambda args, **kw: json.dumps({"ok": True}),
+        )
+        assert self._loads(reg.dispatch("echo", {})) == {"ok": True}
+        assert reg.get_runtime_health() == {}
+
+    def test_get_runtime_health_can_be_called_before_any_dispatch(self):
+        from agent.runtime_health import RuntimeHealthRegistry
+        reg = ToolRegistry(runtime_health=RuntimeHealthRegistry())
+        assert reg.get_runtime_health() == {}
+
+    def test_custom_runtime_health_is_used_not_shared(self):
+        health_a = RuntimeHealthRegistry()
+        health_b = RuntimeHealthRegistry()
+        reg_a = ToolRegistry(runtime_health=health_a)
+        reg_b = ToolRegistry(runtime_health=health_b)
+
+        reg_a.register(
+            name="boom",
+            toolset="flaky",
+            schema={"name": "boom", "description": "", "parameters": {"type": "object", "properties": {}}},
+            handler=lambda args, **kw: (_ for _ in ()).throw(RuntimeError("x")),
+        )
+        reg_b.register(
+            name="ok",
+            toolset="healthy",
+            schema={"name": "ok", "description": "", "parameters": {"type": "object", "properties": {}}},
+            handler=lambda args, **kw: json.dumps({"ok": True}),
+        )
+
+        self._loads(reg_a.dispatch("boom", {}))
+
+        # health_b untouched (independent registry wiring)
+        assert reg_b.get_runtime_health() == {}
+        # health_a saw the failure
+        assert reg_a.get_runtime_health()["toolset:flaky"]["state"] == "degraded"

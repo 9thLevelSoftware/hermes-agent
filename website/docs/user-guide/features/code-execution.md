@@ -6,291 +6,347 @@ description: "Programmatic Python execution with RPC tool access — collapse mu
 
 # Code Execution (Programmatic Tool Calling)
 
-The `execute_code` tool lets the agent write Python scripts that call Hermes tools programmatically, collapsing multi-step workflows into a single LLM turn. The script runs in a child process on the agent host, communicating with Hermes over a Unix domain socket RPC.
+The `execute_code` tool runs a Python script in a child process and gives that
+script RPC access to the Hermes tools in the current session. Use it to collapse
+loops, filtering, and multi-step workflows into one model turn: intermediate
+results stay in the parent process and only the script's final output returns to
+the model.
 
 ## How It Works
 
-1. The agent writes a Python script using `from hermes_tools import ...`
-2. Hermes generates a `hermes_tools.py` stub module with RPC functions
-3. Hermes opens a Unix domain socket and starts an RPC listener thread
-4. The script runs in a child process — tool calls travel over the socket back to Hermes
-5. Only the script's `print()` output is returned to the LLM; intermediate tool results never enter the context window
+1. The model supplies Python source to `execute_code`.
+2. Hermes generates a `hermes_tools.py` module for the current tool scope.
+3. Hermes starts a private RPC listener and a child Python process.
+4. Calls made by the script cross the RPC channel and are dispatched by the
+   normal Hermes tool path.
+5. Hermes captures stdout/stderr, applies redaction and configured limits, and
+   returns a JSON result.
 
 ```python
-# The agent can write scripts like:
 from hermes_tools import web_search, web_extract
 
 results = web_search("Python 3.13 features", limit=5)
-for r in results["data"]["web"]:
-    content = web_extract([r["url"]])
-    # ... filter and process ...
+summary = []
+for item in results.get("data", {}).get("web", []):
+    page = web_extract([item["url"]])
+    summary.append({"title": item["title"], "content": page})
 print(summary)
 ```
 
-**Available tools inside scripts:** `web_search`, `web_extract`, `read_file`, `write_file`, `search_files`, `patch`, `terminal` (foreground only).
+## Generated APIs: typed wrappers and generic catalog helpers
 
-## When the Agent Uses This
-
-The agent uses `execute_code` when there are:
-
-- **3+ tool calls** with processing logic between them
-- Bulk data filtering or conditional branching
-- Loops over results
-
-The key benefit: intermediate tool results never enter the context window — only the final `print()` output comes back, dramatically reducing token usage.
-
-## Practical Examples
-
-### Data Processing Pipeline
+Wrappers are generated from the active `ToolRegistry` schemas, not from a
+second hand-written API list. JSON-schema fields that can be represented safely
+become typed Python parameters (`str`, `int`, `float`, `bool`, `list`, or
+`dict`), with required fields first and schema defaults preserved.
 
 ```python
-from hermes_tools import search_files, read_file
-import json
+from hermes_tools import read_file, search_files
 
-# Find all config files and extract database settings
-matches = search_files("database", path=".", file_glob="*.yaml", limit=20)
-configs = []
-for match in matches.get("matches", []):
-    content = read_file(match["path"])
-    configs.append({"file": match["path"], "preview": content["content"][:200]})
-
-print(json.dumps(configs, indent=2))
+page: dict = read_file("README.md", offset=1, limit=100)
+matches: dict = search_files("deprecated", path="src/", file_glob="*.py")
+print({"lines": page.get("total_lines"), "matches": len(matches.get("matches", []))})
 ```
 
-### Multi-Step Web Research
+A tool name that is not a valid Python identifier is sanitized for the wrapper
+(and collisions receive a deterministic suffix). Schemas containing unions,
+references, unsupported types, or malformed object definitions use a safe
+`**kwargs` wrapper instead; the wrapper includes a bounded sanitized-schema
+summary rather than guessing a signature.
+
+When the active registry surface is available, `hermes_tools` also provides
+these generic helpers:
 
 ```python
-from hermes_tools import web_search, web_extract
-import json
+from hermes_tools import search_tools, describe_tool, call_tool, save_artifact
+from pathlib import Path
+import os
 
-# Search, extract, and summarize in one turn
-results = web_search("Rust async runtime comparison 2025", limit=5)
-summaries = []
-for r in results["data"]["web"]:
-    page = web_extract([r["url"]])
-    for p in page.get("results", []):
-        if p.get("content"):
-            summaries.append({
-                "title": r["title"],
-                "url": r["url"],
-                "excerpt": p["content"][:500]
-            })
-
-print(json.dumps(summaries, indent=2))
+hits = search_tools("issue tracker read-only lookup", limit=5)
+metadata = describe_tool(hits["results"][0]["name"])
+result = call_tool(metadata["name"], {"limit": 10})
+source = Path(os.environ["HERMES_ARTIFACTS_DIR"]) / "report.json"
+source.write_text('{"result": "generated"}', encoding="utf-8")
+artifact = save_artifact(str(source), name="report.json", mime_type="application/json")
+print({"result": result, "artifact": artifact})
 ```
 
-### Bulk File Refactoring
+`json_parse`, `shell_quote`, and `retry` are also embedded convenience helpers.
+`save_artifact` accepts bytes directly or copies a path that is inside the
+execution's `HERMES_ARTIFACTS_DIR` into the configured durable artifact
+directory; it is not a replacement for `write_file` or `terminal`.
 
-```python
-from hermes_tools import search_files, read_file, patch
+## Tool scope, denylist, and approval behavior
 
-# Find all Python files using deprecated API and fix them
-matches = search_files("old_api_call", path="src/", file_glob="*.py")
-fixed = 0
-for match in matches.get("matches", []):
-    result = patch(
-        path=match["path"],
-        old_string="old_api_call(",
-        new_string="new_api_call(",
-        replace_all=True
-    )
-    if "error" not in str(result):
-        fixed += 1
+The generated module is limited to the model-facing tool scope for the
+session. `enabled_toolsets` and `disabled_toolsets` are carried over the RPC
+boundary; when a scope is supplied, Hermes checks the requested registered tool
+against that scope before dispatch. A tool that is not registered or not in the
+current scope returns an error rather than being discovered by guessing.
 
-print(f"Fixed {fixed} files out of {len(matches.get('matches', []))} matches")
-```
+The script denylist is always applied, even if a caller tries to request these
+names directly:
 
-### Build and Test Pipeline
+- **Recursion/catalog control:** `execute_code`, `delegate_task`,
+  `tool_search`, `tool_describe`, and `tool_call`.
+- **Interactive or memory state:** `clarify` and `memory`.
+- **Lifecycle/control-plane operations:** process and terminal lifecycle tools,
+  todo/cron tools, `kanban_*`, `workflow_*`, `project_*`, `browser_cdp`,
+  `browser_dialog`, and `computer_use`.
 
-```python
-from hermes_tools import terminal, read_file
-import json
+The generic catalog helpers use an internal bridge action and still reach the
+same parent dispatcher; they do not grant a second execution path. Read-only,
+non-destructive registered operations can run without an extra approval. Other
+registered operations—including unknown or conservatively classified ones—use
+the normal Hermes middleware and approval path. Code execution itself is also
+checked by the existing `execute_code` approval guard before a child is spawned.
 
-# Run tests, parse results, and report
-result = terminal("cd /project && python -m pytest --tb=short -q 2>&1", timeout=120)
-output = result.get("output", "")
+## When the agent uses this
 
-# Parse test output
-passed = output.count(" passed")
-failed = output.count(" failed")
-errors = output.count(" error")
+`execute_code` is useful when there are:
 
-report = {
-    "passed": passed,
-    "failed": failed,
-    "errors": errors,
-    "exit_code": result.get("exit_code", -1),
-    "summary": output[-500:] if len(output) > 500 else output
-}
+- three or more tool calls with processing between them;
+- loops over search or extraction results;
+- bulk filtering, aggregation, or conditional branching; or
+- large intermediate results that should be reduced before entering context.
 
-print(json.dumps(report, indent=2))
-```
+Use normal tool calls when one call is enough, when you need to reason over the
+full raw result, or when the task needs interactive user input.
 
-## Execution Mode
+## Execution mode
 
-`execute_code` has two execution modes controlled by `code_execution.mode` in `~/.hermes/config.yaml`:
+`code_execution.mode` controls the child process working directory and Python
+interpreter:
 
 | Mode | Working directory | Python interpreter |
 |------|-------------------|--------------------|
-| **`project`** (default) | The session's working directory (same as `terminal()`) | Active `VIRTUAL_ENV` / `CONDA_PREFIX` python, falling back to Hermes's own python |
-| `strict` | A temp staging directory isolated from the user's project | `sys.executable` (Hermes's own python) |
+| **`project`** (default) | The session's working directory, matching `terminal()` | Active `VIRTUAL_ENV`/`CONDA_PREFIX` Python, falling back to Hermes's Python |
+| **`strict`** | A temporary staging directory | Hermes's `sys.executable` |
 
-**When to leave it on `project`:** you want `import pandas`, `from my_project import foo`, or relative paths like `open(".env")` to work the same way they do in `terminal()`. This is almost always what you want.
-
-**When to flip to `strict`:** you need maximum reproducibility — you want the same interpreter every session regardless of which venv the user activated, and you want scripts quarantined from the project tree (no risk of accidentally reading project files through a relative path).
+`strict` changes staging and interpreter selection; it is not a new permission
+boundary. Both modes retain the same environment scrubbing, tool scope, denylist,
+approval, timeout, and output limits.
 
 ```yaml
 # ~/.hermes/config.yaml
 code_execution:
-  mode: project   # or "strict"
+  mode: project   # project (default) or strict
 ```
 
-Fallback behavior in `project` mode: if `VIRTUAL_ENV` / `CONDA_PREFIX` is unset, broken, or points at a Python older than 3.8, the resolver falls back cleanly to `sys.executable` — it never leaves the agent without a working interpreter.
+In `project` mode, a missing, unusable, or too-old active environment falls back
+to `sys.executable`. In `strict` mode, relative paths resolve inside the
+staging directory and project-only dependencies are not expected to be present.
 
-Security-critical invariants are identical across both modes:
+## Resource, session, and artifact limits
 
-- environment scrubbing (API keys, tokens, credentials stripped)
-- tool whitelist (scripts cannot call `execute_code` recursively, `delegate_task`, or MCP tools)
-- resource limits (timeout, stdout cap, tool-call cap)
-
-Switching mode changes where scripts run and which interpreter runs them, not what credentials they can see or which tools they can call.
-
-## Resource Limits
-
-| Resource | Limit | Notes |
-|----------|-------|-------|
-| **Timeout** | 5 minutes (300s) | Script is killed with SIGTERM, then SIGKILL after 5s grace |
-| **Stdout** | 50 KB | Output truncated with `[output truncated at 50KB]` notice |
-| **Stderr** | 10 KB | Included in output on non-zero exit for debugging |
-| **Tool calls** | 50 per execution | Error returned when limit reached |
-
-All limits are configurable via `config.yaml`:
+The canonical nested settings are:
 
 ```yaml
-# In ~/.hermes/config.yaml
 code_execution:
-  mode: project      # project (default) | strict
-  timeout: 300       # Max seconds per script (default: 300)
-  max_tool_calls: 50 # Max tool calls per execution (default: 50)
+  sessions:
+    enabled: false
+    idle_timeout_seconds: 900
+  tools:
+    include: []
+    exclude: []
+  artifacts:
+    max_bytes: 10485760
+    max_total_bytes: 52428800
 ```
 
-## How Tool Calls Work Inside Scripts
+`tools.include` and `tools.exclude` only narrow the model/session tool scope;
+they cannot expand it. Unknown and MCP tools are conservative by default and
+must be present in the active session snapshot. Persistent sessions retain
+Python variables until reset or idle cleanup, and artifacts are size-capped and
+subject to the same approval, path-confinement, and redaction rails as normal
+execution results.
 
-When your script calls a function like `web_search("query")`:
+The existing top-level `persistent`, `kernel_idle_ttl`, and `artifact_dir` keys
+remain accepted as backward-compatible aliases. When both forms are present,
+the explicit top-level alias wins for that setting. Other resource defaults are:
 
-1. The call is serialized to JSON and sent over a Unix domain socket to the parent process
-2. The parent dispatches through the standard `handle_function_call` handler
-3. The result is sent back over the socket
-4. The function returns the parsed result
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `timeout` | `300` seconds | Kills a script after five minutes |
+| `max_tool_calls` | `50` | Caps RPC calls in one execution |
+| `max_stdout_bytes` | `50000` | Caps returned stdout; oversized redacted text is spilled |
+| `max_stderr_bytes` | `10000` | Caps returned stderr |
+| `artifacts.max_bytes` | `10485760` | Caps one persisted artifact |
+| `artifacts.max_total_bytes` | `52428800` | Caps all artifacts in one execution |
+| `artifact_dir` | `/tmp/hermes-results` | Durable directory for redacted spills and copied artifacts |
 
-This means tool calls inside scripts behave identically to normal tool calls — same rate limits, same error handling, same capabilities. The only restriction is that `terminal()` is foreground-only (no `background` or `pty` parameters).
-
-## Error Handling
-
-When a script fails, the agent receives structured error information:
-
-- **Non-zero exit code**: stderr is included in the output so the agent sees the full traceback
-- **Timeout**: Script is killed and the agent sees `"Script timed out after 300s and was killed."`
-- **Interruption**: If the user sends a new message during execution, the script is terminated and the agent sees `[execution interrupted — user sent a new message]`
-- **Tool call limit**: When the 50-call limit is hit, subsequent tool calls return an error message
-
-The response always includes `status` (success/error/timeout/interrupted), `output`, `tool_calls_made`, and `duration_seconds`.
-
-## Security
-
-:::danger Security Model
-The child process runs with a **minimal environment**. API keys, tokens, and credentials are stripped by default. The script accesses tools exclusively via the RPC channel — it cannot read secrets from environment variables unless explicitly allowed.
-:::
-
-Environment variables containing `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `PASSWD`, or `AUTH` in their names are excluded. Only safe system variables (`PATH`, `HOME`, `LANG`, `SHELL`, `PYTHONPATH`, `VIRTUAL_ENV`, etc.) are passed through.
-
-### Skill Environment Variable Passthrough
-
-When a skill declares `required_environment_variables` in its frontmatter, those variables are **automatically passed through** to both `execute_code` and `terminal` child processes after the skill is loaded. This lets skills use their declared API keys without weakening the security posture for arbitrary code.
-
-For non-skill use cases, you can explicitly allowlist variables in `config.yaml`:
+All settings are under `code_execution` in `config.yaml`. For example:
 
 ```yaml
-terminal:
-  env_passthrough:
-    - MY_CUSTOM_KEY
-    - ANOTHER_TOKEN
+code_execution:
+  sessions:
+    enabled: false
+    idle_timeout_seconds: 900
+  tools:
+    include: []
+    exclude: []
+  artifacts:
+    max_bytes: 10485760
+    max_total_bytes: 52428800
+  timeout: 300
+  max_tool_calls: 50
+  max_stdout_bytes: 50000
+  max_stderr_bytes: 10000
+  artifact_dir: /tmp/hermes-results
 ```
 
-See the [Security guide](/user-guide/security#environment-variable-passthrough) for full details.
+The configured artifact directory is created with owner-only permissions when it
+is first used. For oversized stdout, Hermes strips ANSI/control data and
+redacts sensitive text **before** writing the durable spill file. The response
+keeps a bounded head/tail preview and adds:
 
-### `HERMES_*` variables in the child
+```json
+{
+  "truncated": true,
+  "artifact_path": "/tmp/hermes-results/execute_code_....txt"
+}
+```
 
-The child process receives only a small, fixed set of operational `HERMES_*`
-variables by exact name:
+The local fresh-process child receives `HERMES_ARTIFACTS_DIR` for generated
+files. Those files are collected before local staging cleanup when they are
+recognized as image artifacts or oversized text. `save_artifact(path,
+name=None, mime_type=None)` copies a child file to `artifact_dir` and returns
+its durable path. Remote execution uses the remote sandbox for code and RPC.
+Recognized remote image artifacts and oversized remote text files are collected
+before sandbox cleanup, transferred as bounded content, and persisted under the
+parent `artifact_dir`; remote-only source paths are never returned to the model.
 
-- `HERMES_HOME`
-- `HERMES_PROFILE`
-- `HERMES_CONFIG`
-- `HERMES_ENV`
+## Structured image results
 
-(plus `HERMES_RPC_DIR` / `HERMES_RPC_SOCKET` / `TZ` / `HOME`, which Hermes
-injects explicitly so the RPC channel works).
+Image values printed directly, returned as JSON, or written by the child into
+its artifact directory are normalized to the OpenAI-compatible shape:
 
-:::note Behavior change
-Earlier versions passed **any** variable whose name began with `HERMES_`
-through to the child. That broad prefix was removed for security hardening: it
-could leak `HERMES_*`-named configuration that doesn't match a secret substring
-(for example `HERMES_BASE_URL`, `HERMES_KANBAN_DB`, or a `HERMES_*_WEBHOOK`
-endpoint) into arbitrary sandboxed code.
+```json
+{
+  "_multimodal": true,
+  "content": [
+    {"type": "image_url", "image_url": {"url": "file:///.../plot.png"}}
+  ],
+  "text_summary": "..."
+}
+```
 
-If an `execute_code` script — or a repo/plugin module it imports at import time
-— relied on a `HERMES_*` variable outside the four operational names above, it
-will now find that variable **unset** in the child. The drop is intentional,
-not a bug.
-:::
+Supported image inputs include data URLs, HTTP(S) image URLs with a recognized
+image suffix, local image paths, `file://` paths, and structured
+`{"type":"image_url", "image_url":{"url":"..."}}` parts. Ordinary text
+results keep their existing `status`, `output`, `tool_calls_made`,
+`duration_seconds`, and error metadata; the multimodal fields are additive.
 
-**Workaround — opt the variable back in explicitly.** Both routes pass the
-variable through `execute_code` *and* `terminal` children, and neither weakens
-the secret-stripping guarantee (Hermes-managed provider credentials can never
-be re-allowed this way):
+## Persistent kernels (explicit opt-in)
 
-1. **Per-machine, in `config.yaml`** — add the exact variable name to the
-   passthrough allowlist:
+Fresh-process execution remains the default. A caller can explicitly request a
+persistent task-scoped interpreter:
 
-   ```yaml
-   terminal:
-     env_passthrough:
-       - HERMES_KANBAN_DB
-       - HERMES_BASE_URL
-   ```
+```python
+from hermes_tools import read_file
 
-2. **Per-skill, in the skill's frontmatter** — declare it so it is registered
-   automatically whenever that skill is loaded:
+# The tool API passes persistent=True when the execute_code call requests it.
+state = {"rows": [1, 2, 3]}
+print(sum(state["rows"]))
+```
 
-   ```yaml
-   required_environment_variables:
-     - HERMES_KANBAN_DB
-   ```
+At the tool API boundary, use `persistent: true` with an optional `kernel_id`
+(or the compatibility alias `session`). The same task ID and kernel ID reuse
+one child interpreter, so Python globals, imported modules, and state survive
+between calls. An omitted `persistent` argument uses
+`code_execution.sessions.enabled` from YAML; its default is `false`. The
+legacy `code_execution.persistent` key remains an alias and wins when present.
+An explicit `persistent: false` always keeps fresh-process behavior, while an
+explicit `persistent: true` opts in regardless of the configured default.
 
-**Diagnosing it.** When the child drops one or more non-allowlisted `HERMES_*`
-variables, Hermes emits a one-line `debug` log naming them and pointing at the
-`env_passthrough` escape hatch. Run with debug logging (`hermes logs --level
-DEBUG`, or check `~/.hermes/logs/agent.log`) and look for
-`execute_code: dropped N non-allowlisted HERMES_* var(s)` if a script behaves
-as though a `HERMES_*` variable is missing.
+```yaml
+code_execution:
+  sessions:
+    enabled: false
+    idle_timeout_seconds: 900
+```
 
-Hermes always writes the script and the auto-generated `hermes_tools.py` RPC stub into a temp staging directory that is cleaned up after execution. In `strict` mode the script also *runs* there; in `project` mode it runs in the session's working directory (the staging directory stays on `PYTHONPATH` so imports still resolve). The child process runs in its own process group so it can be cleanly killed on timeout or interruption.
+Lifecycle controls:
 
-## execute_code vs terminal
+- `reset: true` terminates the selected kernel before the next code block;
+  passing empty code with reset clears state without running a script.
+- A per-call `timeout` kills a stuck kernel. The next persistent call starts a
+  clean interpreter and reports the timeout in structured output.
+- `kernel_idle_ttl` reaps kernels that have not been used within the configured
+  number of seconds. The default is 900 seconds.
+- Task/environment cleanup and process exit close remaining kernels, their RPC
+  sockets, child process groups, and temporary directories.
+- Kernels are local-backend only; remote terminal backends return a structured
+  error instead of silently pretending to persist state.
 
-| Use Case | execute_code | terminal |
-|----------|-------------|----------|
+Persistent mode does not broaden tool scope or bypass the denylist, approval,
+redaction, or output limits. Do not use it for secrets that should outlive one
+short script; state is process memory and is intentionally not durable storage.
+
+## How tool calls work inside scripts
+
+When a script calls a generated wrapper:
+
+1. Arguments are serialized to JSON and sent over the private RPC channel.
+2. The parent applies scope checks, denylist rules, middleware, and approval.
+3. The normal registered handler runs with the parent task/session context.
+4. The result is serialized back and decoded by the wrapper.
+
+The `terminal()` wrapper is foreground-only: it does not accept `background` or
+`pty` parameters. Use the normal `terminal` tool for interactive or background
+processes.
+
+## Error handling
+
+The JSON result always includes `status`, `output`, `tool_calls_made`, and
+`duration_seconds` for an execution that reaches the child process. Depending
+on the path it can also include `error`, `stderr`, `truncated`, `artifact_path`,
+`persistent`, `kernel_id`, `kernel_reset`, or multimodal fields.
+
+- **Non-zero exit:** redacted stderr is included so the model can see the
+  traceback.
+- **Timeout:** the process or kernel is killed and the result says it timed out.
+- **Interruption:** a user message terminates the child and the result includes
+  an interruption marker.
+- **Tool-call limit:** calls after the configured maximum receive an error from
+  the RPC server.
+- **Approval denial or scope denial:** the child receives an ordinary structured
+  tool error; the parent does not spawn a second unrestricted path.
+
+## Security and environment
+
+The child receives a minimal environment. API keys, tokens, credentials, and
+other secret-like variables are stripped by default; the child accesses Hermes
+capabilities through RPC instead of direct provider credentials.
+
+Environment names containing `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`,
+`PASSWD`, or `AUTH` are excluded. Safe system variables and the operational
+`HERMES_HOME`, `HERMES_PROFILE`, `HERMES_CONFIG`, and `HERMES_ENV` names are
+allowed as required for runtime location. `HERMES_RPC_*`, `TZ`, and `HOME` are
+injected explicitly for the RPC process.
+
+Skill-declared `required_environment_variables` and exact names listed in
+`terminal.env_passthrough` can be passed through for approved skill use cases.
+This does not re-enable Hermes-managed provider credentials automatically.
+
+## `execute_code` vs `terminal`
+
+| Use case | `execute_code` | `terminal` |
+|----------|----------------|------------|
 | Multi-step workflows with tool calls between | ✅ | ❌ |
 | Simple shell command | ❌ | ✅ |
-| Filtering/processing large tool outputs | ✅ | ❌ |
-| Running a build or test suite | ❌ | ✅ |
+| Filtering or aggregating tool output | ✅ | ❌ |
+| Build or test suite | ❌ | ✅ |
 | Looping over search results | ✅ | ❌ |
 | Interactive/background processes | ❌ | ✅ |
-| Needs API keys in environment | ⚠️ Only via [passthrough](/user-guide/security#environment-variable-passthrough) | ✅ (most pass through) |
+| Direct API keys in child environment | Only via explicit passthrough | Backend-dependent; still follow terminal policy |
 
-**Rule of thumb:** Use `execute_code` when you need to call Hermes tools programmatically with logic between calls. Use `terminal` for running shell commands, builds, and processes.
+**Rule of thumb:** use `execute_code` for programmatic Hermes-tool workflows;
+use `terminal` for shell commands, builds, and process management.
 
-## Platform Support
+## Platform support
 
-Code execution requires Unix domain sockets and is available on **Linux and macOS only**. It is automatically disabled on Windows — the agent falls back to regular sequential tool calls.
+Local execution uses Unix domain sockets on macOS/Linux and a loopback TCP
+fallback on Windows. Remote execution uses the terminal backend's file-based
+RPC and requires Python 3 in that environment. Availability and backend
+requirements are checked before the script is spawned.

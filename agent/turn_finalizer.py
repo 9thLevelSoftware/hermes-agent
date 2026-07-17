@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.turn_outcome import classify_turn_outcome
 
 
 def finalize_turn(
@@ -145,16 +146,47 @@ def finalize_turn(
                     exc_info=True,
                 )
 
-    # Determine if conversation completed successfully
-    normal_text_response = str(_turn_exit_reason).startswith("text_response(")
-    completed = (
-        final_response is not None
-        and not failed
-        and (
-            api_call_count < agent.max_iterations
-            or normal_text_response
-        )
+    # Determine completion from the canonical terminal outcome, not response
+    # presence. A failed/interrupted/partial/blocked/unresolved/cancelled exit
+    # can still carry assistant text, but that text is not a completed turn.
+    _turn_outcome = classify_turn_outcome(
+        final_response=final_response,
+        failed=failed,
+        interrupted=interrupted,
+        _turn_exit_reason=_turn_exit_reason,
+        verification_status=getattr(agent, "_turn_verification_status", None),
     )
+    completed = _turn_outcome["outcome"] in {"verified", "completed_unverified"}
+
+    # Persist the per-turn outcome to the learning ledger. Funneled through
+    # the safe writer so a DB outage cannot escape finalization; the
+    # user-visible response is already computed at this point. The sidecar
+    # bump runs in a SEPARATE try/except so a ledger-write failure cannot
+    # suppress utility-counter evidence — DB failure must not shadow the
+    # skill-utility signal.
+    _turn_outcome_record = None
+    try:
+        from agent.turn_ledger import persist_turn_outcome
+        # tool_iterations must reflect the actual tool-call count from the
+        # turn's messages — NOT ``agent._iters_since_skill`` (a skill-nudge
+        # cadence counter with no relation to model-issued tool calls).
+        _turn_tool_count = sum(
+            1 for m in messages
+            if isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and m.get("tool_calls")
+        )
+        _turn_outcome_record = persist_turn_outcome(
+            agent,
+            outcome=_turn_outcome["outcome"],
+            outcome_reason=_turn_outcome["reason"],
+            turn_exit_reason=_turn_exit_reason,
+            api_calls=api_call_count,
+            tool_iterations=_turn_tool_count,
+            messages=messages,
+        )
+    except Exception as _ledger_err:
+        logger.debug("turn_outcome ledger write skipped: %s", _ledger_err)
 
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
@@ -430,6 +462,9 @@ def finalize_turn(
             last_reasoning = msg["reasoning"]
             break
 
+    # ``_turn_outcome`` was computed before cleanup so trajectory persistence
+    # receives the same canonical completion decision as the returned result.
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,
@@ -437,6 +472,8 @@ def finalize_turn(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
+        "outcome": _turn_outcome["outcome"],
+        "outcome_reason": _turn_outcome["reason"],
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
@@ -498,25 +535,50 @@ def finalize_turn(
         _should_review_skills = True
         agent._iters_since_skill = 0
 
-    # External memory provider: sync the completed turn + queue next prefetch.
+    # External memory provider: sync only a verified turn + queue next prefetch.
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message,
         final_response=final_response,
         interrupted=interrupted,
         messages=messages,
+        turn_outcome=_turn_outcome["outcome"],
     )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    try:
+        from agent.reflection_triggers import (
+            _tool_results,
+            evaluate_reflection_triggers,
+            should_trigger_review,
+        )
+        _reflection_trigger = evaluate_reflection_triggers(
+            _turn_outcome,
+            original_user_message,
+            _tool_results(messages),
+        )
+        _run_review = should_trigger_review({
+            "agent": agent,
+            "trigger": _reflection_trigger,
+            "outcome": _turn_outcome["outcome"],
+            "has_response": bool(final_response),
+            "interrupted": interrupted,
+            "interval_triggered": _should_review_memory or _should_review_skills,
+            "signal_enabled": getattr(agent, "_session_db", None) is not None,
+        })
+    except Exception:
+        _reflection_trigger = None
+        _run_review = False
+    if _run_review:
         try:
+            agent._background_review_trigger = _reflection_trigger
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=_should_review_memory,
-                review_skills=_should_review_skills,
+                review_skills=bool(_should_review_skills or _reflection_trigger),
             )
         except Exception:
-            pass  # Background review is best-effort
+            agent._background_review_in_flight = False
 
     # Note: Memory provider on_session_end() + shutdown_all() are NOT
     # called here — run_conversation() is called once per user message in

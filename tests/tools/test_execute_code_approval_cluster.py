@@ -122,6 +122,8 @@ def gw_session(monkeypatch):
     with A._lock:
         A._gateway_queues.pop(session_key, None)
         A._gateway_notify_cbs.pop(session_key, None)
+        A._session_approved.pop(session_key, None)
+        A._permanent_approved.discard("execute_code")
     try:
         yield session_key
     finally:
@@ -160,6 +162,20 @@ def _register_capturing_resolver(session_key: str, result):
     with A._lock:
         A._gateway_notify_cbs[session_key] = cb
     return seen
+
+
+def _latest_pending_for_session(session_key: str) -> dict:
+    with A._lock:
+        request_id = next(
+            (
+                request_id
+                for request_id in reversed(A._pending_by_session.get(session_key, []))
+                if request_id in A._pending
+            ),
+            None,
+        )
+        assert request_id is not None
+        return dict(A._pending[request_id])
 
 
 def test_guard_isolated_backend_approved():
@@ -399,8 +415,7 @@ def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkey
     assert result["status"] == "pending_approval"
     assert result["smart_denied"] is True
     assert result["allow_permanent"] is False
-    with A._lock:
-        pending = dict(A._pending[gw_session])
+    pending = _latest_pending_for_session(gw_session)
     assert pending["smart_denied"] is True
     assert pending["allow_permanent"] is False
 
@@ -414,8 +429,7 @@ def test_execute_code_smart_deny_pending_payload_is_one_operation(gw_session, mo
     assert result["status"] == "pending_approval"
     assert result["smart_denied"] is True
     assert result["allow_permanent"] is False
-    with A._lock:
-        pending = dict(A._pending[gw_session])
+    pending = _latest_pending_for_session(gw_session)
     assert pending["smart_denied"] is True
     assert pending["allow_permanent"] is False
 
@@ -494,6 +508,23 @@ def test_env_scrub_passthrough_overrides_secret_block():
     out = _scrub_child_env(env, is_passthrough=lambda k: k == "MY_SERVICE_DSN",
                            is_windows=False)
     assert out.get("MY_SERVICE_DSN") == "value"
+
+
+def test_generic_catalog_call_respects_session_scope(monkeypatch):
+    from tools.code_execution_tool import CodeExecutionContext, _dispatch_script_call
+
+    def should_not_dispatch(*_args, **_kwargs):
+        raise AssertionError("out-of-scope script call reached handle_function_call")
+
+    import model_tools
+    monkeypatch.setattr(model_tools, "handle_function_call", should_not_dispatch)
+
+    result = _dispatch_script_call(
+        "mcp__other__secret",
+        {},
+        CodeExecutionContext("task", "session", ("mcp-safe",), ()),
+    )
+    assert result["error"]
 
 
 # ---------------------------------------------------------------------------

@@ -32,16 +32,24 @@ This module owns ONLY the async lifecycle. The actual child build + run is
 delegated back to ``delegate_tool._run_single_child`` via an injected
 runner, so all the credential leasing, heartbeat, timeout, and result-shaping
 logic stays in one place.
+
+Dispatch metadata is also written atomically to ``delegations.json`` under the
+active profile. After a process restart, records that were still running are
+reported as ``interrupted`` (never falsely resumed), with their original goal,
+context, and child session IDs preserved. ``/agents`` can then point at the
+child's existing ``/resume`` path without re-running side effects blindly.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
 import uuid
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
@@ -78,6 +86,163 @@ _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
 _DB_LOCK = threading.Lock()
+
+# Durable operation journal is cached per Hermes profile, not process-wide.
+# ponytail: one lazy journal per profile avoids cross-profile state bleed without
+# adding a broader lifecycle manager.
+_journal_lock = threading.Lock()
+_journal_cache: Dict[str, Any] = {}
+_journal_override: Any = None
+_journal_override_enabled = False
+_restored_ids: set[str] = set()
+_restored_lock = threading.Lock()
+_KIND = "async_delegation"
+_STATUS_MAP = {
+    "completed": ("confirmed", "none"),
+    "success": ("confirmed", "none"),
+    "error": ("failed", "none"),
+    "failed": ("failed", "none"),
+    "interrupted": ("cancelled", "none"),
+    "cancelled": ("cancelled", "none"),
+}
+
+
+def _open_journal():
+    if _journal_override_enabled:
+        return _journal_override
+    profile = str(get_hermes_home())
+    with _journal_lock:
+        if profile in _journal_cache:
+            return _journal_cache[profile]
+        try:
+            from agent.operation_journal import OperationJournal
+            from hermes_state import SessionDB
+
+            journal = OperationJournal(SessionDB())
+        except Exception as exc:
+            logger.warning(
+                "Async delegation durable journal unavailable for %s: %s",
+                profile,
+                exc,
+            )
+            journal = None
+        _journal_cache[profile] = journal
+        return journal
+
+
+def _set_journal_for_tests(journal) -> None:
+    global _journal_override, _journal_override_enabled, _journal_cache
+    with _journal_lock:
+        if journal is None:
+            _journal_override = None
+            _journal_override_enabled = False
+            _journal_cache = {}
+        else:
+            _journal_override = journal
+            _journal_override_enabled = True
+
+
+def _journal_for_tests():
+    return _journal_override if _journal_override_enabled else _open_journal()
+
+
+def _terminal_state_for(status: str) -> tuple[str, str]:
+    return _STATUS_MAP.get(status, ("unknown", "unknown"))
+
+
+def _persist_operation_dispatch(record: Dict[str, Any]) -> None:
+    journal = _open_journal()
+    if journal is None:
+        return
+    try:
+        delegation_id = record["delegation_id"]
+        journal.create(
+            operation_id=delegation_id,
+            kind=_KIND,
+            session_id=record.get("session_key", "") or "",
+            destination=record.get("parent_session_id", "") or "",
+            payload_hash=f"{delegation_id}|{record['dispatched_at']:.6f}",
+        )
+        journal.transition(
+            delegation_id,
+            from_states={"pending"},
+            to_state="running",
+            effect_disposition="none",
+        )
+    except Exception as exc:
+        logger.debug("Async delegation %s journal dispatch failed: %s", record.get("delegation_id"), exc)
+
+
+def _persist_operation_completion(event: Dict[str, Any]) -> None:
+    journal = _open_journal()
+    if journal is None:
+        return
+    status = str(event.get("status") or "unknown")
+    to_state, effect = _terminal_state_for(status)
+    try:
+        from_states = {"running"} if to_state == "cancelled" else {"running", "dispatched"}
+        journal.transition(
+            str(event["delegation_id"]),
+            from_states=from_states,
+            to_state=to_state,
+            effect_disposition=effect,
+            result=event,
+            error=str(event.get("error")) if event.get("error") else None,
+        )
+    except Exception as exc:
+        logger.debug("Async delegation %s journal completion failed: %s", event.get("delegation_id"), exc)
+
+
+def acknowledge_async_delegation(operation_id: str) -> bool:
+    journal = _open_journal()
+    if journal is None:
+        return False
+    try:
+        return bool(journal.acknowledge(operation_id))
+    except Exception as exc:
+        logger.debug("Async delegation %s journal acknowledge failed: %s", operation_id, exc)
+        return False
+
+
+def _record_to_event(record) -> Optional[Dict[str, Any]]:
+    if not record.result_json:
+        return None
+    try:
+        event = json.loads(record.result_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(event, dict):
+        return None
+    event.setdefault("type", "async_delegation")
+    event.setdefault("delegation_id", record.operation_id)
+    return event
+
+
+def restore_unacknowledged_delegations(queue, put_fn) -> int:
+    journal = _open_journal()
+    if journal is None:
+        return 0
+    try:
+        records = journal.list_unacknowledged(kind=_KIND)
+    except Exception as exc:
+        logger.warning("Async delegation restore failed: %s", exc)
+        return 0
+    restored = 0
+    with _restored_lock:
+        for record in records:
+            if record.operation_id in _restored_ids:
+                continue
+            event = _record_to_event(record)
+            if event is None:
+                continue
+            try:
+                put_fn(event)
+            except Exception as exc:
+                logger.warning("Async delegation restore enqueue failed: %s", exc)
+                continue
+            _restored_ids.add(record.operation_id)
+            restored += 1
+    return restored
 
 
 def _db_path():
@@ -149,6 +314,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
              record["dispatched_at"], now, __import__("os").getpid(),
              owner_started_at, json.dumps(task_payload)),
         )
+    _persist_operation_dispatch(record)
     _prune_durable_records()
 
 
@@ -206,6 +372,7 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
             (event.get("status", "completed"), event.get("completed_at", now), now,
              json.dumps(event), json.dumps(result), event["delegation_id"]),
         )
+    _persist_operation_completion(event)
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -388,6 +555,188 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _records_path():
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "delegations.json"
+
+
+def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
+    from hermes_cli.active_sessions import _pid_alive as _active_session_pid_alive
+
+    return _active_session_pid_alive(pid, process_start_time)
+
+
+def _current_process_start_time() -> Optional[float]:
+    from hermes_cli.active_sessions import _process_start_time
+
+    return _process_start_time(os.getpid())
+
+
+def _read_persisted_records(path: Path) -> Dict[str, Dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        return {}
+    records = payload.get("records", [])
+    if not isinstance(records, list):
+        return {}
+    return {
+        str(record["delegation_id"]): dict(record)
+        for record in records
+        if isinstance(record, dict) and record.get("delegation_id")
+    }
+
+
+def _persist_records_locked(
+    home: Optional[str] = None,
+    *,
+    remove_ids: Optional[set[str]] = None,
+) -> bool:
+    """Atomically persist one profile's records; never break completion delivery."""
+    from utils import atomic_json_write
+
+    home = home or str(_records_path().parent)
+    path = Path(home) / "delegations.json"
+    try:
+        from hermes_cli.active_sessions import _FileLock
+
+        with _FileLock(Path(home) / "delegations.lock"):
+            merged = _read_persisted_records(path)
+            for record in _records.values():
+                if record.get("_home") != home:
+                    continue
+                owner_pid = record.get("owner_pid")
+                if owner_pid != os.getpid() and not (
+                    record.get("status") == "interrupted"
+                    and not _pid_alive(
+                        owner_pid, record.get("owner_process_start_time")
+                    )
+                ):
+                    continue
+                merged[str(record["delegation_id"])] = {
+                    key: value
+                    for key, value in record.items()
+                    if key not in {"interrupt_fn", "_home"}
+                }
+            for delegation_id in remove_ids or set():
+                merged.pop(delegation_id, None)
+            terminal = [
+                (delegation_id, record)
+                for delegation_id, record in merged.items()
+                if record.get("status") != "running"
+            ]
+            terminal.sort(
+                key=lambda item: item[1].get("completed_at")
+                or item[1].get("dispatched_at")
+                or 0
+            )
+            for delegation_id, _ in terminal[:-_MAX_RETAINED_COMPLETED]:
+                merged.pop(delegation_id, None)
+            atomic_json_write(
+                path,
+                {"records": list(merged.values())},
+                mode=0o600,
+                default=str,
+            )
+    except Exception as exc:
+        logger.error("Could not persist async delegation records: %s", exc)
+        return False
+    return True
+
+
+def _reserve_record_locked(record: Dict[str, Any], max_running: int) -> str:
+    """Atomically recheck profile capacity and persist one running record."""
+    from hermes_cli.active_sessions import _FileLock
+    from utils import atomic_json_write
+
+    home = str(record["_home"])
+    path = Path(home) / "delegations.json"
+    try:
+        with _FileLock(Path(home) / "delegations.lock"):
+            merged = _read_persisted_records(path)
+            live_running = 0
+            now = time.time()
+            for persisted in merged.values():
+                if persisted.get("status") != "running":
+                    continue
+                if _pid_alive(
+                    persisted.get("owner_pid"),
+                    persisted.get("owner_process_start_time"),
+                ):
+                    live_running += 1
+                else:
+                    persisted["status"] = "interrupted"
+                    persisted["completed_at"] = now
+                    persisted["error"] = (
+                        "Hermes restarted while this delegation was running. "
+                        "Its saved goal and context remain available for redispatch."
+                    )
+            if live_running >= max_running:
+                return "capacity"
+            merged[str(record["delegation_id"])] = {
+                key: value
+                for key, value in record.items()
+                if key not in {"interrupt_fn", "_home"}
+            }
+            atomic_json_write(
+                path,
+                {"records": list(merged.values())},
+                mode=0o600,
+                default=str,
+            )
+    except Exception as exc:
+        logger.error("Could not reserve async delegation capacity: %s", exc)
+        return "error"
+    return "ok"
+
+
+def _load_records_locked() -> None:
+    """Refresh one profile without evicting this process's live workers."""
+    path = _records_path()
+    home = str(path.parent)
+    persisted = _read_persisted_records(path)
+    recovered = False
+    now = time.time()
+    for delegation_id, raw_record in persisted.items():
+        current = _records.get(delegation_id)
+        if (
+            current is not None
+            and current.get("_home") == home
+            and current.get("owner_pid") == os.getpid()
+        ):
+            continue
+        record = dict(raw_record)
+        record["interrupt_fn"] = None
+        record["_home"] = home
+        if record.get("status") == "running" and not _pid_alive(
+            record.get("owner_pid"), record.get("owner_process_start_time")
+        ):
+            record["status"] = "interrupted"
+            record["completed_at"] = now
+            record["error"] = (
+                "Hermes restarted while this delegation was running. "
+                "Its saved goal and context remain available for redispatch."
+            )
+            recovered = True
+        _records[delegation_id] = record
+    persisted_ids = set(persisted)
+    for delegation_id, record in list(_records.items()):
+        if (
+            record.get("_home") == home
+            and record.get("owner_pid") != os.getpid()
+            and delegation_id not in persisted_ids
+        ):
+            _records.pop(delegation_id, None)
+    before_prune = sum(1 for record in _records.values() if record.get("_home") == home)
+    _prune_completed_locked(home)
+    after_prune = sum(1 for record in _records.values() if record.get("_home") == home)
+    if recovered or after_prune != before_prune:
+        _persist_records_locked(home)
+
+
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
     """Lazily create (or grow) the shared daemon executor.
 
@@ -408,24 +757,31 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
 
 
 def active_count() -> int:
-    """Number of async delegations currently running."""
+    """Number of async delegations currently running for the active profile."""
     with _records_lock:
-        return sum(1 for r in _records.values() if r.get("status") in {"running", "finalizing"})
+        _load_records_locked()
+        home = str(_records_path().parent)
+        return sum(
+            1 for record in _records.values()
+            if record.get("_home") == home
+            and record.get("status") in {"running", "finalizing"}
+        )
 
 
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
 
-def _prune_completed_locked() -> None:
-    """Drop the oldest completed records beyond the retention cap.
+def _prune_completed_locked(home: Optional[str] = None) -> None:
+    """Drop the oldest completed records beyond the per-profile retention cap.
 
     Caller must hold ``_records_lock``.
     """
+    home = home or str(_records_path().parent)
     completed = [
-        (rid, r)
-        for rid, r in _records.items()
-        if r.get("status") != "running"
+        (rid, record)
+        for rid, record in _records.items()
+        if record.get("_home") == home and record.get("status") != "running"
     ]
     if len(completed) <= _MAX_RETAINED_COMPLETED:
         return
@@ -487,6 +843,9 @@ def dispatch_async_delegation(
     dispatched_at = time.time()
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
+        "_home": str(_records_path().parent),
+        "owner_pid": os.getpid(),
+        "owner_process_start_time": _current_process_start_time(),
         "goal": goal,
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
@@ -504,12 +863,15 @@ def dispatch_async_delegation(
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
     with _records_lock:
+        _load_records_locked()
         running = sum(
-            1 for r in _records.values() if r.get("status") == "running"
+            1 for r in _records.values()
+            if r.get("_home") == record["_home"] and r.get("status") == "running"
         )
         if running >= max_async_children:
             return {
                 "status": "rejected",
+                "reason": "capacity",
                 "error": (
                     f"Async delegation capacity reached ({max_async_children} "
                     f"running). Wait for one to finish (its result will re-enter "
@@ -519,6 +881,23 @@ def dispatch_async_delegation(
                 ),
             }
         _records[delegation_id] = record
+        reservation = _reserve_record_locked(record, max_async_children)
+        if reservation != "ok":
+            _records.pop(delegation_id, None)
+            if reservation == "capacity":
+                return {
+                    "status": "rejected",
+                    "reason": "capacity",
+                    "error": (
+                        f"Async delegation capacity reached ({max_async_children} "
+                        "running across this profile). Wait for one to finish."
+                    ),
+                }
+            return {
+                "status": "rejected",
+                "reason": "persistence",
+                "error": "Could not persist the background delegation record.",
+            }
 
     _persist_dispatch(record)
     executor = _get_executor(max_async_children)
@@ -549,9 +928,13 @@ def dispatch_async_delegation(
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
+            _persist_records_locked(
+                record.get("_home"), remove_ids={delegation_id}
+            )
         _delete_durable_delegation(delegation_id)
         return {
             "status": "rejected",
+            "reason": "schedule",
             "error": f"Failed to schedule async delegation: {exc}",
         }
 
@@ -560,6 +943,24 @@ def dispatch_async_delegation(
         delegation_id, session_key or "<cli>", (goal or "")[:80],
     )
     return {"status": "dispatched", "delegation_id": delegation_id}
+
+
+def _push_completion_event(evt: Dict[str, Any]) -> None:
+    # A worker can finish after the test/runtime reset cleared its record;
+    # don't let that stale completion leak into a later consumer.
+    with _records_lock:
+        if evt.get("delegation_id") not in _records:
+            return
+    try:
+        from tools.process_registry import process_registry
+
+        process_registry.completion_queue.put(evt)
+    except Exception as exc:
+        logger.error(
+            "Async delegation %s finished but completion enqueue failed: %s",
+            evt.get("delegation_id"),
+            exc,
+        )
 
 
 def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
@@ -575,8 +976,10 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None  # drop the closure; child is done
         event_record = dict(record)
+        _prune_completed_locked(record.get("_home"))
+        _persist_records_locked(record.get("_home"))
 
-    _push_completion_event(event_record, result, status)
+    _emit_completion_event(event_record, result, status)
     with _records_lock:
         record = _records.get(delegation_id)
         if record is not None:
@@ -584,7 +987,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         _prune_completed_locked()
 
 
-def _push_completion_event(
+def _emit_completion_event(
     record: Dict[str, Any], result: Dict[str, Any], status: str
 ) -> None:
     """Push a type='async_delegation' event onto the shared completion queue.
@@ -592,16 +995,6 @@ def _push_completion_event(
     Best-effort: a failure here must not crash the worker, but it WOULD mean a
     silently-lost result, so we log loudly.
     """
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s finished but process_registry import failed; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
-        return
-
     summary = result.get("summary")
     error = result.get("error")
     dispatched_at = record.get("dispatched_at") or time.time()
@@ -632,14 +1025,7 @@ def _push_completion_event(
         "exit_reason": result.get("exit_reason"),
     }
     _persist_completion(evt, result)
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation %s: failed to enqueue completion event; "
-            "result lost: %s",
-            record.get("delegation_id"), exc,
-        )
+    _push_completion_event(evt)
 
 
 def dispatch_async_delegation_batch(
@@ -651,6 +1037,7 @@ def dispatch_async_delegation_batch(
     model: Optional[str],
     session_key: str,
     parent_session_id: Optional[str] = None,
+    child_session_ids: Optional[List[str]] = None,
     runner: Callable[[], Dict[str, Any]],
     origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
@@ -685,6 +1072,9 @@ def dispatch_async_delegation_batch(
     )
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
+        "_home": str(_records_path().parent),
+        "owner_pid": os.getpid(),
+        "owner_process_start_time": _current_process_start_time(),
         "goal": combined_goal,
         "goals": list(goals),
         "context": context,
@@ -694,6 +1084,9 @@ def dispatch_async_delegation_batch(
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "parent_session_id": parent_session_id,
+        "child_session_ids": [
+            str(session_id) for session_id in (child_session_ids or []) if session_id
+        ],
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -701,12 +1094,15 @@ def dispatch_async_delegation_batch(
         "is_batch": True,
     }
     with _records_lock:
+        _load_records_locked()
         running = sum(
-            1 for r in _records.values() if r.get("status") == "running"
+            1 for r in _records.values()
+            if r.get("_home") == record["_home"] and r.get("status") == "running"
         )
         if running >= max_async_children:
             return {
                 "status": "rejected",
+                "reason": "capacity",
                 "error": (
                     f"Async delegation capacity reached ({max_async_children} "
                     f"running). Wait for one to finish (its result will re-enter "
@@ -715,6 +1111,23 @@ def dispatch_async_delegation_batch(
                 ),
             }
         _records[delegation_id] = record
+        reservation = _reserve_record_locked(record, max_async_children)
+        if reservation != "ok":
+            _records.pop(delegation_id, None)
+            if reservation == "capacity":
+                return {
+                    "status": "rejected",
+                    "reason": "capacity",
+                    "error": (
+                        f"Async delegation capacity reached ({max_async_children} "
+                        "running across this profile). Wait for one to finish."
+                    ),
+                }
+            return {
+                "status": "rejected",
+                "reason": "persistence",
+                "error": "Could not persist the background delegation record.",
+            }
 
     _persist_dispatch(record)
     executor = _get_executor(max_async_children)
@@ -750,9 +1163,13 @@ def dispatch_async_delegation_batch(
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
+            _persist_records_locked(
+                record.get("_home"), remove_ids={delegation_id}
+            )
         _delete_durable_delegation(delegation_id)
         return {
             "status": "rejected",
+            "reason": "schedule",
             "error": f"Failed to schedule async delegation batch: {exc}",
         }
 
@@ -775,16 +1192,8 @@ def _finalize_batch(
         record["completed_at"] = time.time()
         record["interrupt_fn"] = None
         event_record = dict(record)
-
-    try:
-        from tools.process_registry import process_registry
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s finished but process_registry import "
-            "failed; result lost: %s",
-            delegation_id, exc,
-        )
-        return
+        _prune_completed_locked(record.get("_home"))
+        _persist_records_locked(record.get("_home"))
 
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
@@ -794,6 +1203,7 @@ def _finalize_batch(
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
+        "child_session_ids": event_record.get("child_session_ids") or [],
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),
@@ -811,20 +1221,12 @@ def _finalize_batch(
         "completed_at": completed_at,
     }
     _persist_completion(evt, combined)
-    try:
-        process_registry.completion_queue.put(evt)
-    except Exception as exc:  # pragma: no cover
-        logger.error(
-            "Async delegation batch %s: failed to enqueue completion event; "
-            "result lost: %s",
-            delegation_id, exc,
-        )
-    finally:
-        with _records_lock:
-            record = _records.get(delegation_id)
-            if record is not None:
-                record["status"] = status
-            _prune_completed_locked()
+    _push_completion_event(evt)
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not None:
+            record["status"] = status
+        _prune_completed_locked()
 
 
 def list_async_delegations() -> List[Dict[str, Any]]:
@@ -833,9 +1235,16 @@ def list_async_delegations() -> List[Dict[str, Any]]:
     Safe to call from any thread. Excludes the non-serialisable interrupt_fn.
     """
     with _records_lock:
+        _load_records_locked()
+        home = str(_records_path().parent)
         return [
-            {k: v for k, v in r.items() if k != "interrupt_fn"}
-            for r in _records.values()
+            {
+                key: value
+                for key, value in record.items()
+                if key not in {"interrupt_fn", "_home"}
+            }
+            for record in _records.values()
+            if record.get("_home") == home
         ]
 
 
@@ -847,9 +1256,12 @@ def interrupt_all(reason: str = "shutdown") -> int:
     completion event (status='interrupted') via the normal finalize path.
     """
     count = 0
+    home = str(_records_path().parent)
     with _records_lock:
         targets = [
-            r for r in _records.values() if r.get("status") == "running"
+            record
+            for record in _records.values()
+            if record.get("_home") == home and record.get("status") == "running"
         ]
     for r in targets:
         fn = r.get("interrupt_fn")
@@ -894,10 +1306,12 @@ def interrupt_for_session(
     if not session_key and not origin_ui_session_id and not parent_session_id:
         return 0
     count = 0
+    home = str(_records_path().parent)
     with _records_lock:
         targets = [
             r for r in _records.values()
-            if r.get("status") == "running"
+            if r.get("_home") == home
+            and r.get("status") == "running"
             and (
                 (origin_ui_session_id and str(r.get("origin_ui_session_id") or "") == origin_ui_session_id)
                 or (session_key and str(r.get("session_key") or "") == session_key)
@@ -924,12 +1338,19 @@ def interrupt_for_session(
 
 
 def _reset_for_tests() -> None:
-    """Test-only: clear all state and tear down the executor."""
-    global _executor, _executor_max_workers
+    """Test-only: clear all state, persistent records, and the executor."""
+    global _executor, _executor_max_workers, _journal_cache
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False)
         _executor = None
         _executor_max_workers = 0
+    with _journal_lock:
+        _journal_cache = {}
+        _restored_ids.clear()
     with _records_lock:
         _records.clear()
+        try:
+            _records_path().unlink(missing_ok=True)
+        except OSError:
+            pass

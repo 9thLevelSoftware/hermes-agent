@@ -285,11 +285,30 @@ class CLICommandsMixin:
         running_d = [d for d in delegations if d.get("status") == "running"]
         if delegations:
             _cprint(f"  Background delegations: {len(running_d)} running")
+            session_db = self._session_db
+            if not session_db:
+                try:
+                    from hermes_state import SessionDB
+
+                    session_db = SessionDB()
+                    self._session_db = session_db
+                except Exception:
+                    pass
             for d in delegations:
                 goal = (d.get("goal") or "")[:60]
+                resume_ids = d.get("child_session_ids") or []
+                resume_hint = ""
+                if d.get("status") == "interrupted" and resume_ids and session_db:
+                    for resume_id in resume_ids:
+                        try:
+                            if session_db.get_session(resume_id):
+                                resume_hint = f" · /resume {resume_id}"
+                                break
+                        except Exception:
+                            continue
                 _cprint(
                     f"    {d.get('delegation_id', '?')} · "
-                    f"{d.get('status', '?')} · {goal}"
+                    f"{d.get('status', '?')} · {goal}{resume_hint}"
                 )
 
         agent_running = getattr(self, "_agent_running", False)
@@ -1517,6 +1536,29 @@ class CLICommandsMixin:
             output = run_slash(rest)
         except Exception as exc:  # pragma: no cover - defensive
             output = f"(._.) kanban error: {exc}"
+        if output:
+            print(output)
+
+    def _handle_workflow_command(self, cmd: str):
+        """Handle the /workflow command — delegate to the shared workflow CLI.
+
+        Mirrors ``_handle_kanban_command``: strip the leading ``/workflow``
+        and hand the remainder to ``workflows.run_slash`` which returns a
+        single formatted string.
+        """
+        from hermes_cli.workflows import run_slash
+
+        rest = cmd.strip()
+        if rest.startswith("/"):
+            rest = rest.lstrip("/")
+        for prefix in ("workflows", "workflow"):
+            if rest.startswith(prefix):
+                rest = rest[len(prefix):].lstrip()
+                break
+        try:
+            output = run_slash(rest)
+        except Exception as exc:  # pragma: no cover - defensive
+            output = f"(._.) workflow error: {exc}"
         if output:
             print(output)
 

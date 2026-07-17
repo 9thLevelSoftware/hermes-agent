@@ -9209,6 +9209,17 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+        else:
+            # Acknowledge the durable row AFTER successful dispatch so a future
+            # restart cannot re-fire the same completed delegation (Task 8).
+            if evt.get("type") == "async_delegation":
+                try:
+                    from tools.async_delegation import (
+                        acknowledge_async_delegation,
+                    )
+                    acknowledge_async_delegation(evt.get("delegation_id", ""))
+                except Exception:
+                    pass
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -9277,6 +9288,17 @@ def _notification_poller_loop(
             )
             with session["history_lock"]:
                 session["running"] = False
+        else:
+            # Acknowledge the durable row AFTER successful dispatch so a future
+            # restart cannot re-fire the same completed delegation (Task 8).
+            if evt.get("type") == "async_delegation":
+                try:
+                    from tools.async_delegation import (
+                        acknowledge_async_delegation,
+                    )
+                    acknowledge_async_delegation(evt.get("delegation_id", ""))
+                except Exception:
+                    pass
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -9331,6 +9353,35 @@ def _wire_agent_terminal_output() -> None:
 def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     """Start the background notification poller for a TUI session."""
     _wire_agent_terminal_output()
+    # Re-cover orphan async delegations from a prior process (Task 8). The
+    # journal reconciles any in-flight rows to 'unknown'; then we restore
+    # every terminal unacknowledged row onto the shared completion queue so
+    # the poller picks them up the same way as fresh events. A consumer ack
+    # keeps a future restart from re-firing them.
+    try:
+        from agent.operation_journal import OperationJournal
+        from tools.async_delegation import (
+            restore_unacknowledged_delegations,
+        )
+        from tools.process_registry import process_registry as _pr_tui
+
+        _db = _get_db()
+        if _db is not None:
+            _op_journal = OperationJournal(_db)
+            _moved = _op_journal.reconcile_after_restart(owner_fenced=True)
+            _restored = restore_unacknowledged_delegations(
+                _pr_tui.completion_queue, _pr_tui.completion_queue.put,
+            )
+            if _moved or _restored:
+                logger.info(
+                    "Async delegation durable journal: reconciled %d in-flight, "
+                    "restored %d unacknowledged terminal rows onto completion queue",
+                    _moved, _restored,
+                )
+    except Exception as _e:  # noqa: BLE001
+        logger.debug(
+            "Async delegation durable journal startup skipped: %s", _e,
+        )
     stop = threading.Event()
     t = threading.Thread(
         target=_notification_poller_loop,
@@ -12692,8 +12743,12 @@ def _(rid, params: dict) -> dict:
             )
 
         # Otherwise — treat the remaining text as the new goal.
+        from hermes_cli.goals import parse_contract
+
+        headline, parsed_contract = parse_contract(arg)
+        contract = parsed_contract if not parsed_contract.is_empty() else None
         try:
-            state = mgr.set(arg)
+            state = mgr.set(headline or arg, contract=contract)
         except ValueError as exc:
             return _err(rid, 4004, f"invalid goal: {exc}")
 
@@ -12708,7 +12763,7 @@ def _(rid, params: dict) -> dict:
         # wired in _run_prompt_submit takes over from there.
         return _ok(
             rid,
-            {"type": "send", "notice": notice, "message": state.goal},
+            {"type": "send", "notice": notice, "message": mgr.kickoff_prompt() or state.goal},
         )
 
     if name == "undo":

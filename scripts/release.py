@@ -77,6 +77,11 @@ LEGACY_AUTHOR_MAP = {
     "skosarevivan@yandex.ru": "Epoxidex",  # PR #29820 salvage (ollama: top-level reasoning_effort=none; #25758)
     "jdjiayou@163.com": "JiaDe-Wu",  # PR #34742 salvage (bedrock: bearer routing + streaming fallback + image decode; #28156)
     "changhyun.min@gmail.com": "minchang",  # PR #42231 salvage (providers: add Upstage Solar)
+    "agent@local": "9thLevelSoftware",  # local Hermes Agent commits in PR branches
+    "hermes@local": "9thLevelSoftware",  # local Hermes commits in PR branches
+    "hermes@example.invalid": "9thLevelSoftware",  # generated local Hermes commits
+    "dasblueeyeddevil@gmail.com": "9thLevelSoftware",  # PR #29 (code-mode tool orchestration)
+    "dasblueyeddevil@gmail.com": "9thLevelSoftware",  # local Hermes PR commit
     "neo@neodeMac-mini.local": "neo-claw-bot",  # PR #58465 salvage (moa: drop empty user turns from advisory view)
     "2024104039@mails.szu.edu.cn": "pixel4039",  # PR #64420 salvage (streaming: retry zero-chunk streams)
     "marceloparra.hm@gmail.com": "marcelohildebrand",  # PR #42346 salvage (lmstudio: JIT load mode)

@@ -102,6 +102,50 @@ def _effective_provider_label() -> str:
 from hermes_constants import is_termux as _is_termux
 
 
+def _render_toolset_health_rows(registry) -> int:
+    """Render one ``hermes status`` row per unhealthy toolset; return count.
+
+    Counterpart to :func:`hermes_cli.doctor._render_toolset_health_rows`.
+    Same snapshot source — the dispatch-side RuntimeHealthRegistry — but
+    uses status.py's plain-`print` style. Sorted by key for diff-friendly
+    output across runs. Never raises; a misbehaving snapshot returns 0.
+
+    Returns 0 when no toolsets are unhealthy so callers can emit an
+    "all healthy" line if they want.
+    """
+    try:
+        snapshot = registry.get_runtime_health() or {}
+    except Exception:
+        return 0
+
+    count = 0
+    for key in sorted(snapshot):
+        entry = snapshot[key] or {}
+        state = entry.get("state")
+        if state == "healthy":
+            continue
+        suppressed = entry.get("suppressed_failures", 0) or 0
+        next_probe = entry.get("next_probe_at", 0.0) or 0.0
+        if key.startswith("toolset:"):
+            label = key[len("toolset:"):]
+        else:
+            label = key
+        detail = f"state={state} suppressed={suppressed}"
+        if next_probe:
+            try:
+                from datetime import datetime, timezone
+                ts = datetime.fromtimestamp(float(next_probe), tz=timezone.utc)
+                detail += f" retry_at={ts.isoformat(timespec='seconds')}"
+            except Exception:
+                pass
+        # Style consistent with the rest of `hermes status`: two-space indent,
+        # 16-char key column, status glyph + label.
+        glyph = color("✗", Colors.RED) if state == "open_circuit" else color("⚠", Colors.YELLOW)
+        print(f"  {label:<16} {glyph} {detail}")
+        count += 1
+    return count
+
+
 def show_status(args):
     """Show status of all Hermes Agent components."""
     deep = getattr(args, 'deep', False)
@@ -538,6 +582,19 @@ def show_status(args):
             print("  Jobs:         (error reading jobs file)")
     else:
         print("  Jobs:         0")
+
+    # =========================================================================
+    # Capability Health (runtime health registry surfaced from tool dispatch)
+    # =========================================================================
+    print()
+    print(color("◆ Capability Health", Colors.CYAN, Colors.BOLD))
+    try:
+        from tools.registry import registry as _status_runtime_registry
+        emitted = _render_toolset_health_rows(_status_runtime_registry)
+        if emitted == 0:
+            print("  All toolsets:  ✓ healthy")
+    except Exception as _health_exc:
+        print(f"  Capability health unavailable ({_health_exc})")
 
     # =========================================================================
     # Sessions

@@ -4297,6 +4297,19 @@ def cmd_status(args):
     show_status(args)
 
 
+def cmd_reliability(args):
+    """Offline harness fault matrix (deterministic, no network)."""
+    from hermes_cli.reliability import cmd_reliability as _run_reliability
+
+    # ponytail: hermes_cli/main.py's dispatcher discards the handler's
+    # return value, so cmd_reliability must translate rc → sys.exit()
+    # itself to honor its documented 0/1/2 exit-code contract.
+    rc = _run_reliability(args)
+    if rc:
+        sys.exit(rc)
+    return rc
+
+
 def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
@@ -4347,6 +4360,13 @@ def cmd_kanban(args):
     from hermes_cli.kanban import kanban_command
 
     return kanban_command(args)
+
+
+def cmd_workflow(args):
+    """Workflow graph definitions and executions."""
+    from hermes_cli.workflows import workflow_command
+
+    sys.exit(int(workflow_command(args) or 0))
 
 
 def cmd_project(args):
@@ -12697,7 +12717,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
+        "gui", "desktop", "kanban", "workflow", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "postinstall", "profile",
         "project", "proxy",
@@ -12705,6 +12725,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
+        "reliability",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
@@ -13149,8 +13170,15 @@ def cmd_insights(args):
 
         db = SessionDB()
         engine = InsightsEngine(db)
-        report = engine.generate(days=args.days, source=args.source)
-        print(engine.format_terminal(report))
+        report = engine.generate(
+            days=args.days,
+            source=args.source,
+            learning=getattr(args, "learning", False),
+        )
+        if getattr(args, "learning", False):
+            print(engine.format_terminal_learning(report))
+        else:
+            print(engine.format_terminal(report))
         db.close()
     except Exception as e:
         print(f"Error generating insights: {e}")
@@ -13461,6 +13489,35 @@ def main():
     build_status_parser(subparsers, cmd_status=cmd_status)
 
     # =========================================================================
+    # reliability command — offline harness fault matrix
+    # =========================================================================
+    reliability_parser = subparsers.add_parser(
+        "reliability",
+        help="Offline harness fault matrix (end-state reliability scenarios).",
+        description=(
+            "Deterministic, offline. Runs the eight end-state fault "
+            "scenarios from agent.reliability_scenarios against the "
+            "in-process OperationJournal + FakeDelivery fakes. Exits "
+            "0 when every scenario passes, 1 when any fails, 2 on "
+            "invalid usage."
+        ),
+    )
+    reliability_sub = reliability_parser.add_subparsers(
+        dest="reliability_command",
+        required=True,
+    )
+    reliability_check = reliability_sub.add_parser(
+        "check",
+        help="Run the eight end-state fault scenarios and render the matrix.",
+    )
+    reliability_check.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the matrix as JSON (summary + per-scenario rows).",
+    )
+    reliability_check.set_defaults(func=cmd_reliability)
+
+    # =========================================================================
     # cron command  (parser built in hermes_cli/subcommands/cron.py)
     # =========================================================================
     build_cron_parser(subparsers, cmd_cron=cmd_cron)
@@ -13483,6 +13540,14 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    # =========================================================================
+    # workflow command — workflow graph definitions and executions
+    # =========================================================================
+    from hermes_cli.workflows import build_parser as _build_workflow_parser
+
+    workflow_parser = _build_workflow_parser(subparsers)
+    workflow_parser.set_defaults(func=cmd_workflow)
 
     # =========================================================================
     # project command — named, multi-folder workspaces
