@@ -45,6 +45,18 @@ _VIBE_RE = re.compile(
 )
 
 
+_CORRECTION_RE = re.compile(
+    r"(?:^no,|\bi\s+meant\b|\bthat\s+is\s+wrong\b|\bwrong\s+file\b|"
+    r"\bplease\s+undo\b|\bnot\s+what\s+i\s+asked\b)",
+    re.IGNORECASE,
+)
+
+
+def detect_user_correction(text: str | None) -> bool:
+    """Return True only for explicit correction language."""
+    return bool(text and _CORRECTION_RE.search(text.strip()))
+
+
 def detect_reaction(text: str | None) -> str | None:
     """Return the reaction kind for *text* (currently :data:`VIBE`), or ``None``.
 

@@ -169,6 +169,40 @@ def test_modal_backend_managed_mode_does_not_fall_back_to_direct(monkeypatch, ca
     )
 
 
+# ---------------------------------------------------------------------------
+# execute_code availability follows terminal backend readiness
+# ---------------------------------------------------------------------------
+
+def test_execute_code_unavailable_when_ssh_incomplete(monkeypatch):
+    """Regression: execute_code must not appear when SSH backend is misconfigured."""
+    _clear_terminal_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    # No TERMINAL_SSH_HOST or TERMINAL_SSH_USER set
+
+    from tools.code_execution_tool import check_sandbox_requirements
+    assert check_sandbox_requirements() is False
+
+
+def test_execute_code_available_when_ssh_fully_configured(monkeypatch):
+    """execute_code remains available when SSH backend is fully configured."""
+    _clear_terminal_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    monkeypatch.setenv("TERMINAL_SSH_HOST", "example.com")
+    monkeypatch.setenv("TERMINAL_SSH_USER", "testuser")
+
+    from tools.code_execution_tool import check_sandbox_requirements
+    assert check_sandbox_requirements() is True
+
+
+def test_execute_code_available_with_local_backend(monkeypatch):
+    """execute_code remains available with local backend."""
+    _clear_terminal_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    from tools.code_execution_tool import check_sandbox_requirements
+    assert check_sandbox_requirements() is True
+
+
 def test_modal_backend_managed_mode_without_feature_flag_logs_clear_error(monkeypatch, caplog, tmp_path):
     _clear_terminal_env(monkeypatch)
     monkeypatch.setenv("TERMINAL_ENV", "modal")

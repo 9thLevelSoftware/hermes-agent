@@ -620,6 +620,35 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
         )
+    # Persisted approval outcomes are security policy state. If an agent could
+    # write this file directly it could forge a resolved request and bypass the
+    # terminal approval gate after the next lazy load.
+    try:
+        from hermes_constants import get_hermes_home
+
+        approval_state = str(
+            (get_hermes_home() / "approval_requests.json").resolve()
+        )
+    except Exception:
+        approval_state = ""
+    candidates = [resolved, normalized]
+    is_approval_state = bool(
+        approval_state and any(path == approval_state for path in candidates)
+    )
+    for candidate in candidates:
+        clean = candidate.replace("\\", "/").rstrip("/")
+        if clean.endswith("/.hermes/approval_requests.json"):
+            is_approval_state = True
+        marker = "/.hermes/profiles/"
+        if marker in clean:
+            profile_tail = clean.split(marker, 1)[1].split("/")
+            if len(profile_tail) == 2 and profile_tail[1] == "approval_requests.json":
+                is_approval_state = True
+    if is_approval_state:
+        return (
+            f"Refusing to write to Hermes approval state: {filepath}\n"
+            "Agent cannot modify persisted security decisions."
+        )
     return None
 
 
@@ -2101,7 +2130,7 @@ def _handle_search_files(args, **kw):
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
 
 
-registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
+registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000, read_only=True)
 registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
-registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)
+registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000, read_only=True)

@@ -1475,19 +1475,47 @@ def _render_candidate_list() -> str:
     if not rows:
         return "No agent-created skills to review."
     cron_referenced = _cron_referenced_skills()
+    # Load utility evidence once for all candidates
+    utility_data: Dict[str, Dict[str, Any]] = {}
+    try:
+        usage_records = skill_usage.load_usage()
+        if not isinstance(usage_records, dict):
+            usage_records = {}
+        for r in rows:
+            name = r["name"]
+            rec = usage_records.get(name)
+            util = skill_usage.get_skill_utility(name, rec if isinstance(rec, dict) else {})
+            if util.get("count", 0) > 0:
+                utility_data[name] = util
+    except Exception:
+        pass
+
     lines = [f"Agent-created skills ({len(rows)}):\n"]
     for r in rows:
-        lines.append(
-            f"- {r['name']}  "
+        name = r["name"]
+        parts = [
+            f"- {name}  "
             f"state={r['state']}  "
             f"pinned={'yes' if r.get('pinned') else 'no'}  "
-            f"cron={'yes' if r['name'] in cron_referenced else 'no'}  "
+            f"cron={'yes' if name in cron_referenced else 'no'}  "
             f"activity={r.get('activity_count', 0)}  "
             f"use={r.get('use_count', 0)}  "
             f"view={r.get('view_count', 0)}  "
             f"patches={r.get('patch_count', 0)}  "
             f"last_activity={r.get('last_activity_at') or 'never'}"
-        )
+        ]
+        # Append utility evidence when outcome data exists
+        util = utility_data.get(name)
+        if util:
+            parts.append(
+                f"  utility={util['utility']:.2f}"
+                if util.get("utility") is not None
+                else f"  utility=n/a"
+            )
+            parts.append(f"  samples={util['count']}")
+            parts.append(f"  helped={util['helped']}")
+            parts.append(f"  hurt={util['hurt']}")
+        lines.append("".join(parts))
     return "\n".join(lines)
 
 

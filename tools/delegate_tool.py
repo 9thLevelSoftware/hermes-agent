@@ -1361,47 +1361,88 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
-    child = AIAgent(
-        base_url=effective_base_url,
-        api_key=effective_api_key,
-        model=effective_model,
-        provider=effective_provider,
-        api_mode=effective_api_mode,
-        acp_command=effective_acp_command,
-        acp_args=effective_acp_args,
-        max_iterations=max_iterations,
+    parent_session_db = getattr(parent_agent, "_session_db", None)
+    child_session_db = None
+    child_owns_session_db = False
+    child = None
+    child_cleanup_closed_db = False
+    try:
+        if parent_session_db is not None:
+            child_session_db = parent_session_db.fork()
+            child_owns_session_db = True
 
-        reasoning_config=child_reasoning,
-        prefill_messages=getattr(parent_agent, "prefill_messages", None),
-        fallback_model=parent_fallback,
-        enabled_toolsets=child_toolsets,
-        disabled_toolsets=child_disabled_toolsets,
-        quiet_mode=True,
-        ephemeral_system_prompt=child_prompt,
-        log_prefix=f"[subagent-{task_index}]",
-        platform="subagent",
-        skip_context_files=True,
-        skip_memory=True,
-        clarify_callback=None,
-        thinking_callback=child_thinking_cb,
-        session_db=getattr(parent_agent, "_session_db", None),
-        parent_session_id=getattr(parent_agent, "session_id", None),
-        providers_allowed=child_providers_allowed,
-        providers_ignored=child_providers_ignored,
-        providers_order=child_providers_order,
-        provider_sort=child_provider_sort,
-        provider_require_parameters=child_provider_require_parameters,
-        provider_data_collection=child_provider_data_collection,
-        request_overrides=(
-            dict(override_request_overrides or {})
-            if override_provider
-            else dict(getattr(parent_agent, "request_overrides", {}) or {})
-        ),
-        openrouter_min_coding_score=child_openrouter_min_coding_score,
-        tool_progress_callback=child_progress_cb,
-        iteration_budget=None,  # fresh budget per subagent
-        **child_optional_kwargs,
-    )
+        child_kwargs: Dict[str, Any] = dict(
+            base_url=effective_base_url,
+            api_key=effective_api_key,
+            model=effective_model,
+            provider=effective_provider,
+            api_mode=effective_api_mode,
+            acp_command=effective_acp_command,
+            acp_args=effective_acp_args,
+            max_iterations=max_iterations,
+            reasoning_config=child_reasoning,
+            prefill_messages=getattr(parent_agent, "prefill_messages", None),
+            fallback_model=parent_fallback,
+            enabled_toolsets=child_toolsets,
+            disabled_toolsets=child_disabled_toolsets,
+            quiet_mode=True,
+            ephemeral_system_prompt=child_prompt,
+            log_prefix=f"[subagent-{task_index}]",
+            platform="subagent",
+            skip_context_files=True,
+            skip_memory=True,
+            clarify_callback=None,
+            thinking_callback=child_thinking_cb,
+            session_db=child_session_db,
+            owns_session_db=child_owns_session_db,
+            parent_session_id=getattr(parent_agent, "session_id", None),
+            providers_allowed=child_providers_allowed,
+            providers_ignored=child_providers_ignored,
+            providers_order=child_providers_order,
+            provider_sort=child_provider_sort,
+            provider_require_parameters=child_provider_require_parameters,
+            provider_data_collection=child_provider_data_collection,
+            request_overrides=(
+                dict(override_request_overrides or {})
+                if override_provider
+                else dict(getattr(parent_agent, "request_overrides", {}) or {})
+            ),
+            openrouter_min_coding_score=child_openrouter_min_coding_score,
+            tool_progress_callback=child_progress_cb,
+            iteration_budget=None,
+            **child_optional_kwargs,
+        )
+        if isinstance(AIAgent, type):
+            child = AIAgent.__new__(AIAgent)
+            AIAgent.__init__(child, **child_kwargs)
+        else:
+            # Keep patched constructor doubles working in unit tests.
+            child = AIAgent(**child_kwargs)
+    except Exception:
+        try:
+            if child is not None:
+                child.close()
+                # ponytail: close() may have torn down _conn and then
+                # raised. Observe the post-attempt state to decide
+                # whether the fallback path is even needed — calling
+                # close() again on a non-idempotent DB that already
+                # dropped its connection would double-close.
+                child_cleanup_closed_db = (
+                    getattr(child, "_session_db", None) is child_session_db
+                    and bool(getattr(child, "_session_db_closed", False))
+                ) or not getattr(child_session_db, "is_open", True)
+        except Exception:
+            pass
+        if (
+            child_session_db is not None
+            and not child_cleanup_closed_db
+            and getattr(child_session_db, "is_open", True)
+        ):
+            try:
+                child_session_db.close()
+            except Exception:
+                pass
+        raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
@@ -1416,6 +1457,7 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._delegate_progress_callback = child_progress_cb
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
@@ -2595,6 +2637,26 @@ def delegate_task(
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
+    except Exception:
+        for _, _, child in children:
+            try:
+                if hasattr(parent_agent, "_active_children"):
+                    lock = getattr(parent_agent, "_active_children_lock", None)
+                    if lock:
+                        with lock:
+                            try:
+                                parent_agent._active_children.remove(child)
+                            except ValueError:
+                                pass
+                    else:
+                        try:
+                            parent_agent._active_children.remove(child)
+                        except ValueError:
+                            pass
+                child.close()
+            except Exception:
+                pass
+        raise
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
@@ -2920,21 +2982,72 @@ def delegate_task(
                 _session_key = _agent_session_id
         _parent_session_id = getattr(parent_agent, "session_id", None)
         _child_agents = [c for (_, _, c) in children]
+        _child_session_ids = [
+            str(getattr(child, "session_id", "") or "")
+            for child in _child_agents
+            if getattr(child, "session_id", None)
+        ]
 
-        # Detach every child from the parent's interrupt-propagation list — the
-        # batch's lifecycle is owned by the async registry now, not the parent
-        # turn. _build_child_agent attached them (correct for sync runs).
-        if hasattr(parent_agent, "_active_children"):
-            _ac_lock = getattr(parent_agent, "_active_children_lock", None)
-            for _c in _child_agents:
-                try:
-                    if _ac_lock:
-                        with _ac_lock:
-                            parent_agent._active_children.remove(_c)
-                    else:
-                        parent_agent._active_children.remove(_c)
-                except ValueError:
-                    pass
+        def _detach_children(*, close: bool = False) -> None:
+            if hasattr(parent_agent, "_active_children"):
+                lock = getattr(parent_agent, "_active_children_lock", None)
+                for child in _child_agents:
+                    try:
+                        if lock:
+                            with lock:
+                                parent_agent._active_children.remove(child)
+                        else:
+                            parent_agent._active_children.remove(child)
+                    except ValueError:
+                        pass
+                    if close:
+                        try:
+                            if hasattr(child, "close"):
+                                child.close()
+                        except Exception:
+                            logger.debug("Failed to close rejected child agent")
+
+        def _reject_unstarted_children(error: str) -> None:
+            try:
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+            except Exception:
+                _invoke_hook = None
+            for child in _child_agents:
+                callback = getattr(child, "_delegate_progress_callback", None)
+                if callable(callback):
+                    try:
+                        callback(
+                            "subagent.complete",
+                            preview=error,
+                            status="failed",
+                            duration_seconds=0,
+                            summary=error,
+                        )
+                    except Exception:
+                        logger.debug("Rejected child completion relay failed")
+                if _invoke_hook is not None:
+                    try:
+                        _invoke_hook(
+                            "subagent_stop",
+                            parent_session_id=_parent_session_id,
+                            parent_turn_id=getattr(
+                                parent_agent, "_current_turn_id", ""
+                            ) or "",
+                            child_session_id=getattr(child, "session_id", None),
+                            child_role=getattr(child, "_delegate_role", None),
+                            child_summary=error,
+                            child_status="error",
+                            duration_ms=0,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Rejected child subagent_stop hook failed",
+                            exc_info=True,
+                        )
+                subagent_id = getattr(child, "_subagent_id", None)
+                if subagent_id:
+                    _unregister_subagent(subagent_id)
+            _detach_children(close=True)
 
         def _batch_runner():
             return _execute_and_aggregate()
@@ -2961,12 +3074,16 @@ def delegate_task(
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             parent_session_id=_parent_session_id,
+            child_session_ids=_child_session_ids,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
         )
 
         if dispatch.get("status") == "dispatched":
+            # The async registry now owns cancellation. Detach only after the
+            # durable dispatch is accepted; the worker closes children later.
+            _detach_children()
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -2990,9 +3107,26 @@ def delegate_task(
             }
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        if dispatch.get("reason") != "capacity":
+            _reject_unstarted_children(
+                dispatch.get("error", "Background dispatch failed.")
+            )
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "mode": "background",
+                    "error": dispatch.get("error", "Background dispatch failed."),
+                    "reason": dispatch.get("reason", "dispatch"),
+                    "note": (
+                        "The background delegation was not started. Its unstarted "
+                        "child resources were released safely."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        # Pool at capacity — keep the parent-owned children attached while the
+        # batch runs synchronously.
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
             "batch synchronously instead.",

@@ -1148,13 +1148,29 @@ class SlackAdapter(BasePlatformAdapter):
             async def handle_file_change(event, say):
                 pass
 
-            # Reactions are useful lightweight acknowledgements in Slack, but
-            # Hermes does not currently need to route them into the agent loop.
-            # Ack the events explicitly so high-traffic channels do not fill
-            # gateway.error.log with Slack Bolt "Unhandled request" warnings.
+            # Route authenticated user reactions as ledger feedback without
+            # synthesizing a user message.
             @self._app.event("reaction_added")
             async def handle_reaction_added(event, say):
-                pass
+                item = event.get("item") or {}
+                actor_id = str(event.get("user") or "")
+                channel_id = str(item.get("channel") or "")
+                team_id = str(event.get("team") or event.get("team_id") or "")
+                bot_id = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+                if not actor_id or actor_id == bot_id:
+                    return
+                if not self._is_interactive_user_authorized(
+                    actor_id, channel_id=channel_id, team_id=team_id
+                ):
+                    return
+                self.publish_feedback(
+                    self.platform,
+                    channel_id,
+                    item.get("ts", ""),
+                    actor_id,
+                    event.get("reaction", ""),
+                    event.get("event_ts", ""),
+                )
 
             @self._app.event("reaction_removed")
             async def handle_reaction_removed(event, say):

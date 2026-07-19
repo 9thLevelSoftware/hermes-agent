@@ -283,6 +283,15 @@ _SKILL_REVIEW_PROMPT = (
     "Otherwise, act."
 )
 
+_FAILURE_REVIEW_PROMPT = (
+    "Review the failed turn above for a reusable lesson. Distinguish durable "
+    "workflow lessons from environment-dependent setup failures, transient "
+    "provider errors, and unsupported negative claims about tools. A single "
+    "failure is not evidence that a tool is unavailable: never write a skill "
+    "claiming that it is. Capture only a verified fix, retry pattern, or other "
+    "lesson that will remain useful; otherwise say 'Nothing to save.'"
+)
+
 _COMBINED_REVIEW_PROMPT = (
     "Review the conversation above and update two things:\n\n"
     "**Memory**: who the user is. Did the user reveal persona, "
@@ -951,6 +960,11 @@ def _run_review_in_thread(
             _set_approval_callback(None)
         except Exception:
             pass
+        try:
+            from agent.reflection_triggers import release_review_flight
+            release_review_flight(agent)
+        except Exception:
+            pass
 
 
 def spawn_background_review_thread(
@@ -968,7 +982,11 @@ def spawn_background_review_thread(
     # Pick the right prompt based on which triggers fired.  Allow per-agent
     # override (the prompts moved to module-level constants but old code paths
     # that set agent._MEMORY_REVIEW_PROMPT etc. directly keep working).
-    if review_memory and review_skills:
+    trigger = getattr(agent, "_background_review_trigger", None)
+    agent._background_review_trigger = None
+    if getattr(trigger, "kind", None) == "failure":
+        prompt = getattr(agent, "_FAILURE_REVIEW_PROMPT", _FAILURE_REVIEW_PROMPT)
+    elif review_memory and review_skills:
         prompt = getattr(agent, "_COMBINED_REVIEW_PROMPT", _COMBINED_REVIEW_PROMPT)
     elif review_memory:
         prompt = getattr(agent, "_MEMORY_REVIEW_PROMPT", _MEMORY_REVIEW_PROMPT)
@@ -984,6 +1002,7 @@ def spawn_background_review_thread(
 __all__ = [
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
+    "_FAILURE_REVIEW_PROMPT",
     "_COMBINED_REVIEW_PROMPT",
     "spawn_background_review_thread",
     "summarize_background_review_actions",

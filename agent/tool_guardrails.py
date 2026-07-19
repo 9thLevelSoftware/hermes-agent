@@ -186,7 +186,18 @@ def canonical_tool_args(args: Mapping[str, Any]) -> str:
     )
 
 
-def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
+def _result_text(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    if result is None:
+        return ""
+    try:
+        return json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(result)
+
+
+def classify_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
     """Safety-fallback classifier used only when callers don't pass ``failed``.
 
     Mirrors ``agent.display._detect_tool_failure`` exactly so the guardrail
@@ -199,9 +210,10 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
         return False, ""
     if file_mutation_result_landed(tool_name, result):
         return False, ""
+    result_text = _result_text(result)
 
     if tool_name == "terminal":
-        data = safe_json_loads(result)
+        data = safe_json_loads(result_text)
         if isinstance(data, dict):
             exit_code = data.get("exit_code")
             if exit_code is not None and exit_code != 0:
@@ -209,13 +221,13 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
         return False, ""
 
     if tool_name == "memory":
-        data = safe_json_loads(result)
+        data = safe_json_loads(result_text)
         if isinstance(data, dict):
             if data.get("success") is False and "exceed the limit" in data.get("error", ""):
                 return True, " [full]"
 
-    lower = result[:500].lower()
-    if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
+    lower = result_text[:500].lower()
+    if '"error"' in lower or '"failed"' in lower or result_text.startswith("Error"):
         return True, " [error]"
 
     return False, ""
@@ -427,8 +439,8 @@ def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return args if isinstance(args, Mapping) else {}
 
 
-def _result_hash(result: str | None) -> str:
-    parsed = safe_json_loads(result or "")
+def _result_hash(result: Any) -> str:
+    parsed = safe_json_loads(result) if isinstance(result, str) else result
     if parsed is not None:
         try:
             canonical = json.dumps(
@@ -442,7 +454,7 @@ def _result_hash(result: str | None) -> str:
             canonical = str(parsed)
     else:
         canonical = result or ""
-    return _sha256(canonical)
+    return _sha256(str(canonical))
 
 
 def _as_bool(value: Any, default: bool) -> bool:

@@ -1033,6 +1033,39 @@ class DiscordAdapter(BasePlatformAdapter):
 
         asyncio.create_task(_notify())
 
+    async def _handle_raw_reaction_add(self, payload: Any) -> None:
+        actor_id = str(getattr(payload, "user_id", "") or "")
+        bot_id = str(getattr(getattr(self._client, "user", None), "id", "") or "")
+        if not actor_id or actor_id == bot_id:
+            return
+        member = getattr(payload, "member", None)
+        if getattr(member, "bot", False):
+            return
+        guild = (
+            self._client.get_guild(getattr(payload, "guild_id", None))
+            if self._client is not None else None
+        )
+        if not self._is_allowed_user(
+            actor_id,
+            member,
+            guild=guild,
+            is_dm=getattr(payload, "guild_id", None) is None,
+            channel_ids={str(getattr(payload, "channel_id", "") or "")},
+        ):
+            return
+        self.publish_feedback(
+            self.platform,
+            getattr(payload, "channel_id", ""),
+            getattr(payload, "message_id", ""),
+            actor_id,
+            getattr(payload, "emoji", ""),
+            (
+                f"discord:{getattr(payload, 'channel_id', '')}:"
+                f"{getattr(payload, 'message_id', '')}:{actor_id}:"
+                f"{getattr(payload, 'emoji', '')}"
+            ),
+        )
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Discord and start receiving events."""
         if not DISCORD_AVAILABLE:
@@ -1172,6 +1205,10 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_message(message: DiscordMessage):
                 await adapter_self._dispatch_discord_message(message)
+
+            @self._client.event
+            async def on_raw_reaction_add(payload):
+                await adapter_self._handle_raw_reaction_add(payload)
 
             @self._client.event
             async def on_voice_state_update(member, before, after):

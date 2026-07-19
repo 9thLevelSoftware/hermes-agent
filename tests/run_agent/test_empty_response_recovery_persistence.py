@@ -10,7 +10,7 @@ class _CapturingSessionDB:
         self.rows = []
 
     def append_message(self, session_id, role, content=None, **kwargs):
-        self.rows.append({"role": role, "content": content})
+        self.rows.append({"role": role, "content": content, **kwargs})
         return len(self.rows)
 
 
@@ -174,3 +174,18 @@ def test_flush_skips_thinking_prefill_scaffolding():
     agent._flush_messages_to_session_db(messages, conversation_history=[])
 
     assert [r["content"] for r in agent._session_db.rows] == ["hi", "Hello!"]
+
+
+def test_flush_persists_timeout_cancellation_effect_disposition():
+    agent = _agent_with_capturing_db()
+    messages = [{
+        "role": "tool",
+        "content": "[Tool execution cancelled — write_file was skipped due to timeout]",
+        "tool_name": "write_file",
+        "tool_call_id": "call-1",
+        "effect_disposition": "none",
+    }]
+
+    agent._flush_messages_to_session_db(messages, conversation_history=[])
+
+    assert agent._session_db.rows[0]["effect_disposition"] == "none"

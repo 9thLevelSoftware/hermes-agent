@@ -4970,6 +4970,103 @@ class TestAutoMaintenance:
         assert not (sessions_dir / "old.jsonl").exists()
         assert (sessions_dir / "active.jsonl").exists()
 
+    def test_auto_prune_also_prunes_acknowledged_terminal_operations(self, db, monkeypatch):
+        """Bounded retention: maybe_auto_prune_and_vacuum must also call
+        OperationJournal.prune_terminal in the same sweep. Only acknowledged
+        confirmed/failed/cancelled rows older than the cutoff are removed;
+        unacknowledged and unknown rows survive regardless of age.
+        """
+        from agent.operation_journal import OperationJournal
+
+        journal = OperationJournal(db)
+
+        now = 7_000_000.0
+        old = now - 31 * 86400
+        fresh = now - 29 * 86400
+
+        def _seed(op_id, path, ts, ack):
+            journal.create(operation_id=op_id, kind="tool")
+            for frm, to, eff in path:
+                journal.transition(op_id, from_states={frm}, to_state=to, effect_disposition=eff)
+            db._conn.execute(
+                "UPDATE agent_operations SET created_at = ?, updated_at = ? WHERE operation_id = ?",
+                (ts, ts, op_id),
+            )
+            if ack:
+                journal.acknowledge(op_id)
+
+        # prunable: ack + terminal + older than 30d
+        _seed(
+            "ack_confirmed_old",
+            [("pending", "running", "none"), ("running", "confirmed", "landed")],
+            old,
+            True,
+        )
+        _seed("ack_failed_old", [("pending", "failed", "unknown")], old, True)
+        # survives: ack + terminal but newer than 30d
+        _seed(
+            "ack_confirmed_fresh",
+            [("pending", "running", "none"), ("running", "confirmed", "landed")],
+            fresh,
+            True,
+        )
+        # survives: unack terminal + old
+        _seed(
+            "unack_confirmed_old",
+            [("pending", "running", "none"), ("running", "confirmed", "landed")],
+            old,
+            False,
+        )
+        # survives: ack + unknown state (never prune) + old
+        _seed(
+            "ack_unknown_old",
+            [("pending", "running", "none"), ("running", "unknown", "unknown")],
+            old,
+            True,
+        )
+        db._conn.commit()
+
+        monkeypatch.setattr("agent.operation_journal.time.time", lambda: now)
+
+        result = db.maybe_auto_prune_and_vacuum(
+            retention_days=90,
+            operation_retention_days=30,
+            min_interval_hours=0,
+        )
+        assert result["skipped"] is False
+        assert result["operations_pruned"] == 2
+        # prune_sessions found nothing, but the journal freed rows → VACUUM ran.
+        assert result["vacuumed"] is True
+
+        remaining = {
+            row["operation_id"]
+            for row in db._conn.execute(
+                "SELECT operation_id FROM agent_operations"
+            ).fetchall()
+        }
+        assert remaining == {"ack_confirmed_fresh", "unack_confirmed_old", "ack_unknown_old"}
+
+    def test_auto_prune_operation_journal_failure_does_not_break_session_sweep(
+        self, db, monkeypatch
+    ):
+        """If the operation journal prune raises, the session sweep and
+        bookkeeping must still complete (maintenance never blocks startup).
+        """
+        from agent.operation_journal import OperationJournal
+
+        self._make_old_ended(db, "old", days_old=100)
+
+        def _boom(self, older_than_days=30):
+            raise RuntimeError("simulated journal failure")
+
+        monkeypatch.setattr(OperationJournal, "prune_terminal", _boom)
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90)
+        assert result["skipped"] is False
+        assert result["pruned"] == 1
+        assert result["operations_pruned"] == 0
+        assert result.get("error") is None
+        assert db.get_meta("last_auto_prune") is not None
+
 
 # =========================================================================
 # FTS5 indexing of tool_calls / tool_name (#16751)

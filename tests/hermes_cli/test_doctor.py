@@ -243,6 +243,125 @@ def test_run_doctor_sets_interactive_env_for_tool_checks(monkeypatch, tmp_path):
     assert seen["interactive"] == "1"
 
 
+def _dummy_registry_with_health(entries):
+    """Build a minimal stand-in for ``tools.registry.registry`` that doctor
+    can call ``get_runtime_health()`` on. Keeps doctor tests free from
+    importing the real (singleton) registry."""
+    from types import SimpleNamespace
+    return SimpleNamespace(get_runtime_health=lambda: dict(entries))
+
+
+class TestRenderToolsetHealthRows:
+    """The doctor should surface toolsets currently being held back from
+    dispatch (degraded / open_circuit) so operators don't have to read the
+    agent log to find out why their Telegram adapter stopped firing."""
+
+    def _capture(self, entries):
+        import io
+        from contextlib import redirect_stdout
+        from hermes_cli.doctor import _render_toolset_health_rows
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            count = _render_toolset_health_rows(_dummy_registry_with_health(entries))
+        return count, buf.getvalue()
+
+    def test_no_unhealthy_toolsets_returns_zero_rows(self):
+        # All entries healthy → no rows printed (caller decides on the
+        # "all healthy" notice itself).
+        entries = {
+            "toolset:discord": {"state": "healthy", "suppressed_failures": 0, "next_probe_at": 0.0},
+        }
+        count, out = self._capture(entries)
+        assert count == 0
+        assert out == ""
+
+    def test_degraded_toolset_renders_row_with_state_and_suppression(self):
+        # Degraded state is still allowed to probe, but it's a clear
+        # operator-visible signal: handler failures are accumulating.
+        entries = {
+            "toolset:telegram": {
+                "state": "degraded",
+                "suppressed_failures": 0,
+                "next_probe_at": 0.0,
+            },
+        }
+        count, out = self._capture(entries)
+        assert count == 1
+        assert "telegram" in out
+        assert "state=degraded" in out
+        assert "suppressed=0" in out
+
+    def test_open_circuit_state_renders_with_retry_at(self):
+        # Open circuit: dispatcher is refusing calls. Row must surface the
+        # state plus a human-readable retry timestamp.
+        entries = {
+            "toolset:slack": {
+                "state": "open_circuit",
+                "suppressed_failures": 5,
+                "next_probe_at": 1234567890.0,
+            },
+        }
+        count, out = self._capture(entries)
+        assert count == 1
+        assert "slack" in out
+        assert "state=open_circuit" in out
+        assert "suppressed=5" in out
+        assert "retry_at=" in out
+
+    def test_healthy_rows_are_filtered_out(self):
+        entries = {
+            "toolset:a": {"state": "healthy", "suppressed_failures": 0, "next_probe_at": 0.0},
+            "toolset:b": {"state": "open_circuit", "suppressed_failures": 1, "next_probe_at": 1234567890.0},
+            "toolset:c": {"state": "healthy", "suppressed_failures": 0, "next_probe_at": 0.0},
+        }
+        count, out = self._capture(entries)
+        assert count == 1
+        assert "toolset:a" not in out and "toolset:c" not in out
+        assert "b" in out
+
+    def test_output_is_sorted_for_diff_friendly_runs(self):
+        entries = {
+            "toolset:zeta": {"state": "degraded", "suppressed_failures": 1, "next_probe_at": 0.0},
+            "toolset:alpha": {"state": "open_circuit", "suppressed_failures": 2, "next_probe_at": 0.0},
+            "toolset:mu": {"state": "degraded", "suppressed_failures": 0, "next_probe_at": 0.0},
+        }
+        _, out = self._capture(entries)
+        # Sorted by key, so alpha < mu < zeta
+        assert out.index("alpha") < out.index("mu") < out.index("zeta")
+
+    def test_handles_broken_registry_without_raising(self):
+        # A registry whose get_runtime_health() raises must not crash doctor.
+        from hermes_cli.doctor import _render_toolset_health_rows
+
+        class _Boom:
+            def get_runtime_health(self):
+                raise RuntimeError("nope")
+
+        count = _render_toolset_health_rows(_Boom())
+        assert count == 0
+
+    def test_handles_empty_snapshot(self):
+        count, out = self._capture({})
+        assert count == 0
+        assert out == ""
+
+    def test_non_toolset_keys_pass_through_label(self):
+        # RuntimeHealthRegistry is shared with platforms/messaging backends
+        # (platform:telegram etc.). Doctor should still surface those when
+        # they go unhealthy — operators benefit from non-toolset entries
+        # just as much.
+        entries = {
+            "platform:discord": {
+                "state": "open_circuit",
+                "suppressed_failures": 3,
+                "next_probe_at": 1234567890.0,
+            },
+        }
+        count, out = self._capture(entries)
+        assert count == 1
+        assert "discord" in out
+
+
 def test_check_gateway_service_linger_warns_when_disabled(monkeypatch, tmp_path, capsys):
     unit_path = tmp_path / "hermes-gateway.service"
     unit_path.write_text("[Unit]\n")

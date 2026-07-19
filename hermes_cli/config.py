@@ -2291,6 +2291,9 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Lossless opt-in: move oldest active entries under memories/archive/
+        # when a new entry would exceed the active prompt budget.
+        "archive_on_overflow": False,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
@@ -2431,7 +2434,8 @@ DEFAULT_CONFIG = {
         # Timeout (seconds) for each !`cmd` snippet when inline_shell is on.
         "inline_shell_timeout": 10,
         # Run the keyword/pattern security scanner on skills the agent
-        # writes via skill_manage (create/edit/patch).  Off by default
+        # writes via skill_manage (create/edit/patch/write_file/delete/
+        # remove_file).  Off by default
         # because the agent can already execute the same code paths via
         # terminal() with no gate, so the scan adds friction (blocks
         # skills that mention risky keywords in prose) without meaningful
@@ -2453,6 +2457,17 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # Utility-based skill ranking for the system-prompt skill index.
+        # When enabled, eligible skills (those with enough attributed outcome
+        # samples) are reordered by measured utility rather than purely
+        # alphabetical.  Below-minimum-sample skills keep their existing order.
+        # Pinned, protected, and mandatory skills always stay present.
+        # Ranking is computed once at snapshot-build time and is session-stable.
+        "utility_ranking": {
+            "enabled": False,
+            "min_samples": 5,      # minimum helped+hurt samples before ranking
+            "utility_weight": 0.7, # blend: 0=lexical only, 1=utility only
+        },
     },
 
     # Curator — background skill maintenance.
@@ -2878,6 +2893,15 @@ DEFAULT_CONFIG = {
         "dispatch_stale_timeout_seconds": 14400,
     },
 
+    # Workflow graph engine dispatcher. On by default (matching
+    # kanban.dispatch_in_gateway) so deployed workflows advance unattended in
+    # long-lived gateways; set to false to run `hermes workflow tick` yourself.
+    "workflow": {
+        "dispatch_in_gateway": True,
+        "tick_interval_seconds": 30,
+        "max_executions_per_tick": 50,
+    },
+
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {
         # Execution mode:
@@ -2890,6 +2914,28 @@ DEFAULT_CONFIG = {
         # Env scrubbing (strips *_API_KEY, *_TOKEN, *_SECRET, ...) and the
         # tool whitelist apply identically in both modes.
         "mode": "project",
+        # Fresh-process execution remains the default. Set true to make calls
+        # that omit the persistent argument reuse a task-scoped kernel.
+        "persistent": False,
+        "kernel_idle_ttl": 15 * 60,
+        "timeout": 300,
+        "max_tool_calls": 50,
+        "max_stdout_bytes": 50_000,
+        "max_stderr_bytes": 10_000,
+        "sessions": {
+            "enabled": False,
+            "idle_timeout_seconds": 900,
+        },
+        "tools": {
+            "include": [],
+            "exclude": [],
+        },
+        "artifacts": {
+            "max_bytes": 10_485_760,
+            "max_total_bytes": 52_428_800,
+        },
+        # Durable spill files (already-redacted) are written here.
+        "artifact_dir": "/tmp/hermes-results",
     },
 
     # Tool Search (progressive disclosure for large tool surfaces).
@@ -2916,6 +2962,10 @@ DEFAULT_CONFIG = {
             # Percentage of context length at which "auto" mode kicks in.
             # 10 matches the Claude Code default. Range 0..100.
             "threshold_pct": 10,
+            # Absolute schema-token ceiling for "auto" mode. The effective
+            # threshold is the lower of this value and threshold_pct of context.
+            # Range 1,000..100,000.
+            "absolute_threshold_tokens": 20_000,
             # When the model calls tool_search without a ``limit`` argument,
             # how many hits to return. Range 1..max_search_limit.
             "search_default_limit": 5,
@@ -5488,7 +5538,7 @@ def check_config_version() -> Tuple[int, int]:
 _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
-    "agent", "terminal", "display", "compression", "delegation",
+    "agent", "terminal", "code_execution", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
     "sessions", "streaming", "updates", "mcp_servers",
 }
@@ -5532,7 +5582,134 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
 
     issues: List[ConfigIssue] = []
 
-    # ── custom_providers must be a list, not a dict ──────────────────────
+    # ── code_execution nested settings ───────────────────────────────────
+    code_execution = config.get("code_execution")
+    if code_execution is not None:
+        if not isinstance(code_execution, dict):
+            issues.append(ConfigIssue(
+                "error",
+                f"code_execution must be a mapping, got {type(code_execution).__name__}",
+                "Use code_execution: with mode, limits, and artifact_dir underneath it",
+            ))
+        else:
+            mode = code_execution.get("mode")
+            if "mode" in code_execution and (
+                not isinstance(mode, str) or mode.strip().lower() not in {"project", "strict"}
+            ):
+                issues.append(ConfigIssue(
+                    "error",
+                    "code_execution.mode must be 'project' or 'strict'",
+                    "Set mode: project (default) or mode: strict",
+                ))
+
+            persistent = code_execution.get("persistent")
+            if "persistent" in code_execution and not isinstance(persistent, bool):
+                issues.append(ConfigIssue(
+                    "error",
+                    "code_execution.persistent must be a boolean",
+                    "Set persistent: false (default) or persistent: true",
+                ))
+
+            numeric_fields = {
+                "timeout": ((int, float), 0),
+                "max_tool_calls": (int, 0),
+                "kernel_idle_ttl": ((int, float), 0),
+                "max_stdout_bytes": (int, 0),
+                "max_stderr_bytes": (int, 0),
+            }
+            for field, (field_types, minimum) in numeric_fields.items():
+                if field not in code_execution:
+                    continue
+                value = code_execution[field]
+                valid_type = isinstance(value, field_types) and not isinstance(value, bool)
+                if not valid_type or value <= minimum:
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"code_execution.{field} must be a number greater than {minimum}",
+                        f"Set code_execution.{field} to a positive value",
+                    ))
+
+            artifact_dir = code_execution.get("artifact_dir")
+            if "artifact_dir" in code_execution and (
+                not isinstance(artifact_dir, str) or not artifact_dir.strip()
+            ):
+                issues.append(ConfigIssue(
+                    "error",
+                    "code_execution.artifact_dir must be a non-empty string",
+                    "Set it to an absolute directory for redacted spill artifacts",
+                ))
+
+            sessions = code_execution.get("sessions")
+            if sessions is not None:
+                if not isinstance(sessions, dict):
+                    issues.append(ConfigIssue(
+                        "error",
+                        "code_execution.sessions must be a mapping",
+                        "Use sessions: with enabled and idle_timeout_seconds underneath it",
+                    ))
+                else:
+                    enabled = sessions.get("enabled")
+                    if "enabled" in sessions and not isinstance(enabled, bool):
+                        issues.append(ConfigIssue(
+                            "error",
+                            "code_execution.sessions.enabled must be a boolean",
+                            "Set sessions.enabled: false (default) or true",
+                        ))
+                    idle_timeout = sessions.get("idle_timeout_seconds")
+                    if "idle_timeout_seconds" in sessions and (
+                        not isinstance(idle_timeout, (int, float))
+                        or isinstance(idle_timeout, bool)
+                        or idle_timeout <= 0
+                    ):
+                        issues.append(ConfigIssue(
+                            "error",
+                            "code_execution.sessions.idle_timeout_seconds must be a number greater than 0",
+                            "Set a positive idle timeout in seconds",
+                        ))
+
+            tools = code_execution.get("tools")
+            if tools is not None:
+                if not isinstance(tools, dict):
+                    issues.append(ConfigIssue(
+                        "error",
+                        "code_execution.tools must be a mapping",
+                        "Use tools: with include and exclude lists underneath it",
+                    ))
+                else:
+                    for list_name in ("include", "exclude"):
+                        values = tools.get(list_name)
+                        if list_name in tools and (
+                            not isinstance(values, list)
+                            or any(not isinstance(item, str) or not item.strip() for item in values)
+                        ):
+                            issues.append(ConfigIssue(
+                                "error",
+                                f"code_execution.tools.{list_name} must be a list of strings",
+                                f"Set tools.{list_name}: [] or a list of tool names",
+                            ))
+
+            artifacts = code_execution.get("artifacts")
+            if artifacts is not None:
+                if not isinstance(artifacts, dict):
+                    issues.append(ConfigIssue(
+                        "error",
+                        "code_execution.artifacts must be a mapping",
+                        "Use artifacts: with max_bytes and max_total_bytes underneath it",
+                    ))
+                else:
+                    for field in ("max_bytes", "max_total_bytes"):
+                        value = artifacts.get(field)
+                        if field in artifacts and (
+                            not isinstance(value, int)
+                            or isinstance(value, bool)
+                            or value <= 0
+                        ):
+                            issues.append(ConfigIssue(
+                                "error",
+                                f"code_execution.artifacts.{field} must be an integer greater than 0",
+                                f"Set artifacts.{field} to a positive byte limit",
+                            ))
+
     cp = config.get("custom_providers")
     if cp is not None:
         if isinstance(cp, dict):

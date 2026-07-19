@@ -68,6 +68,7 @@ class ToolSearchConfig:
     threshold_pct: float  # 0..100 — only used when enabled == "auto"
     search_default_limit: int
     max_search_limit: int
+    absolute_threshold_tokens: int = 20_000
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -81,13 +82,16 @@ class ToolSearchConfig:
         """
         if raw is True:
             return cls(enabled="auto", threshold_pct=10.0,
-                       search_default_limit=5, max_search_limit=20)
+                       search_default_limit=5, max_search_limit=20,
+                       absolute_threshold_tokens=20_000)
         if raw is False:
             return cls(enabled="off", threshold_pct=10.0,
-                       search_default_limit=5, max_search_limit=20)
+                       search_default_limit=5, max_search_limit=20,
+                       absolute_threshold_tokens=20_000)
         if not isinstance(raw, dict):
             return cls(enabled="auto", threshold_pct=10.0,
-                       search_default_limit=5, max_search_limit=20)
+                       search_default_limit=5, max_search_limit=20,
+                       absolute_threshold_tokens=20_000)
 
         enabled_raw = str(raw.get("enabled", "auto")).strip().lower()
         if enabled_raw in ("true", "1", "yes"):
@@ -105,12 +109,16 @@ class ToolSearchConfig:
         max_search_limit = max(1, min(50, _safe_int(raw.get("max_search_limit"), 20)))
         search_default_limit = max(1, min(max_search_limit,
                                           _safe_int(raw.get("search_default_limit"), 5)))
+        absolute_threshold_tokens = max(
+            1_000, min(100_000, _safe_int(raw.get("absolute_threshold_tokens"), 20_000))
+        )
 
         return cls(
             enabled=enabled,
             threshold_pct=threshold_pct,
             search_default_limit=search_default_limit,
             max_search_limit=max_search_limit,
+            absolute_threshold_tokens=absolute_threshold_tokens,
         )
 
 
@@ -241,7 +249,8 @@ def should_activate(
     ``"off"`` skips unconditionally. ``"on"`` activates unconditionally
     (as long as there is at least one deferrable tool — there's no point
     swapping a no-op). ``"auto"`` activates when the deferrable schemas
-    would consume ``threshold_pct`` of context or more.
+    would consume ``threshold_pct`` of context or more, capped by the
+    absolute threshold.
     """
     if config.enabled == "off":
         return False
@@ -250,12 +259,18 @@ def should_activate(
     if config.enabled == "on":
         return True
     # auto
+    return deferrable_tokens >= _activation_threshold_tokens(config, context_length)
+
+
+def _activation_threshold_tokens(
+    config: ToolSearchConfig, context_length: Optional[int]
+) -> int:
     if not context_length or context_length <= 0:
-        # Without a known context size, fall back to a fixed 20K-token cutoff
-        # — the cliff above which Anthropic and OpenAI both saw quality drops.
-        return deferrable_tokens >= 20_000
-    threshold_tokens = int(context_length * (config.threshold_pct / 100.0))
-    return deferrable_tokens >= threshold_tokens
+        return config.absolute_threshold_tokens
+    return min(
+        int(context_length * (config.threshold_pct / 100.0)),
+        config.absolute_threshold_tokens,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -562,12 +577,12 @@ def assemble_tool_defs(
             activated=False,
             deferred_count=len(deferrable),
             deferred_tokens=deferrable_tokens,
-            threshold_tokens=int((context_length or 0) * (config.threshold_pct / 100.0)),
+            threshold_tokens=_activation_threshold_tokens(config, context_length),
         )
 
     bridge = bridge_tool_schemas(len(deferrable))
     result = visible + bridge
-    threshold_tokens = int((context_length or 0) * (config.threshold_pct / 100.0))
+    threshold_tokens = _activation_threshold_tokens(config, context_length)
 
     logger.info(
         "tool_search activated: %d core/visible tools kept, %d deferred (~%d tokens, threshold ~%d)",
@@ -657,6 +672,15 @@ def dispatch_tool_describe(args: Dict[str, Any],
     }, ensure_ascii=False)
 
 
+def scoped_tool_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
+    """Return every tool name in a pre-assembly session scope."""
+    return frozenset(
+        name
+        for td in tool_defs
+        if (name := (td.get("function") or td).get("name", ""))
+    )
+
+
 def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     """Return the set of deferrable tool names present in ``tool_defs``.
 
@@ -669,12 +693,10 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     ``tool_executor`` unwrap so a restricted-toolset session can never invoke
     an out-of-scope tool via the bridge.
     """
-    names: set[str] = set()
-    for td in tool_defs:
-        name = (td.get("function") or {}).get("name", "")
-        if name and is_deferrable_tool_name(name):
-            names.add(name)
-    return frozenset(names)
+    return frozenset(
+        name for name in scoped_tool_names(tool_defs)
+        if is_deferrable_tool_name(name)
+    )
 
 
 def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
@@ -731,5 +753,6 @@ __all__ = [
     "dispatch_tool_search",
     "dispatch_tool_describe",
     "resolve_underlying_call",
+    "scoped_tool_names",
     "scoped_deferrable_names",
 ]
