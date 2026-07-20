@@ -44,7 +44,12 @@ export function setupGracefulExit({
     shuttingDown = true
 
     if (signal) {
-      onSignal?.(signal)
+      try {
+        onSignal?.(signal)
+      } catch {
+        // Signal callback (typically stderr.write) failed — the stream is
+        // broken/closed.  Suppress so cleanup and exit still proceed.
+      }
     }
 
     setTimeout(() => process.exit(code), failsafeMs).unref?.()
@@ -62,6 +67,19 @@ export function setupGracefulExit({
     })
   }
 
-  process.on('uncaughtException', err => onError?.('uncaughtException', err))
-  process.on('unhandledRejection', reason => onError?.('unhandledRejection', reason))
+  process.on('uncaughtException', err => {
+    try {
+      onError?.('uncaughtException', err)
+    } catch {
+      // Error reporter itself failed (typically stderr.write EIO).  Suppress
+      // to prevent a cascading uncaught exception from the handler.
+    }
+  })
+  process.on('unhandledRejection', reason => {
+    try {
+      onError?.('unhandledRejection', reason)
+    } catch {
+      // Same guard as uncaughtException above.
+    }
+  })
 }

@@ -331,12 +331,21 @@ def _run_agent_tool_execution_middleware(
         return execute(observed_args)
 
     from hermes_cli.middleware import run_tool_execution_middleware
+    from model_tools import registry
 
+    operation_metadata = registry.get_operation_metadata(function_name)
     result = run_tool_execution_middleware(
         function_name,
         function_args,
         _execute,
         original_args=function_args,
+        operation_metadata=operation_metadata,
+        operation_key_factory=lambda: registry.operation_key(
+            function_name,
+            function_args,
+            task_id=effective_task_id or "",
+            tool_call_id=tool_call_id or "",
+        ),
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",
         tool_call_id=tool_call_id or "",
@@ -659,10 +668,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
+            result_preview = _multimodal_text_summary(result)
             if is_error:
-                logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
+                logger.info("tool %s failed (%.2fs): %s", function_name, duration, result_preview[:200])
             else:
-                logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+                logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result_preview))
             results[index] = (function_name, function_args, result, duration, is_error, False, middleware_trace)
         finally:
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
@@ -694,6 +704,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         futures = []
         future_to_index = {}
         timed_out_indices: set[int] = set()
+        cancelled_indices: set[int] = set()
         timeout_s = _resolve_concurrent_tool_timeout()
         deadline = time.monotonic() + timeout_s if timeout_s is not None else None
         if runnable_calls:
@@ -815,7 +826,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                 force=True,
                             )
                         for f in not_done:
-                            f.cancel()
+                            if f.cancel():
+                                index = future_to_index.get(f)
+                                if index is not None:
+                                    cancelled_indices.add(index)
                         # Give already-running tools a moment to notice the
                         # per-thread interrupt signal and exit gracefully.
                         concurrent.futures.wait(not_done, timeout=3.0)
@@ -843,6 +857,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     wait=not abandon_executor,
                     cancel_futures=abandon_executor,
                 )
+        cancelled_indices.update(
+            future_to_index[f]
+            for f in futures
+            if f.cancelled() and f in future_to_index
+        )
     finally:
         if spinner:
             # Build a summary message for the spinner stop
@@ -859,9 +878,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # loop. Prefer that real result over a fabricated timeout message — the
         # tool genuinely succeeded, just slightly late.
         effect_disposition = None
-        if i in timed_out_indices and r is None:
+        if i in timed_out_indices and i not in cancelled_indices and r is None:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
-            function_result = f"Error executing tool '{name}': timed out after {suffix}"
+            function_result = (
+                f"Error executing tool '{name}': timed out after {suffix}; "
+                "[UNRESOLVED] the operation may have executed and its effect is UNKNOWN. "
+                "Do not retry blindly; inspect current state before retrying."
+            )
             effect_disposition = "unknown"
             _emit_terminal_post_tool_call(
                 agent,
@@ -878,8 +901,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tool_duration = float(timeout_s or 0.0)
         elif r is None:
             # Tool was cancelled (interrupt) or thread didn't return
-            if agent._interrupt_requested:
-                function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
+            if i in cancelled_indices:
+                cancelled_by_timeout = i in timed_out_indices
+                cancellation_reason = "timeout" if cancelled_by_timeout else "user interrupt"
+                function_result = f"[Tool execution cancelled — {name} was skipped due to {cancellation_reason}]"
+                effect_disposition = "none"
                 _emit_terminal_post_tool_call(
                     agent,
                     function_name=name,
@@ -888,8 +914,27 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tc, "id", "") or "",
                     status="cancelled",
-                    error_type="keyboard_interrupt",
-                    error_message="Tool execution cancelled by user interrupt",
+                    error_type="tool_timeout_cancelled" if cancelled_by_timeout else "keyboard_interrupt",
+                    error_message=f"Tool execution cancelled by {cancellation_reason}",
+                    middleware_trace=list(middleware_trace),
+                )
+            elif agent._interrupt_requested:
+                function_result = (
+                    f"[UNRESOLVED] Tool execution for '{name}' was interrupted before a result "
+                    "was observed. The operation may have executed and its effect is UNKNOWN. "
+                    "Do not retry blindly; inspect current state before retrying."
+                )
+                effect_disposition = "unknown"
+                _emit_terminal_post_tool_call(
+                    agent,
+                    function_name=name,
+                    function_args=args,
+                    result=function_result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(tc, "id", "") or "",
+                    status="unresolved",
+                    error_type="tool_interrupt_unresolved",
+                    error_message=function_result,
                     middleware_trace=list(middleware_trace),
                 )
             else:

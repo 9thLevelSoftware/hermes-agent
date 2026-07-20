@@ -80,6 +80,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "provider_override": t.provider_override,
+        "model_override": t.model_override,
     }
 
 
@@ -410,7 +412,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Sort order for listed tasks (default: priority)",
     )
     p_list.add_argument(
+        "--workflow",
         "--workflow-template-id",
+        dest="workflow_template_id",
         default=None,
         metavar="ID",
         help="Restrict to tasks with this workflow_template_id",
@@ -1537,10 +1541,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +
           (f" @ {task.workspace_path}" if task.workspace_path else ""))
+    if task.workflow_template_id:
+        print(f"  workflow:  {task.workflow_template_id}")
+    if task.current_step_key:
+        print(f"  step:      {task.current_step_key}")
     if task.branch_name:
         print(f"  branch:    {task.branch_name}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
+    if task.provider_override:
+        print(f"  provider:  {task.provider_override}")
     if task.model_override:
         print(f"  model:     {task.model_override}")
     # Effective retry threshold. Show the per-task override if set,

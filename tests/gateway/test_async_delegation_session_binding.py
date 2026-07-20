@@ -28,6 +28,7 @@ def _seed_record(delegation_id, session_key="", parent_session_id="", status="ru
     with ad._records_lock:
         ad._records[delegation_id] = {
             "delegation_id": delegation_id,
+            "_home": str(ad._records_path().parent),
             "status": status,
             "session_key": session_key,
             "parent_session_id": parent_session_id,

@@ -8,6 +8,7 @@ formatting, capacity rejection, and crash handling.
 import json
 import os
 import queue
+from collections import deque
 import subprocess
 import sys
 import threading
@@ -121,6 +122,281 @@ def test_async_executor_workers_are_daemon_threads():
     assert _drain_one() is not None
 
 
+def test_running_record_recovers_as_interrupted_after_restart(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    persisted = {
+        "delegation_id": "deleg_restart",
+        "owner_pid": 99_999_999,
+        "goal": "finish the migration",
+        "context": "continue from the saved child transcript",
+        "toolsets": ["file"],
+        "role": "leaf",
+        "model": "m",
+        "session_key": "session",
+        "parent_session_id": "parent",
+        "child_session_ids": ["child-session-1"],
+        "status": "running",
+        "dispatched_at": time.time() - 30,
+        "completed_at": None,
+    }
+    records_path.write_text(
+        json.dumps({"records": [persisted]}), encoding="utf-8"
+    )
+    with ad._records_lock:
+        ad._records.clear()
+
+    recovered = ad.list_async_delegations()
+
+    assert len(recovered) == 1
+    assert recovered[0]["delegation_id"] == "deleg_restart"
+    assert recovered[0]["status"] == "interrupted"
+    assert recovered[0]["goal"] == "finish the migration"
+    assert recovered[0]["context"] == "continue from the saved child transcript"
+    assert recovered[0]["child_session_ids"] == ["child-session-1"]
+    assert "restart" in recovered[0]["error"].lower()
+
+
+def test_live_foreign_owner_is_not_marked_interrupted(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    records_path.write_text(
+        json.dumps({"records": [{
+            "delegation_id": "foreign-live",
+            "owner_pid": os.getpid(),
+            "goal": "still running",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }]}),
+        encoding="utf-8",
+    )
+
+    records = ad.list_async_delegations()
+
+    assert records[0]["status"] == "running"
+    assert "error" not in records[0]
+
+
+def test_pid_probe_reuses_cross_platform_active_session_helper(monkeypatch):
+    seen = {}
+
+    def safe_probe(pid, process_start_time=None):
+        seen["args"] = (pid, process_start_time)
+        return True
+
+    monkeypatch.setattr("hermes_cli.active_sessions._pid_alive", safe_probe)
+
+    assert ad._pid_alive(12345, 678.9) is True
+    assert seen["args"] == (12345, 678.9)
+
+
+def test_reused_owner_pid_is_recovered_as_interrupted(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    monkeypatch.setattr(
+        ad,
+        "_pid_alive",
+        lambda pid, process_start_time=None: process_start_time == 222.0,
+    )
+    records_path.write_text(
+        json.dumps({"records": [{
+            "delegation_id": "reused-pid",
+            "owner_pid": 12345,
+            "owner_process_start_time": 111.0,
+            "goal": "orphaned",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }]}),
+        encoding="utf-8",
+    )
+
+    records = ad.list_async_delegations()
+
+    assert records[0]["status"] == "interrupted"
+
+
+def test_dispatch_merges_foreign_process_records(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    monkeypatch.setattr(
+        ad,
+        "_pid_alive",
+        lambda pid, process_start_time=None: int(pid) in {12345, os.getpid()},
+    )
+    records_path.write_text(
+        json.dumps({"records": [{
+            "delegation_id": "foreign-live",
+            "owner_pid": 12345,
+            "goal": "other process",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }]}),
+        encoding="utf-8",
+    )
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed"}
+
+    result = ad.dispatch_async_delegation(
+        goal="local work",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="local",
+        runner=runner,
+    )
+
+    persisted = json.loads(records_path.read_text(encoding="utf-8"))["records"]
+    assert {record["delegation_id"] for record in persisted} == {
+        "foreign-live", result["delegation_id"]
+    }
+    gate.set()
+    assert _drain_one() is not None
+
+
+def test_locked_capacity_recheck_rejects_foreign_process_race(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    monkeypatch.setattr(ad, "_load_records_locked", lambda: None)
+    monkeypatch.setattr(ad, "_pid_alive", lambda *args: True)
+    records_path.write_text(
+        json.dumps({"records": [{
+            "delegation_id": "foreign-live",
+            "owner_pid": 12345,
+            "owner_process_start_time": 111.0,
+            "goal": "other process",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }]}),
+        encoding="utf-8",
+    )
+    called = False
+
+    def runner():
+        nonlocal called
+        called = True
+        return {"status": "completed"}
+
+    result = ad.dispatch_async_delegation(
+        goal="racing local work",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="local",
+        runner=runner,
+        max_async_children=1,
+    )
+
+    assert result["status"] == "rejected"
+    assert result["reason"] == "capacity"
+    assert "capacity" in result["error"].lower()
+    assert called is False
+
+
+def test_profile_switch_does_not_drop_another_profiles_running_record(tmp_path, monkeypatch):
+    current = {"path": tmp_path / "profile-a" / "delegations.json"}
+    monkeypatch.setattr(ad, "_records_path", lambda: current["path"])
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    result = ad.dispatch_async_delegation(
+        goal="profile A work",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="profile-a",
+        runner=runner,
+    )
+    delegation_id = result["delegation_id"]
+
+    current["path"] = tmp_path / "profile-b" / "delegations.json"
+    assert ad.list_async_delegations() == []
+    with ad._records_lock:
+        assert delegation_id in ad._records
+
+    gate.set()
+    event = _drain_one()
+    assert event is not None
+    assert event["delegation_id"] == delegation_id
+
+    current["path"] = tmp_path / "profile-a" / "delegations.json"
+    restored = ad.list_async_delegations()
+    assert restored[0]["status"] == "completed"
+
+
+def test_malformed_records_collection_loads_as_empty(tmp_path, monkeypatch):
+    records_path = tmp_path / "delegations.json"
+    records_path.write_text('{"records": null}', encoding="utf-8")
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    with ad._records_lock:
+        ad._records.clear()
+
+    assert ad.list_async_delegations() == []
+
+
+def test_persistence_failure_rejects_background_dispatch(monkeypatch):
+    called = False
+
+    def runner():
+        nonlocal called
+        called = True
+        return {"status": "completed"}
+
+    monkeypatch.setattr(ad, "_reserve_record_locked", lambda *args: "error")
+    result = ad.dispatch_async_delegation(
+        goal="must be durable",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+    )
+
+    assert result["status"] == "rejected"
+    assert result["reason"] == "persistence"
+    assert "persist" in result["error"].lower()
+    assert called is False
+
+
+def test_final_persistence_failure_does_not_resurrect_running_record(
+    tmp_path, monkeypatch
+):
+    records_path = tmp_path / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: records_path)
+    monkeypatch.setattr(ad, "_persist_records_locked", lambda *args, **kwargs: False)
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    result = ad.dispatch_async_delegation(
+        goal="finish once",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="",
+        runner=runner,
+    )
+    gate.set()
+    assert _drain_one() is not None
+
+    records = ad.list_async_delegations()
+    record = next(item for item in records if item["delegation_id"] == result["delegation_id"])
+    assert record["status"] == "completed"
+    assert ad.active_count() == 0
+
+
 def test_completion_event_lands_on_shared_queue_with_session_key():
     def runner():
         return {"status": "completed", "summary": "the result",
@@ -191,6 +467,57 @@ def test_dispatch_rejected_at_capacity():
     assert r3["status"] == "rejected"
     assert "capacity reached" in r3["error"]
     ev.set()
+
+
+def test_crashed_runner_produces_error_completion():
+    def boom():
+        raise RuntimeError("subagent exploded")
+
+    r = ad.dispatch_async_delegation(
+        goal="risky", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=boom, max_async_children=3,
+    )
+    assert r["status"] == "dispatched"
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["status"] == "error"
+    text = format_process_notification(evt)
+    assert text is not None
+    assert "did not complete successfully" in text
+    assert "subagent exploded" in text
+
+
+def test_interrupts_are_scoped_to_active_profile(tmp_path, monkeypatch):
+    current_path = tmp_path / "profile-b" / "delegations.json"
+    monkeypatch.setattr(ad, "_records_path", lambda: current_path)
+    interrupted = {"a": 0, "b": 0}
+    with ad._records_lock:
+        ad._records.update({
+            "deleg-a": {
+                "delegation_id": "deleg-a",
+                "_home": str((tmp_path / "profile-a")),
+                "status": "running",
+                "session_key": "same-session",
+                "interrupt_fn": lambda: interrupted.__setitem__(
+                    "a", interrupted["a"] + 1
+                ),
+            },
+            "deleg-b": {
+                "delegation_id": "deleg-b",
+                "_home": str(current_path.parent),
+                "status": "running",
+                "session_key": "same-session",
+                "interrupt_fn": lambda: interrupted.__setitem__(
+                    "b", interrupted["b"] + 1
+                ),
+            },
+        })
+
+    assert ad.interrupt_for_session(session_key="same-session") == 1
+    assert interrupted == {"a": 0, "b": 1}
+    assert ad.interrupt_all(reason="test") == 1
+    assert interrupted == {"a": 0, "b": 2}
+
 
 
 def test_interrupt_all_signals_running_children():
@@ -439,6 +766,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
+    fake_child.session_id = "child-session-1"
 
     gate = threading.Event()
 
@@ -473,6 +801,11 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     # blocked on the closed gate, so no completion event exists yet.
     assert process_registry.completion_queue.empty()
     assert ad.active_count() == 1  # one background batch unit, not finished
+    record = next(
+        item for item in ad.list_async_delegations()
+        if item["delegation_id"] == parsed["delegation_id"]
+    )
+    assert record["child_session_ids"] == ["child-session-1"]
 
     gate.set()
     evt = _drain_one()
@@ -480,11 +813,75 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert evt["type"] == "async_delegation"
     # Single task rides the batch path → carries a 1-item results list.
     assert evt.get("is_batch") is True
+    assert evt["child_session_ids"] == ["child-session-1"]
     assert len(evt["results"]) == 1
     assert evt["results"][0]["summary"] == "done: the real task"
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+
+
+def test_delegate_task_persistence_rejection_releases_unstarted_child(monkeypatch):
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "sess"
+    parent._current_turn_id = "turn-1"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+    fake_child._subagent_id = "s1"
+    fake_child._delegate_progress_callback = MagicMock()
+    fake_child.session_id = "child-session-1"
+    child_ran = False
+    stop_hook = MagicMock()
+
+    def build_child(**kwargs):
+        parent._active_children.append(fake_child)
+        return fake_child
+
+    def run_child(*args, **kwargs):
+        nonlocal child_ran
+        child_ran = True
+        return {"status": "completed"}
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
+    monkeypatch.setattr(dt, "_run_single_child", run_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", stop_hook)
+    monkeypatch.setattr(
+        ad,
+        "dispatch_async_delegation_batch",
+        lambda **kwargs: {
+            "status": "rejected",
+            "reason": "persistence",
+            "error": "disk unavailable",
+        },
+    )
+
+    parsed = json.loads(dt.delegate_task(
+        goal="the real task", background=True, parent_agent=parent
+    ))
+
+    assert parsed["status"] == "rejected"
+    assert parsed["reason"] == "persistence"
+    assert child_ran is False
+    assert fake_child not in parent._active_children
+    fake_child.close.assert_called_once_with()
+    completion_call = fake_child._delegate_progress_callback.call_args
+    assert completion_call.args[0] == "subagent.complete"
+    assert completion_call.kwargs["status"] == "failed"
+    stop_call = stop_hook.call_args
+    assert stop_call.args[0] == "subagent_stop"
+    assert stop_call.kwargs["child_status"] == "error"
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
@@ -721,6 +1118,7 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
+    fake_child.session_id = "child-session-1"
 
     gate = threading.Event()
 
@@ -871,5 +1269,692 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
+
+
+# ---------------------------------------------------------------------------
+# Task 8 — durable delegation completion & acknowledgement
+# ---------------------------------------------------------------------------
+# Completion of a background delegation must persist to state.db via
+# OperationJournal BEFORE the completion event is enqueued, so a crash
+# between persist and enqueue cannot lose the result; consumers must
+# acknowledge after successful injection so a redelivery on restart
+# never double-fires.
+
+import importlib as _importlib_t8
+import json as _json_t8
+import sys as _sys_t8
+from pathlib import Path as _Path_t8
+from unittest.mock import MagicMock as _MM_t8, patch as _patch_t8
+
+import pytest as _pytest_t8
+
+from agent.operation_journal import OperationJournal as _OpJournal_t8
+from hermes_state import SessionDB as _SessionDB_t8
+
+
+@_pytest_t8.fixture()
+def _journal_db(tmp_path):
+    db = _SessionDB_t8(db_path=tmp_path / "state.db")
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _open_journal_db(path: _Path_t8) -> _SessionDB_t8:
+    """Return a SECOND SessionDB instance against the same path."""
+    return _SessionDB_t8(db_path=path)
+
+
+def _make_cli_for_drain_test():
+    """HermesCLI instance with prompt_toolkit stubbed — only enough to exercise
+    the idle notification drain path. Mirrors tests/cli/test_cli_interrupt_ack_race.py."""
+    _clean_config = {
+        "model": {
+            "default": "anthropic/claude-opus-4.6",
+            "base_url": "https://openrouter.ai/api/v1",
+            "provider": "auto",
+        },
+        "display": {"compact": False, "tool_progress": "all"},
+        "agent": {},
+        "terminal": {"env_type": "local"},
+    }
+    clean_env = {"LLM_MODEL": "", "HERMES_MAX_ITERATIONS": ""}
+    prompt_toolkit_stubs = {
+        "prompt_toolkit": _MM_t8(),
+        "prompt_toolkit.history": _MM_t8(),
+        "prompt_toolkit.styles": _MM_t8(),
+        "prompt_toolkit.patch_stdout": _MM_t8(),
+        "prompt_toolkit.application": _MM_t8(),
+        "prompt_toolkit.layout": _MM_t8(),
+        "prompt_toolkit.layout.processors": _MM_t8(),
+        "prompt_toolkit.filters": _MM_t8(),
+        "prompt_toolkit.layout.dimension": _MM_t8(),
+        "prompt_toolkit.layout.menus": _MM_t8(),
+        "prompt_toolkit.widgets": _MM_t8(),
+        "prompt_toolkit.key_binding": _MM_t8(),
+        "prompt_toolkit.completion": _MM_t8(),
+        "prompt_toolkit.formatted_text": _MM_t8(),
+        "prompt_toolkit.auto_suggest": _MM_t8(),
+    }
+    with _patch_t8.dict(_sys_t8.modules, prompt_toolkit_stubs), _patch_t8.dict(
+        "os.environ", clean_env, clear=False
+    ):
+        import cli as _cli_mod_t8
+
+        _cli_mod_t8 = _importlib_t8.reload(_cli_mod_t8)
+        with _patch_t8.object(_cli_mod_t8, "get_tool_definitions", return_value=[]), _patch_t8.dict(
+            _cli_mod_t8.__dict__, {"CLI_CONFIG": _clean_config}
+        ):
+            return _cli_mod_t8.HermesCLI()
+
+
+def test_dispatch_creates_pending_record_and_completion_persists_before_queue(_journal_db):
+    """At dispatch, OperationJournal sees a pending 'async_delegation' row.
+    On completion, the row reaches a terminal state (confirmed/failed/...)
+    AND the event is enqueued — never the other way around."""
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    # Replace _push_completion_event with a publisher that asserts the
+    # terminal row is already persisted before the queue sees the event.
+    ad._completion_publisher_spy = []
+    original_push = ad._push_completion_event
+
+    def _spy_push(evt):
+        # By the time this fires, the journal must already hold the
+        # terminal row for the same delegation_id.
+        rec = journal.get(evt["delegation_id"])
+        assert rec is not None, (
+            f"queue published evt {evt['delegation_id']!r} BEFORE "
+            "terminal transition was persisted"
+        )
+        assert rec.state in {"confirmed", "failed", "cancelled", "unknown"}, (
+            f"unexpected terminal state {rec.state!r} for {evt['delegation_id']!r}"
+        )
+        # Mirror the normal put so consumer tests downstream still see it.
+        from tools.process_registry import process_registry
+        process_registry.completion_queue.put(dict(evt))
+        ad._completion_publisher_spy.append((rec.state, rec.effect_disposition, evt["delegation_id"]))
+
+    ad._push_completion_event = _spy_push
+    try:
+        def runner():
+            return {"status": "completed", "summary": "ok",
+                    "api_calls": 1, "duration_seconds": 0.1, "model": "m"}
+
+        res = ad.dispatch_async_delegation(
+            goal="durable", context=None, toolsets=None, role="leaf", model="m",
+            session_key="", runner=runner, max_async_children=3,
+        )
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not ad._completion_publisher_spy:
+            time.sleep(0.02)
+
+        assert res["status"] == "dispatched"
+        assert len(ad._completion_publisher_spy) == 1
+        state, effect, did = ad._completion_publisher_spy[0]
+        assert state == "confirmed"
+        assert effect == "none"
+        assert did == res["delegation_id"]
+    finally:
+        ad._push_completion_event = original_push
+
+
+def test_completed_persists_to_db_with_bounded_event_dict(_journal_db):
+    """On completion, result_json holds the bounded event dict with the
+    fields the consumer needs (summary, status, error, dispatched_at, etc.)"""
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    def runner():
+        return {"status": "completed", "summary": "the answer",
+                "error": None, "api_calls": 4, "duration_seconds": 1.2,
+                "model": "m", "exit_reason": "completed"}
+
+    res = ad.dispatch_async_delegation(
+        goal="bg", context=None, toolsets=None, role="leaf", model="m",
+        session_key="agent:main:telegram:dm:1",
+        parent_session_id="parent-1",
+        runner=runner, max_async_children=3,
+    )
+    _drain_one()
+
+    record = journal.get(res["delegation_id"])
+    assert record is not None
+    assert record.state == "confirmed"
+    assert record.effect_disposition == "none"
+    assert record.kind == "async_delegation"
+    payload = _json_t8.loads(record.result_json)
+    assert payload["status"] == "completed"
+    assert payload["summary"] == "the answer"
+    assert payload["session_key"] == "agent:main:telegram:dm:1"
+    assert payload["parent_session_id"] == "parent-1"
+    assert payload["model"] == "m"
+
+
+def test_failed_completion_persists_with_failed_state(_journal_db):
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    def boom():
+        raise RuntimeError("kaboom")
+
+    res = ad.dispatch_async_delegation(
+        goal="x", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=boom, max_async_children=3,
+    )
+    _drain_one()
+
+    record = journal.get(res["delegation_id"])
+    assert record is not None
+    assert record.state == "failed"
+    assert record.effect_disposition == "none"
+    assert "kaboom" in (record.error or "")
+
+
+def test_interrupted_completion_persists_with_cancelled_state(_journal_db):
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    ev = threading.Event()
+
+    def blocker():
+        ev.wait(timeout=5)
+        return {"status": "interrupted", "summary": None,
+                "error": "cancelled"}
+
+    def interrupt_fn():
+        ev.set()
+
+    res = ad.dispatch_async_delegation(
+        goal="block", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=blocker, interrupt_fn=interrupt_fn,
+        max_async_children=3,
+    )
+    ad.interrupt_all(reason="t")
+    _drain_one()
+
+    record = journal.get(res["delegation_id"])
+    assert record is not None
+    assert record.state == "cancelled"
+    assert record.effect_disposition == "none"
+
+
+def test_unknown_status_persists_with_unknown_state(_journal_db):
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    def runner():
+        return {"status": "weird", "summary": "?"}
+
+    res = ad.dispatch_async_delegation(
+        goal="weird", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, max_async_children=3,
+    )
+    _drain_one()
+
+    record = journal.get(res["delegation_id"])
+    assert record is not None
+    assert record.state == "unknown"
+    assert record.effect_disposition == "unknown"
+
+
+def test_acknowledge_marks_record_and_is_idempotent(_journal_db):
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    def runner():
+        return {"status": "completed", "summary": "ok"}
+
+    res = ad.dispatch_async_delegation(
+        goal="ack", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, max_async_children=3,
+    )
+    _drain_one()
+    assert journal.get(res["delegation_id"]).acknowledged_at is None
+
+    assert ad.acknowledge_async_delegation(res["delegation_id"]) is True
+    assert ad.acknowledge_async_delegation(res["delegation_id"]) is False
+    assert ad.acknowledge_async_delegation(res["delegation_id"]) is False
+    assert journal.get(res["delegation_id"]).acknowledged_at is not None
+
+
+def test_acknowledge_pending_or_unknown_id_returns_false(_journal_db):
+    """If the row hasn't reached a terminal state yet (still pending/running),
+    acknowledge is a no-op and returns False. Once terminal, ack is True."""
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    # Block the worker long enough for the test thread to observe pre-terminal state.
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "x"}
+
+    res = ad.dispatch_async_delegation(
+        goal="pending", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, max_async_children=3,
+    )
+    # Worker is blocked on gate → row is still "running", not terminal.
+    # acknowledge must return False (only terminal rows can be acked).
+    assert ad.acknowledge_async_delegation(res["delegation_id"]) is False
+
+    # Let the worker finish + terminal transition land.
+    gate.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        rec = journal.get(res["delegation_id"])
+        if rec and rec.state in {"confirmed", "failed", "cancelled", "unknown"}:
+            break
+        time.sleep(0.02)
+
+    # After terminal transition, can be acknowledged.
+    assert ad.acknowledge_async_delegation(res["delegation_id"]) is True
+
+
+def test_restore_unacknowledged_returns_count_and_enqueues(tmp_path):
+    """A fresh process opening the same db must see terminal unacked
+    delegations as 'to enqueue' — idem-potent within process scope."""
+    db_path = tmp_path / "state.db"
+
+    # Process 1: dispatch + finish a delegation
+    db1 = _SessionDB_t8(db_path=db_path)
+    journal1 = _OpJournal_t8(db1)
+    ad._set_journal_for_tests(journal1)
+
+    def runner():
+        return {"status": "completed", "summary": "delivered"}
+
+    res = ad.dispatch_async_delegation(
+        goal="persist", context=None, toolsets=None, role="leaf", model="m",
+        session_key="agent:main:telegram:dm:7",
+        parent_session_id="p-7",
+        runner=runner, max_async_children=3,
+    )
+    _drain_one()
+    db1.close()
+
+    # Process 2 — fresh SessionDB instance, fresh journal
+    db2 = _SessionDB_t8(db_path=db_path)
+    journal2 = _OpJournal_t8(db2)
+    ad._set_journal_for_tests(journal2)
+
+    captured = []
+
+    def _capture_put(evt):
+        captured.append(evt)
+
+    # Restore must return the count and requeue events
+    enqueued = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue, _capture_put,
+    )
+    assert enqueued == 1
+    assert len(captured) == 1
+    evt = captured[0]
+    assert evt["type"] == "async_delegation"
+    assert evt["delegation_id"] == res["delegation_id"]
+    assert evt["session_key"] == "agent:main:telegram:dm:7"
+    assert evt["status"] == "completed"
+    assert evt["summary"] == "delivered"
+
+    # Idempotent within process: a second restore within the same process
+    # in the same in-memory cache must NOT double-enqueue.
+    enqueued2 = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue, _capture_put,
+    )
+    assert enqueued2 == 0
+    assert len(captured) == 1
+
+    # ...but a fresh process (new restore cache) DOES re-emit on restart.
+    # ``_reset_for_tests()`` simulates process death: it clears the per-process
+    # restored-ids cache + closes the prior journal handle, the same way a real
+    # process boundary would.
+    db2.close()
+    ad._reset_for_tests()
+    db3 = _SessionDB_t8(db_path=db_path)
+    journal3 = _OpJournal_t8(db3)
+    ad._set_journal_for_tests(journal3)
+    captured2 = []
+    enqueued3 = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue,
+        lambda e: captured2.append(e),
+    )
+    assert enqueued3 == 1
+    assert len(captured2) == 1
+    db3.close()
+
+
+def test_acknowledge_via_restore_loop_skips_already_acked(_journal_db):
+    """Once ack'd, restore_unacknowledged_delegations() must not re-enqueue
+    on a subsequent call (with a fresh in-process cache that still loads
+    only terminal+unacknowledged rows)."""
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    def runner():
+        return {"status": "completed", "summary": "ok"}
+
+    res = ad.dispatch_async_delegation(
+        goal="ack-then-restore", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=runner, max_async_children=3,
+    )
+    _drain_one()
+    ad.acknowledge_async_delegation(res["delegation_id"])
+
+    captured = []
+    enqueued = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue, lambda e: captured.append(e),
+    )
+    assert enqueued == 0
+    assert captured == []
+
+
+def test_durable_journal_fail_open_when_db_unavailable(tmp_path, monkeypatch):
+    """If state.db can't be opened, dispatch must still work — fail-open
+    by logging and proceeding without persistence."""
+    from tools import async_delegation as ad_mod
+
+    # Force the journal helper to raise.
+    class _BrokenDB:
+        @staticmethod
+        def _execute_write(_fn):
+            raise RuntimeError("db corrupt")
+
+    monkeypatch.setattr(ad_mod, "_open_journal", lambda: (_OpJournal_t8(_BrokenDB())))
+
+    def runner():
+        return {"status": "completed", "summary": "yes"}
+
+    res = ad_mod.dispatch_async_delegation(
+        goal="no-db", context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, max_async_children=3,
+    )
+    assert res["status"] == "dispatched"
+    evt = _drain_one()
+    assert evt is not None
+    assert evt["status"] == "completed"
+    # And acknowledge is a no-op (returns False).
+    assert ad_mod.acknowledge_async_delegation("nonexistent") is False
+
+
+def test_batch_dispatch_also_persists_as_one_record(_journal_db):
+    journal = _OpJournal_t8(_journal_db)
+    ad._set_journal_for_tests(journal)
+
+    def runner():
+        return {"status": "completed", "summary": None,
+                "results": [
+                    {"status": "completed", "summary": "a"},
+                    {"status": "completed", "summary": "b"},
+                ],
+                "total_duration_seconds": 1.0}
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["a", "b"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="", runner=runner, max_async_children=3,
+    )
+    _drain_one()
+
+    record = journal.get(res["delegation_id"])
+    assert record is not None
+    assert record.state == "confirmed"
+    assert record.kind == "async_delegation"
+
+
+def test_startup_reconcile_recovers_in_flight_after_process_restart(tmp_path):
+    """Simulate a hard crash: process1 creates pending+running rows, then
+    dies. process2 startup must reconcile them to 'unknown' on creation."""
+    db_path = tmp_path / "state.db"
+    db1 = _SessionDB_t8(db_path=db_path)
+    journal1 = _OpJournal_t8(db1)
+
+    journal1.create(operation_id="inflight-1", kind="async_delegation")
+    journal1.create(operation_id="inflight-2", kind="async_delegation")
+    journal1.transition(
+        "inflight-1",
+        from_states={"pending"},
+        to_state="running",
+        effect_disposition="none",
+    )
+    # 'inflight-2' stays in pending.
+    db1.close()
+
+    db2 = _SessionDB_t8(db_path=db_path)
+    journal2 = _OpJournal_t8(db2)
+    moved = journal2.reconcile_after_restart()
+    assert moved == 1
+    assert journal2.get("inflight-1").state == "unknown"
+    assert journal2.get("inflight-2").state == "pending"  # pending is NOT in-flight
+    db2.close()
+
+
+def test_startup_reconcile_then_restore_emits_orphans_only(tmp_path):
+    db_path = tmp_path / "state.db"
+    db1 = _SessionDB_t8(db_path=db_path)
+    journal1 = _OpJournal_t8(db1)
+
+    # An 'orphaned' terminal row: confirmed, never acknowledged.
+    journal1.create(operation_id="orphan-1", kind="async_delegation")
+    journal1.transition(
+        "orphan-1",
+        from_states={"pending"},
+        to_state="running",
+        effect_disposition="none",
+    )
+    journal1.transition(
+        "orphan-1",
+        from_states={"running"},
+        to_state="confirmed",
+        effect_disposition="none",
+        result={"status": "completed", "summary": "save me"},
+    )
+
+    # An already-acked row: must not re-emit.
+    journal1.create(operation_id="acked-1", kind="async_delegation")
+    journal1.transition(
+        "acked-1",
+        from_states={"pending"},
+        to_state="running",
+        effect_disposition="none",
+    )
+    journal1.transition(
+        "acked-1",
+        from_states={"running"},
+        to_state="confirmed",
+        effect_disposition="none",
+        result={"status": "completed", "summary": "delivered"},
+    )
+    journal1.acknowledge("acked-1")
+
+    db1.close()
+
+    db2 = _SessionDB_t8(db_path=db_path)
+    journal2 = _OpJournal_t8(db2)
+    journal2.reconcile_after_restart()
+
+    ad._set_journal_for_tests(journal2)
+    captured = []
+    n = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue, lambda e: captured.append(e),
+    )
+    assert n == 1
+    assert len(captured) == 1
+    assert captured[0]["delegation_id"] == "orphan-1"
+    assert captured[0]["summary"] == "save me"
+    db2.close()
+
+
+def test_cli_idle_drain_does_not_ack_synchronously_after_enqueue(tmp_path, monkeypatch):
+    """The CLI idle drain puts the synthetic prompt into _pending_input but
+    MUST NOT synchronously call acknowledge_async_delegation(). If the process
+    dies between put() and the agent loop actually picking up + processing
+    the item, the durable row must remain unacked so a restart replays the
+    completion. Acknowledgement belongs on the *consumer* path, gated by
+    the moment we commit to running the turn.
+
+    We exercise the CLI's drain helper directly. Pre-fix the helper does
+    not exist (or acks synchronously); in both cases the durable row gets
+    acked before the agent can process the queued synth, which would lose
+    a completion across a crash + restart. Post-fix the helper stages the
+    ack for the consumer path.
+    """
+    db_path = tmp_path / "state.db"
+    db = _SessionDB_t8(db_path=db_path)
+    journal = _OpJournal_t8(db)
+    journal.create(operation_id="t8-cli-drain", kind="async_delegation")
+    journal.transition(
+        "t8-cli-drain", from_states={"pending"}, to_state="running",
+        effect_disposition="none",
+    )
+    journal.transition(
+        "t8-cli-drain", from_states={"running"}, to_state="confirmed",
+        effect_disposition="none",
+        result={"status": "completed", "summary": "from-drain",
+                "session_key": "", "parent_session_id": None},
+    )
+    ad._set_journal_for_tests(journal)
+
+    cli = _make_cli_for_drain_test()
+    cli._pending_input = queue.Queue()
+
+    fake_synth = "[SYSTEM: async delegation completed: from-drain]"
+    fake_evt = {"type": "async_delegation", "delegation_id": "t8-cli-drain",
+                "summary": "from-drain", "session_key": "",
+                "parent_session_id": None, "status": "completed"}
+
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.drain_notifications",
+        lambda session_key="": [(_dict_copy(fake_evt), fake_synth)],
+    )
+
+    # Helper under test (defined post-fix). Pre-fix this raises AttributeError.
+    cli._drain_idle_async_delegations()
+
+    # Drain put the synth into _pending_input.
+    assert not cli._pending_input.empty()
+    assert cli._pending_input.get_nowait() == fake_synth
+
+    # KEY invariant: the row is NOT yet acked — the consumer commit must ack.
+    # Pre-fix this assertion FAILS because the synchronous ack already
+    # marked acknowledged_at, so a crash between put and consumption loses
+    # the result forever on restart.
+    rec = journal.get("t8-cli-drain")
+    assert rec is not None
+    assert rec.acknowledged_at is None, (
+        "row was acked synchronously after enqueue; a crash before consumption "
+        "would lose the result on restart"
+    )
+
+    # Simulate a process restart: new journal handle, restore MUST replay
+    # because we did not ack. This is the operational truth: a crash
+    # between put and consume must NOT lose the completion.
+    db.close()
+    ad._reset_for_tests()
+    db2 = _SessionDB_t8(db_path=db_path)
+    journal2 = _OpJournal_t8(db2)
+    ad._set_journal_for_tests(journal2)
+    captured = []
+    n = ad.restore_unacknowledged_delegations(
+        process_registry.completion_queue, lambda e: captured.append(e),
+    )
+    db2.close()
+    assert n == 1, "row lost after simulated process death"
+    assert captured and captured[0]["delegation_id"] == "t8-cli-drain"
+
+
+def test_cli_consumer_path_acks_after_commit_to_run(tmp_path, monkeypatch):
+    """Once the consumer path commits to processing the queued synth (the
+    point where a future crash becomes the agent's responsibility, not
+    the durable journal's), the row must be acknowledged. Without this
+    edge, every successfully-processed completion would replay on restart
+    and double-fire the [SYSTEM: ...] block."""
+    db_path = tmp_path / "state.db"
+    db = _SessionDB_t8(db_path=db_path)
+    journal = _OpJournal_t8(db)
+    journal.create(operation_id="t8-cli-consume", kind="async_delegation")
+    journal.transition(
+        "t8-cli-consume", from_states={"pending"}, to_state="running",
+        effect_disposition="none",
+    )
+    journal.transition(
+        "t8-cli-consume", from_states={"running"}, to_state="confirmed",
+        effect_disposition="none",
+        result={"status": "completed", "summary": "consumed"},
+    )
+    ad._set_journal_for_tests(journal)
+
+    cli = _make_cli_for_drain_test()
+    cli._pending_input = queue.Queue()
+
+    fake_synth = "[SYSTEM: async delegation completed: consumed]"
+    fake_evt = {"type": "async_delegation", "delegation_id": "t8-cli-consume",
+                "summary": "consumed", "session_key": "",
+                "parent_session_id": None, "status": "completed"}
+
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.drain_notifications",
+        lambda session_key="": [(_dict_copy(fake_evt), fake_synth)],
+    )
+
+    # Stage the drain (does not ack by itself).
+    cli._drain_idle_async_delegations()
+    assert journal.get("t8-cli-consume").acknowledged_at is None
+
+    # Simulate the consumer pulling the item off the queue and committing
+    # to run it. The CLI ack hook lives at this commit point; if it is
+    # missing, every completion replays on restart (the second part of
+    # the original bug — never-acked rows double-fire).
+    queued = cli._pending_input.get_nowait()
+    assert queued == fake_synth
+    cli._ack_pending_async_delegations(getattr(queued, "delegation_id", ""))
+
+    rec = journal.get("t8-cli-consume")
+    assert rec is not None
+    assert rec.acknowledged_at is not None, (
+        "row was not acknowledged after committing to run it; "
+        "every completion would double-fire on restart"
+    )
+    db.close()
+
+
+def _dict_copy(d):
+    return {k: v for k, v in d.items()}
+
+
+def test_cli_ack_is_scoped_to_consumed_delegation():
+    cli = _make_cli_for_drain_test()
+    cli._pending_delegation_acks = deque(["a", "b"])
+    acknowledged = []
+
+    import tools.async_delegation as async_delegation
+    original = async_delegation.acknowledge_async_delegation
+    async_delegation.acknowledge_async_delegation = acknowledged.append
+    try:
+        cli._ack_pending_async_delegations("a")
+        cli._ack_pending_async_delegations("unrelated")
+    finally:
+        async_delegation.acknowledge_async_delegation = original
+
+    assert acknowledged == ["a"]
+    assert list(cli._pending_delegation_acks) == ["b"]
+
+
+def test_operation_journal_cache_is_scoped_to_profile(monkeypatch):
+    class FakeDB:
+        def __init__(self):
+            self.home = str(ad.get_hermes_home())
+
+    monkeypatch.setattr("hermes_state.SessionDB", FakeDB)
+    ad._set_journal_for_tests(None)
+    monkeypatch.setenv("HERMES_HOME", "/tmp/hermes-profile-a")
+    first = ad._open_journal()
+    monkeypatch.setenv("HERMES_HOME", "/tmp/hermes-profile-b")
+    second = ad._open_journal()
+
+    assert first is not second
+    assert first._db.home != second._db.home
 
 

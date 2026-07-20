@@ -321,6 +321,53 @@ def _missing_api_key_toolsets_for_summary(unavailable: list[dict]) -> list[dict]
     ]
 
 
+def _render_toolset_health_rows(registry) -> int:
+    """Render one doctor row per unhealthy toolset; return count emitted.
+
+    Reads the dispatch-side RuntimeHealthRegistry snapshot via
+    ``registry.get_runtime_health()``. A row is emitted for every entry
+    whose ``state`` is not ``healthy`` (so ``degraded`` and
+    ``open_circuit`` both surface). The row shows the toolset name, the
+    health state, the number of suppressed failures, and the projected
+    next-probe timestamp. Returns 0 when there are no unhealthy toolsets
+    so the caller can decide whether to print an "all healthy" notice.
+
+    Side effect: writes to stdout via ``check_warn``. Never raises — a
+    misbehaving snapshot just yields a zero-count return.
+    """
+    try:
+        snapshot = registry.get_runtime_health() or {}
+    except Exception:
+        return 0
+
+    count = 0
+    # Stable order so two doctor runs are diff-friendly.
+    for key in sorted(snapshot):
+        entry = snapshot[key] or {}
+        state = entry.get("state")
+        if state == "healthy":
+            continue
+        suppressed = entry.get("suppressed_failures", 0) or 0
+        next_probe = entry.get("next_probe_at", 0.0) or 0.0
+        # Dispatch keys are "toolset:<name>"; show the bare toolset so
+        # operators can correlate with the Toolset availability block above.
+        if key.startswith("toolset:"):
+            label = key[len("toolset:"):]
+        else:
+            label = key
+        detail = f"state={state} suppressed={suppressed}"
+        if next_probe:
+            try:
+                from datetime import datetime, timezone
+                ts = datetime.fromtimestamp(float(next_probe), tz=timezone.utc)
+                detail += f" retry_at={ts.isoformat(timespec='seconds')}"
+            except Exception:
+                pass
+        check_warn(label, f"({detail})")
+        count += 1
+    return count
+
+
 def _read_pyproject_version() -> str | None:
     """Read the ``version = "..."`` from ``pyproject.toml`` at the project root.
 
@@ -2334,6 +2381,17 @@ def run_doctor(args):
         api_disabled = _missing_api_key_toolsets_for_summary(unavailable)
         if api_disabled:
             issues.append("Run 'hermes setup' to configure missing API keys for full tool access")
+
+        # Runtime health: toolsets the dispatch-side RuntimeHealthRegistry is
+        # currently treating as degraded / open_circuit. Reads from the same
+        # registry dispatch() short-circuits against, so doctor reflects what
+        # the agent will actually do at runtime. Kept inside the try block so
+        # a misbehaving registry cannot tank the whole availability section.
+        try:
+            from tools.registry import registry as _doctor_runtime_registry
+            _render_toolset_health_rows(_doctor_runtime_registry)
+        except Exception as _health_exc:
+            check_warn("Toolset runtime health unavailable", f"({_health_exc})")
     except Exception as e:
         check_warn("Could not check tool availability", f"({e})")
     

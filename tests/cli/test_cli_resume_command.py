@@ -40,6 +40,46 @@ class TestCliResumeCommand:
         assert "/resume 2" in output
         assert "/resume <session title>" in output
 
+    def test_agents_hides_resume_hint_for_missing_child_session(self):
+        cli_obj = _make_cli()
+        cli_obj._session_db.get_session.return_value = None
+        record = {
+            "delegation_id": "deleg-1",
+            "status": "interrupted",
+            "goal": "recover",
+            "child_session_ids": ["ghost-session"],
+        }
+
+        with (
+            patch("tools.process_registry.process_registry.list_sessions", return_value=[]),
+            patch("tools.async_delegation.list_async_delegations", return_value=[record]),
+            patch("cli._cprint") as mock_cprint,
+        ):
+            cli_obj._handle_agents_command()
+
+        printed = " ".join(str(call) for call in mock_cprint.call_args_list)
+        assert "ghost-session" not in printed
+
+    def test_agents_shows_resume_hint_for_existing_child_session(self):
+        cli_obj = _make_cli()
+        cli_obj._session_db.get_session.return_value = {"id": "child-session"}
+        record = {
+            "delegation_id": "deleg-1",
+            "status": "interrupted",
+            "goal": "recover",
+            "child_session_ids": ["child-session"],
+        }
+
+        with (
+            patch("tools.process_registry.process_registry.list_sessions", return_value=[]),
+            patch("tools.async_delegation.list_async_delegations", return_value=[record]),
+            patch("cli._cprint") as mock_cprint,
+        ):
+            cli_obj._handle_agents_command()
+
+        printed = " ".join(str(call) for call in mock_cprint.call_args_list)
+        assert "/resume child-session" in printed
+
     def test_show_recent_sessions_uses_prompt_toolkit_safe_print(self):
         cli_obj = _make_cli()
         cli_obj._list_recent_sessions = MagicMock(return_value=[

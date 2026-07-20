@@ -122,6 +122,21 @@ def test_goal_set_returns_send_with_notice(server, session):
     assert mgr.state.status == "active"
 
 
+def test_goal_set_kickoff_includes_working_state(server, session):
+    sid, _, _ = session
+    response = _call(
+        server,
+        "command.dispatch",
+        name="goal",
+        arg="build a rocket\nnext_action: run the launch simulation",
+        session_id=sid,
+    )
+
+    message = response["result"]["message"]
+    assert message.startswith("build a rocket")
+    assert "Next action: run the launch simulation" in message
+
+
 def test_goal_pause_after_set(server, session):
     sid, session_key, _ = session
     _call(server, "command.dispatch", name="goal", arg="write a story", session_id=sid)
