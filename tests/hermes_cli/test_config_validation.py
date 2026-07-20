@@ -1,7 +1,13 @@
 """Tests for config.yaml structure validation (validate_config_structure)."""
 
 
-from hermes_cli.config import _KNOWN_ROOT_KEYS, validate_config_structure, ConfigIssue
+from hermes_cli.config import (
+    DEFAULT_CONFIG,
+    _EXTRA_KNOWN_ROOT_KEYS,
+    _KNOWN_ROOT_KEYS,
+    validate_config_structure,
+    ConfigIssue,
+)
 
 
 class TestCustomProvidersValidation:
@@ -207,77 +213,52 @@ class TestConfigIssueDataclass:
         assert a == b
 
 
-class TestCodeExecutionValidation:
-    def test_code_execution_is_a_known_root_section(self):
-        assert "code_execution" in _KNOWN_ROOT_KEYS
+class TestUnknownTopLevelKeys:
+    """Arbitrary top-level keys must NOT warn — they are bridged to os.environ.
 
-    def test_valid_code_execution_config_has_no_issues(self):
-        assert validate_config_structure({
-            "code_execution": {
-                "mode": "strict",
-                "persistent": False,
-                "timeout": 300,
-                "max_tool_calls": 50,
-                "kernel_idle_ttl": 900,
-                "max_stdout_bytes": 50_000,
-                "max_stderr_bytes": 10_000,
-                "artifact_dir": "/tmp/hermes-results",
-            },
-        }) == []
+    Top-level scalars in config.yaml are forwarded into the environment
+    (gateway/run.py, hermes send) so users can feed skills and external apps
+    env-style keys like DISCORD_HOME_CHANNEL or MY_APP_TOKEN. A closed-world
+    allowlist can never enumerate those, so no "Unknown top-level config key"
+    warning may exist.
+    """
 
-    def test_invalid_code_execution_types_and_ranges_are_reported(self):
+    def test_arbitrary_top_level_keys_stay_silent(self):
+        """Env-style and custom keys must produce no unknown-key warnings."""
         issues = validate_config_structure({
-            "code_execution": {
-                "mode": "banana",
-                "persistent": "yes",
-                "timeout": 0,
-                "max_tool_calls": -1,
-                "kernel_idle_ttl": -2,
-                "max_stdout_bytes": 0,
-                "max_stderr_bytes": True,
-                "artifact_dir": 42,
-            },
+            "model": {"provider": "openrouter"},
+            "DISCORD_HOME_CHANNEL": "12345",
+            "TELEGRAM_HOME_CHANNEL": "-100987",
+            "DISCORD_ALLOW_ALL_USERS": True,
+            "MY_CUSTOM_SKILL_VAR": "hello",
+            "skillz": {"enabled": True},
         })
-        messages = "\n".join(issue.message for issue in issues)
-        assert "code_execution.mode" in messages
-        assert "code_execution.persistent" in messages
-        assert "code_execution.timeout" in messages
-        assert "code_execution.max_tool_calls" in messages
-        assert "code_execution.kernel_idle_ttl" in messages
-        assert "code_execution.max_stdout_bytes" in messages
-        assert "code_execution.max_stderr_bytes" in messages
-        assert "code_execution.artifact_dir" in messages
+        assert not any("Unknown top-level config key" in i.message for i in issues)
+        assert issues == []
 
-    def test_code_execution_must_be_a_mapping(self):
-        issues = validate_config_structure({"code_execution": []})
-        assert any("code_execution must be a mapping" in issue.message for issue in issues)
+    def test_known_root_keys_derived_from_default_config(self):
+        """_KNOWN_ROOT_KEYS must be DEFAULT_CONFIG.keys() plus extras — single source of truth."""
+        assert set(DEFAULT_CONFIG.keys()).issubset(_KNOWN_ROOT_KEYS)
+        assert _EXTRA_KNOWN_ROOT_KEYS.issubset(_KNOWN_ROOT_KEYS)
+        assert _KNOWN_ROOT_KEYS == frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 
-    def test_nested_code_execution_defaults_match_plan_contract(self):
-        from hermes_cli.config import DEFAULT_CONFIG
-
-        section = DEFAULT_CONFIG["code_execution"]
-        assert section["sessions"] == {
-            "enabled": False,
-            "idle_timeout_seconds": 900,
-        }
-        assert section["tools"] == {"include": [], "exclude": []}
-        assert section["artifacts"] == {
-            "max_bytes": 10_485_760,
-            "max_total_bytes": 52_428_800,
-        }
-
-    def test_nested_code_execution_validation_rejects_bad_shapes(self):
+    def test_provider_like_unknown_root_keeps_misplaced_message(self):
+        """Preserve existing base_url/api_key root-level guidance."""
         issues = validate_config_structure({
-            "code_execution": {
-                "sessions": {"enabled": "yes", "idle_timeout_seconds": 0},
-                "tools": {"include": "read_file", "exclude": [1]},
-                "artifacts": {"max_bytes": 0, "max_total_bytes": -1},
-            },
+            "base_url": "https://example.com/v1",
+            "api_key": "secret",
         })
-        messages = "\n".join(issue.message for issue in issues)
-        assert "code_execution.sessions.enabled" in messages
-        assert "code_execution.sessions.idle_timeout_seconds" in messages
-        assert "code_execution.tools.include" in messages
-        assert "code_execution.tools.exclude" in messages
-        assert "code_execution.artifacts.max_bytes" in messages
-        assert "code_execution.artifacts.max_total_bytes" in messages
+        misplaced = [
+            i for i in issues
+            if i.severity == "warning" and "looks misplaced" in i.message
+        ]
+        assert any("base_url" in i.message for i in misplaced)
+        assert any("api_key" in i.message for i in misplaced)
+
+    def test_private_underscore_keys_not_flagged(self):
+        """Internal keys starting with _ remain ignored."""
+        issues = validate_config_structure({
+            "_internal_scratch": True,
+            "model": {"provider": "openrouter"},
+        })
+        assert issues == []
