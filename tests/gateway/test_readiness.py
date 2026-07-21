@@ -101,3 +101,151 @@ def test_collect_runtime_readiness_uses_active_profile_home(tmp_path, monkeypatc
     assert result["checks"]["config"]["status"] == "ok"
     assert not (tmp_path / ".hermes" / "state.db").exists()
     assert os.environ["HERMES_HOME"] == str(profile_home)
+
+
+def test_collect_runtime_readiness_reports_platform_health_aggregate(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    result = collect_runtime_readiness(
+        configured_model="model",
+        runtime_status={
+            "gateway_state": "running",
+            "platforms": {
+                "telegram": {
+                    "state": "connected",
+                    "health_state": "healthy",
+                    "next_probe_at": 0.0,
+                    "suppressed_failures": 0,
+                },
+                "discord": {
+                    "state": "retrying",
+                    "health_state": "open_circuit",
+                    "next_probe_at": 130.0,
+                    "suppressed_failures": 3,
+                },
+            },
+        },
+    )
+
+    gateway = result["checks"]["gateway"]
+    assert gateway["configured"] == 2
+    assert gateway["connected"] == 1
+    assert gateway["degraded"] == 1
+    assert gateway["platform_health"] == {
+        "telegram": {
+            "health_state": "healthy",
+            "next_probe_at": 0.0,
+            "suppressed_failures": 0,
+        },
+        "discord": {
+            "health_state": "open_circuit",
+            "next_probe_at": 130.0,
+            "suppressed_failures": 3,
+        },
+    }
+
+
+def test_collect_runtime_readiness_fails_closed_for_retrying_healthy_platform(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    result = collect_runtime_readiness(
+        configured_model="model",
+        runtime_status={
+            "gateway_state": "running",
+            "platforms": {
+                "telegram": {
+                    "state": "retrying",
+                    "health_state": "healthy",
+                }
+            },
+        },
+    )
+
+    gateway = result["checks"]["gateway"]
+    assert result["status"] == "degraded"
+    assert gateway["status"] == "degraded"
+    assert gateway["connected"] == 0
+    assert gateway["degraded"] == 1
+    assert gateway["platform_health"]["telegram"]["health_state"] == "degraded"
+
+
+def test_collect_runtime_readiness_strips_platform_secrets_and_raw_errors(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    secret = "https://user:password@example.test/path?token=secret"
+
+    result = collect_runtime_readiness(
+        configured_model="model",
+        runtime_status={
+            "gateway_state": "running",
+            "platforms": {
+                "telegram": {
+                    "state": "retrying",
+                    "health_state": "degraded",
+                    "next_probe_at": 42.0,
+                    "suppressed_failures": 1,
+                    "error_message": secret,
+                    "url": secret,
+                    "command": secret,
+                }
+            },
+        },
+    )
+
+    payload = json.dumps(result)
+    assert secret not in payload
+    assert payload.count("telegram") == 1
+    assert result["checks"]["gateway"]["platform_health"] == {
+        "telegram": {
+            "health_state": "degraded",
+            "next_probe_at": 42.0,
+            "suppressed_failures": 1,
+        }
+    }
+
+
+def test_collect_runtime_readiness_prefers_live_health_over_stale_runtime_status(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        "gateway.readiness._live_platform_health",
+        lambda: {
+            "telegram": {
+                "health_state": "degraded",
+                "next_probe_at": 42.0,
+                "suppressed_failures": 2,
+            }
+        },
+    )
+
+    result = collect_runtime_readiness(
+        configured_model="model",
+        runtime_status={
+            "gateway_state": "running",
+            "platforms": {
+                "telegram": {
+                    "state": "connected",
+                    "health_state": "healthy",
+                    "next_probe_at": 0.0,
+                    "suppressed_failures": 0,
+                }
+            },
+        },
+    )
+
+    gateway = result["checks"]["gateway"]
+    assert result["status"] == "degraded"
+    assert gateway["degraded"] == 1
+    assert gateway["platform_health"]["telegram"] == {
+        "health_state": "degraded",
+        "next_probe_at": 42.0,
+        "suppressed_failures": 2,
+    }

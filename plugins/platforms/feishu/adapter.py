@@ -2965,34 +2965,35 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Failed to fetch message for reaction routing", exc_info=True)
             return
 
+        action = "added" if "created" in event_type else "removed"
+        if action != "added":
+            return
         user_id_obj = getattr(event, "user_id", None)
+        actor_id = str(
+            getattr(user_id_obj, "open_id", None)
+            or getattr(user_id_obj, "user_id", None)
+            or ""
+        )
         reaction_type_obj = getattr(event, "reaction_type", None)
         emoji_type = str(getattr(reaction_type_obj, "emoji_type", "") or "UNKNOWN")
-        action = "added" if "created" in event_type else "removed"
-        synthetic_text = f"reaction:{action}:{emoji_type}"
-
-        sender_profile = await self._resolve_sender_profile(user_id_obj)
-        chat_info = await self.get_chat_info(chat_id)
-        source = self.build_source(
-            chat_id=chat_id,
-            chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
-            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type_raw),
-            user_id=sender_profile["user_id"],
-            user_name=sender_profile["user_name"],
-            thread_id=None,
-            user_id_alt=sender_profile["user_id_alt"],
+        chat_type = self._resolve_source_chat_type(
+            chat_info={"type": chat_type_raw}, event_chat_type=chat_type_raw
         )
-        synthetic_event = MessageEvent(
-            text=synthetic_text,
-            message_type=MessageType.TEXT,
-            source=source,
-            raw_message=data,
-            message_id=message_id,
-            channel_prompt=self._resolve_channel_prompt(chat_id),
-            timestamp=datetime.now(),
+        if not actor_id or self._is_sender_authorized(actor_id, chat_type, chat_id) is False:
+            return
+        event_id = str(
+            getattr(data, "event_id", None)
+            or getattr(event, "event_id", None)
+            or f"feishu:{message_id}:{actor_id}:{emoji_type}:added"
         )
-        logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
-        await self._handle_message_with_guards(synthetic_event)
+        self.publish_feedback(
+            self.platform,
+            chat_id,
+            message_id,
+            actor_id,
+            emoji_type,
+            event_id,
+        )
 
     def _is_card_action_duplicate(self, token: str) -> bool:
         """Return True if this card action token was already processed within the dedup window."""

@@ -878,6 +878,7 @@ class TestAdapterBehavior(unittest.TestCase):
         )
         adapter._build_get_message_request = Mock(return_value=object())
         adapter._handle_message_with_guards = AsyncMock()
+        adapter.publish_feedback = Mock(return_value=True)
         adapter._resolve_sender_profile = AsyncMock(
             return_value={"user_id": "u_human", "user_name": "Human", "user_id_alt": None}
         )
@@ -914,7 +915,15 @@ class TestAdapterBehavior(unittest.TestCase):
         asyncio.run(
             adapter._handle_reaction_event("im.message.reaction.created_v1", data)
         )
-        adapter._handle_message_with_guards.assert_awaited_once()
+        adapter._handle_message_with_guards.assert_not_awaited()
+        adapter.publish_feedback.assert_called_once_with(
+            adapter.platform,
+            "oc_chat",
+            "om_self_msg",
+            "ou_human",
+            "THUMBSUP",
+            "feishu:om_self_msg:ou_human:THUMBSUP:added",
+        )
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_requires_mentions_even_when_policy_open(self):

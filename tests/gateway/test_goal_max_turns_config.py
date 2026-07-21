@@ -36,11 +36,16 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
         platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
     )
     runner.session_store = _FakeSessionStore()
-    runner.adapters = {}
+    adapter = object()
+    runner.adapters = {Platform.DISCORD: adapter}
     runner._queued_events = {}
+    captured = {}
+    runner._enqueue_fifo = lambda key, queued_event, selected_adapter: captured.update(
+        key=key, event=queued_event, adapter=selected_adapter
+    )
 
     event = MessageEvent(
-        text="/goal ship the benchmark",
+        text="/goal ship the benchmark\nnext_action: run pytest",
         message_type=MessageType.TEXT,
         source=SessionSource(
             platform=Platform.DISCORD,
@@ -58,5 +63,8 @@ async def test_gateway_goal_uses_goals_max_turns_from_full_config(tmp_path, monk
         state = goals.GoalManager("sid-gateway-goal-config").state
         assert state is not None
         assert state.max_turns == 7
+        assert captured["adapter"] is adapter
+        assert captured["event"].text.startswith("ship the benchmark")
+        assert "Next action: run pytest" in captured["event"].text
     finally:
         goals._DB_CACHE.clear()

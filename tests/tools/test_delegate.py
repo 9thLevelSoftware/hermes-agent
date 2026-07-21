@@ -350,6 +350,62 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(result["results"][1]["summary"], "Result B")
         self.assertIn("total_duration_seconds", result)
 
+    def test_batch_construction_closes_already_built_children_on_failure(self):
+        parent = _make_mock_parent()
+        first_child = MagicMock()
+        parent._active_children.append(first_child)
+        creds = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": None,
+            "max_output_tokens": None,
+            "command": None,
+            "args": None,
+        }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=creds),
+            patch(
+                "tools.delegate_tool._build_child_agent",
+                side_effect=[first_child, RuntimeError("second child failed")],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "second child failed"):
+                delegate_task(
+                    tasks=[{"goal": "first"}, {"goal": "second"}],
+                    parent_agent=parent,
+                )
+
+        first_child.close.assert_called_once_with()
+        self.assertEqual(parent._active_children, [])
+
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    def test_normal_execution_does_not_double_close_children(self, mock_build, mock_run):
+        parent = _make_mock_parent()
+        child = MagicMock()
+        mock_build.return_value = child
+
+        def run_child(_task_index, _goal, child, _parent_agent):
+            child.close()
+            return {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 0,
+                "duration_seconds": 0,
+            }
+
+        mock_run.side_effect = run_child
+        result = json.loads(delegate_task(goal="normal run", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        child.close.assert_called_once_with()
+
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode_accepts_json_string_tasks(self, mock_run):
         mock_run.side_effect = [
@@ -524,6 +580,213 @@ class TestDelegateTask(unittest.TestCase):
             )
 
         self.assertIs(mock_child._print_fn, sink)
+
+    def test_child_forks_parent_session_db_and_owns_handle(self):
+        parent = _make_mock_parent(depth=0)
+        parent_db = MagicMock()
+        child_db = MagicMock()
+        parent_db.fork.return_value = child_db
+        parent._session_db = parent_db
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+
+            _build_child_agent(
+                task_index=0,
+                goal="Isolate database ownership",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+            _, kwargs = MockAgent.call_args
+
+        parent_db.fork.assert_called_once_with()
+        self.assertIs(kwargs["session_db"], child_db)
+        self.assertTrue(kwargs["owns_session_db"])
+
+    def test_child_closes_forked_db_when_constructor_fails(self):
+        parent = _make_mock_parent(depth=0)
+        parent_db = MagicMock()
+        child_db = MagicMock()
+        parent_db.fork.return_value = child_db
+        parent._session_db = parent_db
+
+        with patch("run_agent.AIAgent", side_effect=RuntimeError("constructor failed")):
+            with self.assertRaisesRegex(RuntimeError, "constructor failed"):
+                _build_child_agent(
+                    task_index=0,
+                    goal="Close the fork on constructor failure",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        child_db.close.assert_called_once_with()
+
+    def test_child_closes_forked_db_when_request_overrides_conversion_fails(self):
+        parent = _make_mock_parent(depth=0)
+        parent_db = MagicMock()
+        child_db = MagicMock()
+        parent_db.fork.return_value = child_db
+        parent._session_db = parent_db
+
+        class ExplodingOverrides:
+            def __iter__(self):
+                raise RuntimeError("request overrides conversion failed")
+
+        parent.request_overrides = ExplodingOverrides()
+
+        with patch("run_agent.AIAgent"):
+            with self.assertRaisesRegex(RuntimeError, "request overrides conversion failed"):
+                _build_child_agent(
+                    task_index=0,
+                    goal="Close the fork after kwargs construction fails",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        child_db.close.assert_called_once_with()
+
+    def test_partial_constructor_does_not_double_close_owned_session_db(self):
+        from run_agent import AIAgent
+
+        class NonIdempotentDB:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_calls > 1:
+                    raise AssertionError("session DB closed twice")
+
+        parent = _make_mock_parent(depth=0)
+        parent_db = MagicMock()
+        child_db = NonIdempotentDB()
+        parent_db.fork.return_value = child_db
+        parent._session_db = parent_db
+
+        def partial_init(agent, *args, **kwargs):
+            agent._session_db = kwargs["session_db"]
+            agent._owns_session_db = kwargs["owns_session_db"]
+            agent._session_db_closed = False
+            agent._end_session_on_close = False
+            raise RuntimeError("init failed after session DB ownership")
+
+        with patch("agent.agent_init.init_agent", side_effect=partial_init):
+            with self.assertRaisesRegex(RuntimeError, "init failed after session DB ownership"):
+                _build_child_agent(
+                    task_index=0,
+                    goal="Close an owned DB exactly once",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        self.assertEqual(child_db.close_calls, 1)
+
+    def test_close_raises_after_side_effect_does_not_cause_fallback_double_close(self):
+        """child.close() may set _conn=None and then raise — the fallback
+        path in _build_child_agent's except branch must observe the
+        post-attempt state and skip its own close() instead of double-
+        closing a non-idempotent DB.
+        """
+        from run_agent import AIAgent
+
+        class NonIdempotentConn:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+                if self.close_calls > 1:
+                    raise AssertionError("session DB closed twice")
+
+        class PartialCloseDB:
+            def __init__(self):
+                self.close_calls = 0
+                self._conn = NonIdempotentConn()
+
+            def close(self):
+                # Simulate a DB whose close() performs the actual side
+                # effect (closes _conn) and THEN raises — leaving the
+                # caller thinking the close failed even though _conn is
+                # already gone.
+                self._conn = None
+                self.close_calls += 1
+                raise RuntimeError("close failed after side effect")
+
+        parent = _make_mock_parent(depth=0)
+        parent_db = MagicMock()
+        child_db = PartialCloseDB()
+        parent_db.fork.return_value = child_db
+        parent._session_db = parent_db
+
+        def partial_init(agent, *args, **kwargs):
+            agent._session_db = kwargs["session_db"]
+            agent._owns_session_db = kwargs["owns_session_db"]
+            agent._session_db_closed = False
+            agent._end_session_on_close = False
+            raise RuntimeError("init failed after session DB ownership")
+
+        with patch("agent.agent_init.init_agent", side_effect=partial_init):
+            with self.assertRaisesRegex(RuntimeError, "init failed after session DB ownership"):
+                _build_child_agent(
+                    task_index=0,
+                    goal="Close an owned DB exactly once even after a raise",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        # The DB performed its side effect on the only call; the fallback
+        # path must observe _conn is None and NOT issue a second close().
+        self.assertEqual(child_db.close_calls, 1)
+        self.assertIsNone(child_db._conn)
+
+    def test_partial_constructor_closes_client_after_init_failure(self):
+        from run_agent import AIAgent
+
+        parent = _make_mock_parent(depth=0)
+        client = MagicMock()
+
+        def partial_init(agent, *args, **kwargs):
+            agent.client = client
+            raise RuntimeError("init failed after client creation")
+
+        with (
+            patch("agent.agent_init.init_agent", side_effect=partial_init),
+            patch.object(AIAgent, "_force_close_tcp_sockets", return_value=0),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "init failed after client creation"):
+                _build_child_agent(
+                    task_index=0,
+                    goal="Close a client from a partial constructor",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                )
+
+        client.close.assert_called_once_with()
 
     def test_child_uses_thinking_callback_when_progress_callback_available(self):
         parent = _make_mock_parent(depth=0)

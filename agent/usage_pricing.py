@@ -689,6 +689,43 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # cached_input rate per model alongside input/output, which maps to
     # cache_read_cost_per_million. No separately published cache_write rate.
     # Snapshot of https://docs.fireworks.ai/serverless/pricing (Standard tier).
+    # Keep the fork's legacy fallback IDs priced as historical snapshots even
+    # though Fireworks now advertises them as on-demand rather than serverless.
+    # Existing sessions can still report those IDs, and silently treating them
+    # as free would understate recorded usage.
+    (
+        "fireworks",
+        "kimi-k2-instruct-0905",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.60"),
+        output_cost_per_million=Decimal("2.50"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        source="official_docs_snapshot",
+        source_url="https://fireworks.ai/models/fireworks/kimi-k2-instruct-0905",
+        pricing_version="fireworks-pricing-legacy-2025",
+    ),
+    (
+        "fireworks",
+        "kimi-k2-instruct",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.60"),
+        output_cost_per_million=Decimal("2.50"),
+        cache_read_cost_per_million=Decimal("0.30"),
+        source="official_docs_snapshot",
+        source_url="https://fireworks.ai/models/fireworks/kimi-k2-instruct",
+        pricing_version="fireworks-pricing-legacy-2025",
+    ),
+    (
+        "fireworks",
+        "glm-4p6",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.55"),
+        output_cost_per_million=Decimal("2.20"),
+        cache_read_cost_per_million=Decimal("0.275"),
+        source="official_docs_snapshot",
+        source_url="https://fireworks.ai/models/fireworks/glm-4p6",
+        pricing_version="fireworks-pricing-legacy-2025",
+    ),
     (
         "fireworks",
         "kimi-k2p6",

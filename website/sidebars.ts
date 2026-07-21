@@ -86,6 +86,7 @@ const sidebars: SidebarsConfig = {
             'reference/automation-blueprints-catalog',
             'user-guide/features/delegation',
             'user-guide/features/kanban',
+            'user-guide/features/workflows',
             'user-guide/features/codex-app-server-runtime',
             'user-guide/features/kanban-tutorial',
             'user-guide/features/kanban-worker-lanes',
@@ -155,6 +156,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-claude-code',
                     'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-codex',
                     'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent',
+                    'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-workflow-builder',
                     'user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-opencode',
                   ],
                 },
@@ -372,6 +374,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-grok',
                     'user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-honcho',
                     'user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-openhands',
+                    'user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-self-improvement-loop',
                   ],
                 },
                 {

@@ -15,6 +15,7 @@ Import chain (circular-import safe):
 """
 
 import ast
+import hashlib
 import importlib
 import json
 import logging
@@ -25,6 +26,27 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+# ponytail: shared instance; ToolRegistry defaults to this so dispatch() can
+# fail-fast on open-circuit toolsets without each caller threading the
+# registry through. Replacement at construction time (via
+# ToolRegistry(runtime_health=...)) is the only escape hatch; see
+# ToolRegistry.__init__ and dispatch(). Lazy-initialised because importing
+# agent.runtime_health at tools.registry import time would create a
+# tools/agent/… circular import (tools tools → model_tools which imports
+# many tool modules which register on first import).
+_SHARED_RUNTIME_HEALTH = None
+
+
+def _shared_runtime_health():
+    global _SHARED_RUNTIME_HEALTH
+    if _SHARED_RUNTIME_HEALTH is None:
+        try:
+            from agent.runtime_health import RuntimeHealthRegistry
+            _SHARED_RUNTIME_HEALTH = RuntimeHealthRegistry()
+        except Exception:  # noqa: BLE001 — runtime health is optional
+            _SHARED_RUNTIME_HEALTH = None
+    return _SHARED_RUNTIME_HEALTH
 
 
 def _is_registry_register_call(node: ast.AST) -> bool:
@@ -91,11 +113,13 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars", "dynamic_schema_overrides",
+        "read_only", "destructive", "idempotent",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 read_only=False, destructive=True, idempotent=False):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -114,6 +138,9 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.read_only = bool(read_only)
+        self.destructive = bool(destructive) and not self.read_only
+        self.idempotent = bool(idempotent)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +187,12 @@ def _check_fn_cached(fn: Callable) -> bool:
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
     """
+    if getattr(fn, "__hermes_no_check_fn_cache__", False):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
     now = time.monotonic()
     with _check_fn_cache_lock:
         cached = _check_fn_cache.get(fn)
@@ -217,7 +250,7 @@ def invalidate_check_fn_cache() -> None:
 class ToolRegistry:
     """Singleton registry that collects tool schemas + handlers from tool files."""
 
-    def __init__(self):
+    def __init__(self, runtime_health=None):
         self._tools: Dict[str, ToolEntry] = {}
         # Durable map: plugin module namespace (handler.__globals__["__name__"])
         # -> operator opt-in for built-in override. Populated at plugin load and
@@ -237,6 +270,13 @@ class ToolRegistry:
         # against it: a cache entry keyed on the generation is valid for as
         # long as the generation hasn't changed.
         self._generation: int = 0
+        # Optional RuntimeHealthRegistry: dispatch() short-circuits with a
+        # structured error when the tool's toolset is in open_circuit state
+        # and the cooldown has not elapsed; record_success / record_failure
+        # fire on dispatch outcomes. Shared per-process by default so doctor
+        # and the dispatch path agree on what is currently suppressed; pass
+        # your own instance (typically in a test) for isolation.
+        self._runtime_health = runtime_health if runtime_health is not None else _shared_runtime_health()
 
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
@@ -275,6 +315,40 @@ class ToolRegistry:
         """Return a registered tool entry by name, or None."""
         with self._lock:
             return self._tools.get(name)
+
+    def get_operation_metadata(self, name: str) -> Dict[str, bool]:
+        """Return conservative policy metadata without changing model schemas."""
+        entry = self.get_entry(name)
+        if entry is None:
+            return {"read_only": False, "destructive": True, "idempotent": False}
+        return {
+            "read_only": entry.read_only,
+            "destructive": entry.destructive,
+            "idempotent": entry.idempotent,
+        }
+
+    @staticmethod
+    def operation_key(
+        name: str,
+        args: Dict[str, object],
+        *,
+        task_id: str = "",
+        tool_call_id: str = "",
+    ) -> str:
+        """Return a stable correlation key for retries of one provider call."""
+        canonical = json.dumps(
+            {
+                "tool": name,
+                "args": args,
+                "task_id": task_id or "",
+                "tool_call_id": tool_call_id or "",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
@@ -376,6 +450,10 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        *,
+        read_only: bool = False,
+        destructive: Optional[bool] = None,
+        idempotent: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -445,6 +523,9 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                read_only=read_only,
+                destructive=(not read_only if destructive is None else destructive),
+                idempotent=idempotent,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -619,19 +700,57 @@ class ToolRegistry:
           envelope before leaving the registry.
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
+        * When the tool's toolset is in ``open_circuit`` state and its
+          cooldown has not elapsed, the handler is skipped and a structured
+          ``open_circuit`` error is returned so a retry-loop can back off
+          without burning turns on a known-broken capability.
         """
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
+
+        # Fail-fast open-circuit check. Keys are scoped to the toolset so
+        # one slow platform (e.g. telegram) does not suppress unrelated
+        # toolsets (e.g. discord) sharing the process.
+        health = getattr(self, "_runtime_health", None)
+        if health is not None and entry.toolset:
+            toolset_key = f"toolset:{entry.toolset}"
+            snapshot = health.snapshot().get(toolset_key)
+            if snapshot is not None and snapshot.state in {"open_circuit", "probing"}:
+                if not health.should_probe(toolset_key):
+                    retry_after = max(
+                        1,
+                        int(snapshot.next_probe_at - time.time()),
+                    )
+                    return json.dumps({
+                        "error": "Capability temporarily unavailable",
+                        "error_type": "open_circuit",
+                        "retry_after_seconds": retry_after,
+                    })
+
         try:
             if entry.is_async:
                 from model_tools import _run_async
                 result = _run_async(entry.handler(args, **kwargs))
             else:
                 result = entry.handler(args, **kwargs)
-            return self._normalize_handler_result(name, result)
+            normalized = self._normalize_handler_result(name, result)
+            if health is not None and entry.toolset:
+                # Best-effort bookkeeping. A health error must not escape
+                # dispatch; the original tool result is what the caller
+                # is waiting for.
+                try:
+                    health.record_success(f"toolset:{entry.toolset}")
+                except Exception:
+                    logger.debug("health.record_success failed", exc_info=True)
+            return normalized
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
+            if health is not None and entry.toolset:
+                try:
+                    health.record_failure(f"toolset:{entry.toolset}", e)
+                except Exception:
+                    logger.debug("health.record_failure failed", exc_info=True)
             # Route through the sanitizer so framing tokens / CDATA / fences
             # in exception strings don't reach the model as structural noise.
             # See model_tools._sanitize_tool_error for rationale.
@@ -656,6 +775,30 @@ class ToolRegistry:
             return default
         from tools.budget_config import DEFAULT_RESULT_SIZE_CHARS
         return DEFAULT_RESULT_SIZE_CHARS
+
+    def get_runtime_health(self) -> Dict[str, Dict[str, object]]:
+        """Return ``{toolset_key: {state, suppressed_failures, next_probe_at}}``.
+
+        Snapshot of the dispatch-side RuntimeHealthRegistry. Surfaced to
+        doctor and ``hermes status`` so operators can see which toolsets are
+        currently being held back from dispatch (``open_circuit``) or have
+        accumulated failures that have been triaged but not yet escalated to
+        full suppression (``degraded``). Keys are ``toolset:<name>`` so they
+        cannot collide with the platform keys used elsewhere in the
+        codebase. Empty dict when no dispatch has happened yet (or no
+        runtime_health was wired in).
+        """
+        health = getattr(self, "_runtime_health", None)
+        if health is None:
+            return {}
+        return {
+            key: {
+                "state": snap.state,
+                "suppressed_failures": snap.suppressed_failures,
+                "next_probe_at": snap.next_probe_at,
+            }
+            for key, snap in health.snapshot().items()
+        }
 
     def get_all_tool_names(self) -> List[str]:
         """Return sorted list of all registered tool names."""

@@ -322,6 +322,7 @@ def get_tool_definitions(
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            bool(os.environ.get("HERMES_WORKFLOW_CONTEXT")),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
@@ -1067,6 +1068,8 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    *,
+    operation_metadata: Optional[Dict[str, bool]] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1088,6 +1091,8 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        operation_metadata: Optional registry policy metadata supplied by an
+                       alternate dispatcher; defaults to the registry lookup.
 
     Returns:
         Function result as a JSON string.
@@ -1171,6 +1176,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                operation_metadata=registry.get_operation_metadata(underlying_name),
             )
 
     _tool_original_args = dict(function_args)
@@ -1297,6 +1303,8 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        enabled_toolsets=enabled_toolsets,
+                        disabled_toolsets=disabled_toolsets,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1308,11 +1316,23 @@ def handle_function_call(
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 
+            operation_metadata = (
+                dict(operation_metadata)
+                if operation_metadata is not None
+                else registry.get_operation_metadata(function_name)
+            )
             result = run_tool_execution_middleware(
                 function_name,
                 function_args,
                 _dispatch,
                 original_args=_tool_original_args,
+                operation_metadata=operation_metadata,
+                operation_key_factory=lambda: registry.operation_key(
+                    function_name,
+                    function_args,
+                    task_id=task_id or "",
+                    tool_call_id=tool_call_id or "",
+                ),
                 task_id=task_id or "",
                 session_id=session_id or "",
                 tool_call_id=tool_call_id or "",

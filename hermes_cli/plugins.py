@@ -2257,12 +2257,19 @@ def resolve_pre_tool_block(
     if details.action == "block":
         return details.message
     if details.action == "approve":
+        if not isinstance(args, dict):
+            return f"BLOCKED: plugin approval requires call arguments for {tool_name}"
         try:
             from tools.approval import request_tool_approval
             result = request_tool_approval(
                 tool_name,
                 details.message or "",
                 rule_key=details.rule_key or tool_name,
+                arguments=args,
+                requester=session_id,
+                channel=task_id,
+                # turn/API IDs can cover multiple calls; submit_pending mints UUIDs.
+                request_id=tool_call_id,
             )
         except Exception:
             # Fail-closed: if the gate itself errors, block rather than

@@ -295,6 +295,19 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+KANBAN_ORCHESTRATOR_GUIDANCE = (
+    "# Kanban orchestrator mode\n"
+    "You have access to Kanban board tools but are NOT assigned a specific "
+    "task (no `HERMES_KANBAN_TASK`). Use `kanban_list(board=<board-slug>)` "
+    "with an explicit board to review the board state. To decompose work, "
+    "use `kanban_create(title=..., assignee=<profile>, parents=[...])` to "
+    "spawn child tasks and `kanban_link(parent_id=..., child_id=...)` to "
+    "express dependencies. Do NOT call `kanban_show()` with no arguments — "
+    "it defaults to `HERMES_KANBAN_TASK`, which is not set in orchestrator "
+    "mode; always pass an explicit `task_id` if you need to inspect a "
+    "specific task."
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "
@@ -1498,6 +1511,81 @@ def _current_session_platform_hint() -> str:
         return ""
 
 
+# =========================================================================
+# Utility-based skill ranking
+# =========================================================================
+
+
+def _load_utility_ranking_config() -> dict:
+    """Read skills.utility_ranking config. Returns dict with enabled/min_samples/utility_weight."""
+    defaults = {"enabled": False, "min_samples": 5, "utility_weight": 0.7}
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        if isinstance(cfg, dict):
+            skills_cfg = cfg.get("skills") or {}
+            if isinstance(skills_cfg, dict):
+                ur = skills_cfg.get("utility_ranking") or {}
+                if isinstance(ur, dict):
+                    defaults["enabled"] = bool(ur.get("enabled", defaults["enabled"]))
+                    defaults["min_samples"] = int(ur.get("min_samples", defaults["min_samples"]))
+                    defaults["utility_weight"] = float(ur.get("utility_weight", defaults["utility_weight"]))
+    except Exception:
+        pass
+    return defaults
+
+
+def _load_skill_utility_records() -> dict[str, dict]:
+    """Load per-skill utility data from the sidecar. Returns {} on failure.
+
+    Reads the sidecar once per snapshot-build; callers cache the result.
+    """
+    try:
+        from tools.skill_usage import load_usage, get_skill_utility
+        data = load_usage()
+    except Exception:
+        return {}
+    records: dict[str, dict] = {}
+    for name, rec in data.items():
+        try:
+            util = get_skill_utility(name, rec)
+            records[name] = util
+        except Exception:
+            continue
+    return records
+
+
+def _utility_sort_key(
+    name: str,
+    utility_records: dict,
+    utility_weight: float,
+    min_samples: int,
+) -> tuple:
+    """Sort key for skills within a category when utility ranking is enabled.
+
+    Returns (eligible_flag, -score, name). Eligible skills sort first
+    (eligible_flag=1) by blended score descending; ineligible sort last
+    (eligible_flag=0) and keep alphabetical order.
+
+    Eligibility is determined by the *caller's* ``min_samples`` (from config),
+    not the sidecar's hardcoded ``MIN_UTILITY_SAMPLES``.  This lets users
+    tune the floor up or down.
+    """
+    rec = utility_records.get(name, {})
+    # Recompute from raw counts so config min_samples controls eligibility
+    helped = int(rec.get("helped", 0))
+    hurt = int(rec.get("hurt", 0))
+    count = helped + hurt
+    if count < min_samples:
+        return (1, 0.0, name)  # below configured threshold: keep alpha order
+    # ponytail: lexical_relevance is constant (no query context) — all skills
+    # have the same lexical relevance when there's no search query. Use 1.0
+    # so the formula reduces to utility_weight * utility + (1 - weight) * 1.0.
+    utility = (helped + 1.0) / (helped + hurt + 2.0)
+    score = utility_weight * utility + (1 - utility_weight) * 1.0
+    return (0, -score, name)  # eligible: sort first, higher score first
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
@@ -1700,6 +1788,12 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
+        # Load utility records once when ranking is enabled (not per API call)
+        ur_cfg = _load_utility_ranking_config()
+        utility_records = _load_skill_utility_records() if ur_cfg["enabled"] else {}
+        utility_weight = ur_cfg["utility_weight"]
+        min_samples = ur_cfg["min_samples"]
+
         index_lines = []
         for category in sorted(skills_by_category.keys()):
             # Deduplicate and sort skills within each category
@@ -1713,7 +1807,16 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+
+            if utility_records:
+                _ur = utility_records
+                _uw = utility_weight
+                _ms = min_samples
+                sort_key = lambda x: _utility_sort_key(x[0], _ur, _uw, _ms)
+            else:
+                sort_key = lambda x: x[0]
+
+            for name, desc in sorted(skills_by_category[category], key=sort_key):
                 if name in seen:
                     continue
                 seen.add(name)
