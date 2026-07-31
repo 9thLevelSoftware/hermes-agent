@@ -16,6 +16,8 @@ def _make_agent(**overrides):
         _environment_probe=False,
         _kanban_worker_guidance="",
         _memory_store=None,
+        _memory_enabled=False,
+        _user_profile_enabled=False,
         _memory_manager=None,
         model="",
         provider="",
@@ -25,6 +27,68 @@ def _make_agent(**overrides):
     )
     base.update(overrides)
     return SimpleNamespace(**base)
+
+
+def test_external_owner_replaces_flat_memory_prompt_but_keeps_provider_block():
+    class _Store:
+        def format_for_system_prompt(self, target):
+            return f"BUILTIN-{target.upper()}"
+
+    class _Manager:
+        def owns_builtin_memory(self):
+            return True
+
+        def build_system_prompt(self):
+            return "EXTERNAL-BRAIN"
+
+    agent = _make_agent(
+        _memory_store=_Store(),
+        _memory_enabled=True,
+        _user_profile_enabled=True,
+        _memory_manager=_Manager(),
+    )
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        volatile = build_system_prompt_parts(agent)["volatile"]
+
+    assert "EXTERNAL-BRAIN" in volatile
+    assert "BUILTIN-MEMORY" not in volatile
+    assert "BUILTIN-USER" not in volatile
+
+
+def test_non_owning_provider_keeps_flat_memory_prompt():
+    class _Store:
+        def format_for_system_prompt(self, target):
+            return f"BUILTIN-{target.upper()}"
+
+    class _Manager:
+        def owns_builtin_memory(self):
+            return False
+
+        def build_system_prompt(self):
+            return "EXTERNAL-ADDITIVE"
+
+    agent = _make_agent(
+        _memory_store=_Store(),
+        _memory_enabled=True,
+        _user_profile_enabled=True,
+        _memory_manager=_Manager(),
+    )
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        volatile = build_system_prompt_parts(agent)["volatile"]
+
+    assert "BUILTIN-MEMORY" in volatile
+    assert "BUILTIN-USER" in volatile
+    assert "EXTERNAL-ADDITIVE" in volatile
 
 
 def _captured_context_cwd(agent):

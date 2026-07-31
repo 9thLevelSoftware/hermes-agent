@@ -303,6 +303,23 @@ def test_memory_nudge_fires_at_interval():
     assert agent._turns_since_memory == 0  # reset after firing
 
 
+def test_memory_nudge_is_suppressed_when_provider_owns_builtin_memory():
+    agent = _FakeAgent()
+    agent._memory_nudge_interval = 1
+    agent.valid_tool_names = {"memory"}
+    agent._memory_store = object()
+    agent._memory_manager = types.SimpleNamespace(
+        owns_builtin_memory=lambda: True,
+        on_turn_start=lambda *_a, **_k: None,
+        prefetch_all=lambda *_a, **_k: "",
+    )
+
+    ctx = _build(agent)
+
+    assert ctx.should_review_memory is False
+    assert agent._turns_since_memory == 0
+
+
 def test_no_review_when_memory_disabled():
     agent = _FakeAgent()
     ctx = _build(agent)
