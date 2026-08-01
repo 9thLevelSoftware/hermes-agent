@@ -37,11 +37,11 @@ When a memory provider is active, Hermes automatically:
 6. **Adds provider-specific tools** so the agent can search, store, and manage memories
 
 The built-in memory (MEMORY.md / USER.md) continues to work exactly as before for normal
-providers. A provider may implement `owns_builtin_memory()` and return `true` only after
+providers. A provider may implement `owns_builtin_memory()` and return `True` only after
 it has durably imported those files and can serve them itself. At safe system-prompt
 rebuilds Hermes then omits the duplicate MEMORY.md/USER.md blocks and suppresses the
 built-in memory-review nudge. The built-in memory tool and flat files remain operational,
-and writes still mirror to the provider. The default is `false`; provider errors or an
+and writes still mirror to the provider. The default is `False`; provider errors or an
 incomplete import retain the built-in prompt automatically.
 
 ## Available Providers
