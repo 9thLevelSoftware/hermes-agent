@@ -483,6 +483,27 @@ class MemoryManager:
 
     # -- System prompt -------------------------------------------------------
 
+    def owns_builtin_memory(self) -> bool:
+        """Whether a healthy external provider owns flat-memory context.
+
+        Fail closed: an older provider has the base-class ``False`` default,
+        and any capability-check error retains Hermes's built-in prompt.
+        """
+        for provider in self._providers:
+            if provider.name == "builtin":
+                continue
+            try:
+                if provider.owns_builtin_memory():
+                    return True
+            except Exception as e:
+                logger.warning(
+                    "Memory provider '%s' ownership check failed: %s; "
+                    "retaining built-in memory context",
+                    provider.name,
+                    e,
+                )
+        return False
+
     def build_system_prompt(self) -> str:
         """Collect system prompt blocks from all providers.
 

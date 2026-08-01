@@ -500,7 +500,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
-    if agent._memory_store:
+    _external_owns_builtin = False
+    if agent._memory_manager:
+        try:
+            _external_owns_builtin = agent._memory_manager.owns_builtin_memory()
+        except Exception:
+            # The fallback is intentionally the built-in prompt.
+            _external_owns_builtin = False
+
+    if agent._memory_store and not _external_owns_builtin:
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
@@ -511,7 +519,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if user_block:
                 volatile_parts.append(user_block)
 
-    # External memory provider system prompt block (additive to built-in)
+    # External provider context is additive unless it explicitly and healthily
+    # owns the imported built-in memory lifecycle.
     if agent._memory_manager:
         try:
             _ext_mem_block = agent._memory_manager.build_system_prompt()

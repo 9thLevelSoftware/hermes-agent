@@ -138,6 +138,10 @@ class TestMemoryProviderABC:
         p.sync_turn("user", "assistant")
         p.shutdown()
 
+    def test_default_provider_does_not_own_builtin_memory(self):
+        """Existing providers remain additive unless they explicitly opt in."""
+        assert FakeMemoryProvider().owns_builtin_memory() is False
+
 
 # ---------------------------------------------------------------------------
 # MemoryManager tests
@@ -152,6 +156,25 @@ class TestMemoryManager:
         assert mgr.get_all_tool_schemas() == []
         assert mgr.build_system_prompt() == ""
         assert mgr.prefetch_all("test") == ""
+        assert mgr.owns_builtin_memory() is False
+
+    def test_builtin_ownership_requires_an_explicit_healthy_provider(self):
+        class OwningProvider(FakeMemoryProvider):
+            def owns_builtin_memory(self):
+                return True
+
+        mgr = MemoryManager()
+        mgr.add_provider(OwningProvider("external"))
+        assert mgr.owns_builtin_memory() is True
+
+    def test_builtin_ownership_fails_closed_when_provider_raises(self):
+        class BrokenOwnershipProvider(FakeMemoryProvider):
+            def owns_builtin_memory(self):
+                raise RuntimeError("database unavailable")
+
+        mgr = MemoryManager()
+        mgr.add_provider(BrokenOwnershipProvider("external"))
+        assert mgr.owns_builtin_memory() is False
 
     def test_add_provider(self):
         mgr = MemoryManager()
