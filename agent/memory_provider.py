@@ -22,6 +22,7 @@ Lifecycle (called by MemoryManager, wired in run_agent.py):
   shutdown()             — clean exit
 
 Optional hooks (override to opt in):
+  owns_builtin_memory() -> bool — suppress imported flat-memory prompt context
   on_turn_start(turn, message, **kwargs) — per-turn tick with runtime context
   on_session_end(messages)               — end-of-session extraction
   on_session_switch(new_session_id, **kwargs) — mid-process session_id rotation
@@ -128,6 +129,18 @@ class MemoryProvider(ABC):
         recall context is injected separately via prefetch().
         """
         return ""
+
+    def owns_builtin_memory(self) -> bool:
+        """Return whether this provider replaces flat-memory prompt context.
+
+        The default is additive for complete backward compatibility.  A
+        provider may return ``True`` only while it has durably imported the
+        built-in MEMORY.md/USER.md state and can serve it itself.  Hermes
+        re-checks this capability at safe system-prompt rebuild boundaries.
+        Built-in memory files and their write tool remain operational either
+        way so writes can continue to mirror into the provider.
+        """
+        return False
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for the upcoming turn.
