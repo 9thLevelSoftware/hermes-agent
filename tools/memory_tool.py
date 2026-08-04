@@ -162,7 +162,7 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 4000, user_char_limit: int = 2500):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
@@ -427,6 +427,13 @@ class MemoryStore:
 
             if new_total > limit:
                 current = self._char_count(target)
+                # Include per-entry lengths so the model can identify the
+                # largest entries as consolidation candidates.  Sort longest
+                # first — these are the best targets for compression/removal.
+                sized = sorted(
+                    [(len(e), e) for e in entries],
+                    key=lambda x: x[0], reverse=True,
+                )
                 return self._consolidation_failure({
                     "success": False,
                     "error": (
@@ -434,9 +441,11 @@ class MemoryStore:
                         f"Adding this entry ({len(content)} chars) would exceed the limit. "
                         f"Consolidate now: use 'replace' to merge overlapping entries into "
                         f"shorter ones or 'remove' stale or less important entries (see "
-                        f"current_entries below), then retry this add — all in this turn."
+                        f"current_entries below, sorted longest-first), then retry this "
+                        f"add — all in one call using the 'operations' array."
                     ),
-                    "current_entries": entries,
+                    "current_entries": [e for _, e in sized],
+                    "entry_sizes": {e[:60]: s for s, e in sized},
                     "usage": f"{current:,}/{limit:,}",
                 })
 
@@ -499,15 +508,20 @@ class MemoryStore:
 
             if new_total > limit:
                 current = self._char_count(target)
+                sized = sorted(
+                    [(len(e), e) for e in entries],
+                    key=lambda x: x[0], reverse=True,
+                )
                 return self._consolidation_failure({
                     "success": False,
                     "error": (
                         f"Replacement would put memory at {new_total:,}/{limit:,} chars. "
                         f"Shorten the new content, or 'remove' other stale or less important "
-                        f"entries to make room (see current_entries below), then retry — all "
-                        f"in this turn."
+                        f"entries to make room (see current_entries below, sorted longest-first), "
+                        f"then retry — all in one call using the 'operations' array."
                     ),
-                    "current_entries": entries,
+                    "current_entries": [e for _, e in sized],
+                    "entry_sizes": {e[:60]: s for s, e in sized},
                     "usage": f"{current:,}/{limit:,}",
                 })
 
@@ -889,8 +903,8 @@ def load_on_disk_store() -> "MemoryStore":
     Falls back to the built-in defaults if config can't be loaded, so this can
     never raise on a missing/unreadable config.
     """
-    memory_char_limit = 2200
-    user_char_limit = 1375
+    memory_char_limit = 4000
+    user_char_limit = 2500
     try:
         from hermes_cli.config import load_config
 
@@ -1085,6 +1099,35 @@ def memory_tool(
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
+    # Detect missing action (model omitted the optional `action` field).
+    # Can't make `action` schema-required because the batch path uses
+    # `operations` instead — OpenAI's Codex backend rejects allOf/oneOf
+    # combinators that would express "required unless operations is set".
+    # Return a recoverable error with current entries so the model can
+    # reissue with the correct action.  (Dojo #1 persistent failure)
+    if not action:
+        entries = store._entries_for(target)
+        current = store._char_count(target)
+        limit = store._char_limit(target)
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "The 'action' parameter is missing. It must be one of: "
+                    "'add', 'replace', or 'remove'. For multiple changes, use "
+                    "the 'operations' array instead. Reissue with action set."
+                ),
+                "current_entries": entries,
+                "usage": f"{current:,}/{limit:,}",
+                "hint": (
+                    "add = append new entry (requires 'content'); "
+                    "replace = swap entry (requires 'old_text' + 'content'); "
+                    "remove = delete entry (requires 'old_text')"
+                ),
+            },
+            ensure_ascii=False,
+        )
+
     # Validate required params BEFORE the gate so an invalid write is rejected
     # immediately instead of being staged and only failing at approve time.
     if action == "add" and not content:
@@ -1225,7 +1268,7 @@ registry.register(
     toolset="memory",
     schema=MEMORY_SCHEMA,
     handler=lambda args, **kw: memory_tool(
-        action=args.get("action", ""),
+        action=args.get("action"),  # None when omitted — triggers helpful error
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
