@@ -207,8 +207,8 @@ hermes sessions list    # 浏览过去的会话
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 2200   # ~800 tokens
-  user_char_limit: 1375     # ~500 tokens
+  memory_char_limit: 4000   # ~1450 tokens
+  user_char_limit: 2500     # ~900 tokens
 ```
 
 ## 外部记忆提供商
