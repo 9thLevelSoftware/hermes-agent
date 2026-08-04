@@ -445,7 +445,7 @@ class MemoryStore:
                         f"add — all in one call using the 'operations' array."
                     ),
                     "current_entries": [e for _, e in sized],
-                    "entry_sizes": {e[:60]: s for s, e in sized},
+                    "entry_sizes": {f"{i}:{e[:40]}": s for i, (s, e) in enumerate(sized)},
                     "usage": f"{current:,}/{limit:,}",
                 })
 
@@ -521,7 +521,7 @@ class MemoryStore:
                         f"then retry — all in one call using the 'operations' array."
                     ),
                     "current_entries": [e for _, e in sized],
-                    "entry_sizes": {e[:60]: s for s, e in sized},
+                    "entry_sizes": {f"{i}:{e[:40]}": s for i, (s, e) in enumerate(sized)},
                     "usage": f"{current:,}/{limit:,}",
                 })
 
