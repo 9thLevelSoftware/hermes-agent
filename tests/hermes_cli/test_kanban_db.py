@@ -2084,3 +2084,101 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+# ---------------------------------------------------------------------------
+# Respawn guard — active_pr vs explicit re-queues (#111910 refinement)
+# ---------------------------------------------------------------------------
+
+_GUARD_PR_URL = "https://github.com/9thLevelSoftware/Project-Phoenix-MP/pull/1165"
+
+
+def _seed_pr_url_comment(conn, tid, when):
+    """Worker comment citing a PR URL — the #111910 'a PR now exists' signal."""
+    kb.add_comment(
+        conn,
+        tid,
+        "worker",
+        f"Senior audit withheld merge at bb0044b. Review notes for {_GUARD_PR_URL}",
+    )
+    conn.execute(
+        "UPDATE task_comments SET created_at=? WHERE task_id=?", (when, tid)
+    )
+    conn.commit()
+
+
+def _seed_event(conn, tid, kind, when, payload="{}"):
+    conn.execute(
+        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?,?,?,?)",
+        (tid, kind, payload, when),
+    )
+    conn.commit()
+
+
+@pytest.mark.parametrize("requeue_kind", ["status", "promoted", "unblocked"])
+def test_active_pr_guard_releases_on_explicit_requeue(kanban_home, monkeypatch, requeue_kind):
+    """An explicit re-queue AFTER the newest PR-URL comment is a deliberate
+    "run it again" on THAT PR — the same exception ``recent_success`` grants
+    (done→ready drag, dependency promotion, unblock). Without it, a gate/monitor
+    card whose review output cites the PR is stranded for the whole window no
+    matter how deliberately it is resumed (observed: a merge-gate card held for
+    24h+ by 218 guard hits after its dependency completed and promoted it)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    now = 5_000_000
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="gate", assignee="a")
+        _seed_pr_url_comment(conn, tid, now)
+        _seed_event(conn, tid, requeue_kind, now + 10)
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 20)
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_active_pr_guard_holds_on_auto_reclaim(kanban_home, monkeypatch):
+    """Automatic crash recovery (``reclaimed``) is NOT re-run authorization:
+    per #111910 the worker that may have just opened the PR must not be
+    re-spawned against it after a crash. This exclusion is the whole reason the
+    exception above is a curated event list rather than "any later event"."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    now = 5_000_000
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="impl", assignee="a")
+        _seed_pr_url_comment(conn, tid, now)
+        _seed_event(conn, tid, "reclaimed", now + 10)
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 20)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_holds_without_requeue(kanban_home, monkeypatch):
+    """Unchanged #111910 behavior: a fresh PR-URL comment with nothing after
+    it still blocks re-spawn (the ready lane only)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    now = 5_000_000
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="impl", assignee="a")
+        _seed_pr_url_comment(conn, tid, now)
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 20)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+        # Review-lane spawns still skip the guard entirely: a recent PR URL is
+        # an *input* to a review handoff.
+        assert kbd.check_respawn_guard(conn, tid, lane="review") is None
+
+
+def test_active_pr_guard_requeue_tie_fails_closed(kanban_home, monkeypatch):
+    """Strictly-after, same as the handoff check: a same-second re-queue tie
+    stays guarded."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    now = 5_000_000
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="gate", assignee="a")
+        _seed_pr_url_comment(conn, tid, now)
+        _seed_event(conn, tid, "promoted", now)  # same second as the comment
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 20)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"

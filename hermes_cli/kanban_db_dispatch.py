@@ -140,7 +140,10 @@ class DispatchResult:
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error — also auto-blocked), ``"recent_success"`` (completed run
-    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment).
+    ``"active_pr"`` yields to an explicit re-queue after that comment (status
+    drag, dependency promotion, unblock — the ``recent_success`` re-run
+    exception; automatic ``reclaimed`` crash recovery excluded, per #111910)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
@@ -1539,7 +1542,11 @@ def check_respawn_guard(
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
     handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
+    PR, or an explicit re-queue after it deliberately re-runs the task on that
+    PR — ``status``/``promoted``/``unblocked``, the same re-run exception
+    ``recent_success`` grants; automatic ``reclaimed`` crash recovery is
+    excluded so a crash after opening a PR still cannot duplicate it). The
+    review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
@@ -1625,6 +1632,10 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    #    Explicit re-queues after the comment (status drag, dependency
+    #    promotion, unblock) are also deliberate "run it again" authorization —
+    #    the same exception step 3 grants `recent_success`. Automatic crash
+    #    recovery (`reclaimed`) is deliberately NOT in that list.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
@@ -1638,7 +1649,8 @@ def check_respawn_guard(
             # Strictly after: a same-second tie stays guarded (fail closed).
             "SELECT kind, payload FROM task_events "
             "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
+            "AND kind IN ('assigned', 'changes_requested', 'review_reopened', "
+            "'status', 'promoted', 'unblocked')",
             (task_id, int(c["created_at"] or 0)),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
