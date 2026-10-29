@@ -22,8 +22,8 @@ def test_profile_home_resolves_to_launch_home_owner(tmp_path, monkeypatch):
     discovery = _load("gw_disc", "hermes_cli/gateway_runtime_discovery.py")
     from gateway import status as gw_status
 
-    launch = tmp_path / "launch"
-    profile = tmp_path / "profiles" / "phoenixworker"
+    launch = tmp_path / ".hermes"
+    profile = launch / "profiles" / "phoenixworker"
     launch.mkdir(parents=True)
     profile.mkdir(parents=True)
 
@@ -48,3 +48,18 @@ def test_launch_home_still_reports_absent_when_unlocked(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setattr(gw_status, "_is_gateway_runtime_lock_active_strict", lambda lock: False)
     assert discovery.missing_owner_state(home) == "absent"
+
+
+def test_profile_owner_mapping_cycle_raises_discovery_error(tmp_path):
+    import pytest
+    from hermes_cli.gateway_runtime import gateway_profile_home
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "gateway.lock").symlink_to(second / "gateway.lock")
+    (second / "gateway.lock").symlink_to(first / "gateway.lock")
+
+    with pytest.raises(DiscoveryError, match="profile_home_cycle"):
+        gateway_profile_home(first)

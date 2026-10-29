@@ -233,7 +233,10 @@ def _private_lock(lock: Path) -> None:
 def missing_owner_state(home: Path) -> Literal["starting", "absent", "inaccessible"]:
     """A reservation before PID/control publication already excludes a new owner."""
     from gateway.status import _is_gateway_runtime_lock_active_strict
-    lock = home / "gateway.lock"
+    from hermes_cli.gateway_runtime import _gateway_discovery_homes
+
+    _, owner_home = _gateway_discovery_homes(home)
+    lock = owner_home / "gateway.lock"
     try:
         if os.name != "nt":
             _private_lock(lock)

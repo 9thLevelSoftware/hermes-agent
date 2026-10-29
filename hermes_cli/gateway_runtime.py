@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import ipaddress
 import math
 import os
@@ -71,7 +72,30 @@ def gateway_profile_home(home: str | Path) -> Path:
     (a task dir mirroring a profile through symlinks, its ``gateway.lock`` among them) the profile its
     lock names. A client compares the owner's ``profile_id`` with this, never the overlay path.
     Not normcased: ``profile_id`` keeps the owner's own spelling (Windows)."""
-    return _overlay_owner_home(Path(home).expanduser().resolve())
+    from hermes_cli.gateway_runtime_discovery import DiscoveryError
+
+    # Keep the logical profile path: offloaded homes resolve outside the launch home's profiles tree.
+    current = Path(os.path.abspath(Path(home).expanduser()))
+    seen: set[Path] = set()
+    while current not in seen:
+        seen.add(current)
+        try:
+            resolved = current.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise DiscoveryError("profile_home_cycle", "gateway home links form a cycle") from exc
+        owner = _overlay_owner_home(resolved)
+        if owner == resolved:
+            return current
+        current = owner
+    raise DiscoveryError("profile_home_cycle", "gateway.lock links form a profile-home cycle")
+
+
+def _gateway_discovery_homes(home: str | Path) -> tuple[Path, Path]:
+    """Return the serving profile identity and the launch home that publishes its owner."""
+    profile = gateway_profile_home(home)
+    from hermes_cli.gateway_runtime_multiplex import multiplexer_serves_home
+
+    return profile, multiplexer_serves_home(profile) or profile.resolve()
 
 
 def _overlay_owner_home(home: Path) -> Path:
@@ -90,7 +114,13 @@ def _overlay_owner_home(home: Path) -> Path:
             return home
         _private_node(target.parent, kind="directory", home=True)
         _private_lock(target)
-    except (FileNotFoundError, OSError, DiscoveryError):
+    except FileNotFoundError:
+        return home
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise DiscoveryError("profile_home_cycle", f"{lock} links form a profile-home cycle") from exc
+        return home
+    except DiscoveryError:
         return home
     return target.parent
 
@@ -296,9 +326,12 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
 
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be finite and positive")
-    home = _overlay_owner_home(Path(_canonical_home(profile_home)))
+    home = Path(profile_home).expanduser()
+    owner_home = home
     try:
-        return _endpoint(query_identify(home, timeout=timeout), home)
+        home, owner_home = _gateway_discovery_homes(home)
+        return _endpoint(query_identify(owner_home, timeout=timeout), home,
+                         control_home=owner_home if owner_home != home else None)
     except (FileNotFoundError, ConnectionRefusedError):
         served = _served_by_multiplexer(home, timeout=timeout)
         if served is not None:
@@ -306,7 +339,7 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
         state = missing_owner_state(home)
         if state == "inaccessible" and os.name != "nt":
             from gateway.runtime_ownership import unreadable_lock_recovery
-            if detail := unreadable_lock_recovery(home / "gateway.lock"):
+            if detail := unreadable_lock_recovery(owner_home / "gateway.lock"):
                 return GatewayDiscovery(state, reason_code="foreign_stale_lock", detail=detail)
         return GatewayDiscovery(state)
     except TimeoutError:
@@ -316,7 +349,7 @@ def discover_gateway_endpoint(profile_home: str | Path, *, timeout: float = 2.0)
         return GatewayDiscovery("inaccessible", reason_code=exc.reason, detail=exc.bounded_detail(500))
     except PermissionError as exc:
         named = _refused_owner_verdict(exc)  # the client proved the boundary from the control pipe (#140706)
-        return named if named is not None else _refused(home)
+        return named if named is not None else _refused(owner_home)
     except (OSError, ValueError, TypeError):
         # Raw peer data, paths and URLs may contain secrets; report bounded codes.
         return GatewayDiscovery("inaccessible", reason_code="invalid_control_peer")
@@ -413,7 +446,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be finite and positive")
     deadline = time.monotonic() + timeout
-    home = _overlay_owner_home(Path(_canonical_home(profile_home)))
+    home = gateway_profile_home(profile_home)
     requested = False
     child = None
     child_home, child_offset = home, 0
