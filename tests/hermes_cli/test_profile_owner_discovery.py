@@ -125,3 +125,19 @@ def test_offloaded_root_found_under_worker_env(tmp_path, monkeypatch):
         "an offloaded profile home must map to the launch root even when HERMES_HOME "
         "points at the profile home itself (the managed-worker environment)"
     )
+
+
+def test_default_root_recovers_offloaded_profile_env(tmp_path, monkeypatch):
+    """get_default_hermes_root must return the LAUNCH root for an offloaded profile home in
+    HERMES_HOME (the managed-worker env): it is <root>/profiles/<name> via the storage-offload
+    mirror. Otherwise _global_auth_file_path returns None, the global credential fallback dies,
+    and OAuth providers with tokens only in the global root fail in workers while chat works."""
+    import hermes_constants
+    launch, physical = _offloaded_home(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(physical))
+    monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: launch)
+
+    assert hermes_constants.get_default_hermes_root() == launch
+    # Classic spellings keep their behavior.
+    monkeypatch.setenv("HERMES_HOME", str(launch / "profiles" / "phoenixworker"))
+    assert hermes_constants.get_default_hermes_root() == launch

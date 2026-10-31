@@ -103,7 +103,24 @@ def _hermes_root_of(native_home: Path, env_path: Path | None) -> Path:
     try:
         env_path.resolve().relative_to(native_home.resolve())  # under ~/.hermes (normal or profile mode)
     except ValueError:  # Docker/custom root: <root>/profiles/<name> -> <root>, else HERMES_HOME itself
-        return env_path.parent.parent if env_path.parent.name == "profiles" else env_path
+        if env_path.parent.name == "profiles":
+            return env_path.parent.parent
+        # Storage offload: <native>/profiles/<name> resolves to a directory elsewhere, so the
+        # physical spelling HERMES_HOME carries (managed workers resolve their home) is not
+        # under any profiles tree. Match the native mirror by name plus real-path equality —
+        # without this, _global_auth_file_path reports no global store and OAuth providers with
+        # tokens only in the global root fail in workers while chat works.
+        try:
+            profiles = native_home / "profiles"
+            for candidate in (env_path, *env_path.parents):
+                if candidate.name.startswith("."):
+                    continue
+                match = profiles / candidate.name
+                if match.exists() and match.resolve() == candidate.resolve():
+                    return native_home
+        except OSError:
+            pass
+        return env_path
     return native_home
 
 
