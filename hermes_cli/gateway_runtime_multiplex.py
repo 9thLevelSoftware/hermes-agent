@@ -19,9 +19,41 @@ def multiplexer_root_for(home: Path) -> Path | None:
     """Default root that may multiplex *home*, when *home* is a named profile under it."""
     from hermes_constants import named_profile_home
     if named_profile_home(home) is None:
-        return None
+        return _offloaded_profile_root(home)
     root = home.parent.parent
     return root if root != home else None
+
+
+def _offloaded_profile_root(home: Path) -> Path | None:
+    """Root whose ``profiles/<name>`` the storage-offloaded *home* physically is, else None.
+
+    Storage offload relocates a profile home so its ``profiles/<name>`` path resolves to a
+    directory elsewhere (e.g. an external SSD). ``named_profile_home`` cannot see through the
+    relocation, so any client holding the physical spelling (``WorkerRPC`` resolves its home)
+    fell into ``missing_owner_state`` and read the offloaded home's own held ``gateway.lock`` as
+    a forever-``starting`` owner — every managed worker then died at ``worker.adopt`` with
+    ``owner_unavailable``. Match the default root's ``profiles/<name>`` by name plus real-path
+    equality (never bare name), walking up from *home* like ``named_profile_home`` so subpaths
+    resolve too. Both the env-derived root and the native default home are probed: managed
+    workers run with ``HERMES_HOME`` set to their own profile home, so root discovery must not
+    depend on the process env. Only default roots are consulted; a classic layout never
+    reaches here.
+    """
+    from hermes_constants import _get_platform_default_hermes_home, get_default_hermes_root
+    candidates = (home, *home.parents)
+    for root in dict.fromkeys((Path(get_default_hermes_root()),
+                              Path(_get_platform_default_hermes_home()))):
+        try:
+            profiles = root / "profiles"
+            for candidate in candidates:
+                if candidate.name.startswith("."):
+                    continue
+                match = profiles / candidate.name
+                if match.exists() and match.resolve() == candidate.resolve():
+                    return root if root != candidate else None
+        except OSError:
+            continue
+    return None
 
 
 def implied_host_root(home: Path) -> Path | None:

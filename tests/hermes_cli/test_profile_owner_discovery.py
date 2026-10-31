@@ -63,3 +63,65 @@ def test_profile_owner_mapping_cycle_raises_discovery_error(tmp_path):
 
     with pytest.raises(DiscoveryError, match="profile_home_cycle"):
         gateway_profile_home(first)
+
+
+def _offloaded_home(tmp_path):
+    """A storage-offloaded profile home: its ``profiles/<name>`` path resolves to a directory
+    elsewhere (external SSD), which is how the macos storage offload relocates homes."""
+    launch = tmp_path / ".hermes"
+    physical = tmp_path / "offload" / "phoenixworker"
+    (launch / "profiles").mkdir(parents=True)
+    physical.mkdir(parents=True)
+    (launch / "profiles" / "phoenixworker").symlink_to(physical, target_is_directory=True)
+    return launch, physical
+
+
+def test_offloaded_physical_home_maps_to_launch_root(tmp_path, monkeypatch):
+    """`WorkerRPC` resolves its home, so every managed worker holds the PHYSICAL spelling of an
+    offloaded home. `multiplexer_root_for` must still find the launch root that multiplexes it,
+    or `_served_by_multiplexer` bails and `missing_owner_state` reads the offloaded home's own
+    held gateway.lock as a forever-'starting' owner — every worker then died at `worker.adopt`."""
+    multi = _load("gw_multiplex", "hermes_cli/gateway_runtime_multiplex.py")
+    launch, physical = _offloaded_home(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+
+    assert multi.multiplexer_root_for(physical) == launch
+    assert multi.multiplexer_root_for(physical / "workspace") == launch
+    assert multi.multiplexer_root_for(tmp_path / "offload" / "other") is None
+
+
+def test_offloaded_physical_home_missing_owner_matches_logical(tmp_path, monkeypatch):
+    """Both spellings of the same offloaded home must reach the same missing-owner verdict."""
+    discovery = _load("gw_disc_offload", "hermes_cli/gateway_runtime_discovery.py")
+    from gateway import status as gw_status
+
+    launch, physical = _offloaded_home(tmp_path)
+    (launch / "gateway_state.json").write_text(
+        '{"gateway_state":"running","pid":12345,"served_profiles":["default","phoenixworker"]}'
+    )
+    (physical / "gateway.lock").write_text("")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setattr(gw_status, "_is_gateway_runtime_lock_active_strict", lambda lock: True)
+
+    logical = launch / "profiles" / "phoenixworker"
+    assert discovery.missing_owner_state(physical) == discovery.missing_owner_state(logical), (
+        "the physical spelling of an offloaded home must not read its own held gateway.lock "
+        "as a starting owner when the logical spelling resolves through the launch home"
+    )
+
+
+def test_offloaded_root_found_under_worker_env(tmp_path, monkeypatch):
+    """Managed workers run with HERMES_HOME set to their profile home (and the bootstrap
+    contract pins frame['home'] to the physical spelling), so root discovery must not depend
+    on the process env: the native default home is the launch root that mirrors the home
+    under profiles/<name>."""
+    import hermes_constants
+    multi = _load("gw_multiplex_worker_env", "hermes_cli/gateway_runtime_multiplex.py")
+    launch, physical = _offloaded_home(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(physical))
+    monkeypatch.setattr(hermes_constants, "_get_platform_default_hermes_home", lambda: launch)
+
+    assert multi.multiplexer_root_for(physical) == launch, (
+        "an offloaded profile home must map to the launch root even when HERMES_HOME "
+        "points at the profile home itself (the managed-worker environment)"
+    )
